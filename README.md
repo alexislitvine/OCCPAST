@@ -1,3 +1,5 @@
+This is a development for OCCPAST of the original OccCANINE model developed by Christian Møller Dahl, Torben Johansen, Christian Vedel from the University of Southern Denmark. The original repo is accesible at https://github.com/christianvedels/OccCANINE.git
+
 Overview
 --------
 
