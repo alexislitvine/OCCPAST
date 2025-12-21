@@ -10,7 +10,7 @@ performance by contextualizing the predictions.
 
 Example Usage
 -------------
->>> from histocc.utils.descriptions import load_descriptions_from_csv
+>>> from occpast_extensions import load_descriptions_from_csv
 >>> descriptions = load_descriptions_from_csv('my_descriptions.csv', code_col='code', desc_col='description')
 >>> print(descriptions.get('1,1,0,0,0,0,0,0'))  # Look up a PST2 code
 """
@@ -21,7 +21,7 @@ from typing import Dict, Union
 
 import pandas as pd
 
-from ..datasets import DATASETS
+from histocc.datasets import DATASETS
 
 
 def load_hisco_descriptions(

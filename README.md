@@ -9,9 +9,23 @@ This repository provides everything needed to train, finetune, and use OccCANINE
 Structure
 ---------
 
-*   **histocc**: Core Python code containing all logic for training, finetuning, and prediction. This repo is intended for local use; packaging is currently disabled.
-*   **tests**: Test suite for the histocc package.
+*   **histocc**: Core Python code containing all logic for training, finetuning, and prediction. This is provided via a git submodule linked to the upstream OccCANINE repository (commit 844e6be6aa08c00235094ac3cd42698c9cf0c09b) to avoid divergence from the original repo.
+*   **occpast_extensions**: OCCPAST-specific extensions to histocc, including data conversion utilities (CSV to Parquet) and description loading functions.
+*   **tests**: Test suite for the histocc package and OCCPAST extensions.
 *   **Data**: Contains key.csv mapping and toy data for testing.
+
+## Important: Initializing the Repository
+
+After cloning this repository, you must initialize the histocc submodule:
+
+```bash
+git submodule update --init --recursive
+cd OccCANINE_upstream
+git checkout 844e6be6aa08c00235094ac3cd42698c9cf0c09b
+cd ..
+```
+
+The `histocc` directory is a symbolic link to `OccCANINE_upstream/histocc` from the upstream repository.
 
 ## Main Scripts
 

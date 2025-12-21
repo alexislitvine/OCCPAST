@@ -6,7 +6,7 @@ import unittest
 
 import pandas as pd
 
-from histocc.utils.descriptions import (
+from occpast_extensions import (
     load_hisco_descriptions,
     load_descriptions_from_csv,
     load_descriptions_from_dataframe,

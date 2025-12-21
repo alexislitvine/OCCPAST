@@ -1,0 +1,4 @@
+[submodule "OccCANINE_upstream"]
+	path = OccCANINE_upstream
+	url = https://github.com/christianvedels/OccCANINE.git
+	branch = main

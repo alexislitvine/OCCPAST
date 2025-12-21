@@ -14,7 +14,7 @@ import numpy as np
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from histocc.utils.data_conversion import (
+from occpast_extensions import (
     convert_csv_to_parquet,
     convert_directory_to_parquet,
     get_hisco_dtype_overrides,
