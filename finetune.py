@@ -576,7 +576,6 @@ def main():
             'data_loader_train': data_loader_train,
             'data_loader_val': data_loader_val,
         },
-        train_sampler=train_sampler,
         loss_fn=loss_fn,
         optimizer=optimizer,
         device=device,
