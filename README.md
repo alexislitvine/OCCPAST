@@ -1,5 +1,15 @@
 This is a development for OCCPAST of the original OccCANINE model developed by Christian Møller Dahl, Torben Johansen, Christian Vedel from the University of Southern Denmark. The original repo is accesible at https://github.com/christianvedels/OccCANINE.git
 
+## 🔍 Comparison with Original histocc
+
+**Important**: This repository has been compared with the original histocc implementation. See our comprehensive analysis:
+
+- **[TRAINING_SCRIPTS_COMPARISON.md](TRAINING_SCRIPTS_COMPARISON.md)** - Complete comparison of all training scripts
+- **[COMPARISON_REPORT.md](COMPARISON_REPORT.md)** - Detailed technical analysis
+- **[docs/REPRODUCE_ORIGINAL.md](docs/REPRODUCE_ORIGINAL.md)** - Guide to reproduce original behavior
+
+**Key Finding**: Loss functions are 100% identical. The only difference is a warmup schedule change (0% → 5%) which improves training stability. Use `--warmup-pct 0.0` to reproduce original behavior exactly.
+
 Overview
 --------
 
