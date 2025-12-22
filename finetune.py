@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 
 import torch
 import torch.distributed as dist
@@ -74,6 +75,11 @@ def parse_args():
     parser.add_argument('--eval-interval', type=int, default=1000, help='Number of steps between calculating and logging validation performance')
     parser.add_argument('--log-wandb', action='store_true', default=False, help='Whether to log validation performance using W&B')
     parser.add_argument('--wandb-project-name', type=str, default='histco-v2-mixer')
+    parser.add_argument('--seed', type=int, default=1234, help='Random seed used for initialization')
+    parser.add_argument('--deterministic', action='store_true', default=False, help='Enable deterministic/cuDNN-safe algorithms (may reduce speed)')
+    parser.add_argument('--drop-last', action='store_true', default=False, help='Drop the last incomplete batch in the training loader')
+    parser.add_argument('--diagnostic-log-loss-breakdown', action='store_true', default=False, help='Log order-invariant vs padding loss components for debugging')
+    parser.add_argument('--diagnostic-log-target-blocks', action='store_true', default=False, help='Log target-block statistics derived from the loss target mask')
 
     # Data parameters
     parser.add_argument('--num-epochs', type=int, default=5)
@@ -134,6 +140,15 @@ def parse_args():
                   'No descriptions will be included in training.')
 
     return args
+
+
+def _set_seeds(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
 def check_if_data_prepared(save_path: str) -> dict[str, int] | None:
@@ -402,12 +417,15 @@ def main():
         # Barrier with device_id to avoid "devices used ... unknown" warnings
         if torch.cuda.is_available():
             dist.barrier(device_ids=[local_rank])
+
+    _set_seeds(args.seed + (local_rank if distributed else 0), deterministic=args.deterministic)
     
     def is_main_process() -> bool:
         return (not distributed) or dist.get_rank() == 0
     
     # perf tweaks
-    cudnn.benchmark = True
+    cudnn.benchmark = not args.deterministic
+    torch.backends.cudnn.deterministic = args.deterministic
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -543,6 +561,7 @@ def main():
             dataset_train,
             batch_size=args.batch_size,
             shuffle=True,
+            drop_last=args.drop_last,
             **dataloader_kwargs,
         )
         data_loader_val = DataLoader(
@@ -633,6 +652,8 @@ def main():
         distributed=distributed,
         is_main_process=is_main_process(),
         use_amp=args.use_amp,
+        diagnostic_log_loss_breakdown=args.diagnostic_log_loss_breakdown,
+        diagnostic_log_target_blocks=args.diagnostic_log_target_blocks,
     )
     
     # Cleanup distributed training
