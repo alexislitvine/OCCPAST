@@ -70,6 +70,8 @@ def train_one_epoch(
         distributed: bool = False,
         is_main_process: bool = True,
         scaler: GradScaler | None = None,
+        diagnostic_log_loss_breakdown: bool = False,
+        diagnostic_log_target_blocks: bool = False,
         ) -> int:
     model = model.train()
 
@@ -156,6 +158,32 @@ def train_one_epoch(
         elapsed = time.time() - end
         batch_time.update(elapsed)
         samples_per_sec.update(out_seq2seq.size(0) / elapsed)
+
+        if (diagnostic_log_loss_breakdown or diagnostic_log_target_blocks) and is_main_process and batch_idx % log_interval == 0:
+            seq2seq_loss = getattr(loss_fn, "loss_fn_seq2seq", None)
+            if seq2seq_loss is not None and hasattr(seq2seq_loss, "_push_to_pad"):
+                with torch.no_grad():
+                    yhat = out_seq2seq.permute(0, 2, 1)[:, :, :-1]
+                    target_trim = targets_seq2seq[:, 1:-1]
+                    target_mask_diag = None
+                    if hasattr(seq2seq_loss, "_get_target_mask"):
+                        target_mask_diag = seq2seq_loss._get_target_mask(target_trim)
+                    if diagnostic_log_target_blocks and target_mask_diag is not None:
+                        num_target_blocks = (~target_mask_diag).sum(dim=1)
+                        tqdm.write(f"  [Diag] target blocks (mean/min/max): "
+                                   f"{num_target_blocks.float().mean():.2f} / "
+                                   f"{int(num_target_blocks.min())} / "
+                                   f"{int(num_target_blocks.max())}")
+                    if diagnostic_log_loss_breakdown:
+                        if target_mask_diag is None:
+                            order_loss = seq2seq_loss._order_invariant_loss(yhat, target_trim)
+                            padding_loss = seq2seq_loss._push_to_pad(yhat)
+                        else:
+                            order_loss = seq2seq_loss._order_invariant_loss(yhat, target_trim, target_mask_diag)
+                            padding_loss = seq2seq_loss._push_to_pad(yhat, target_mask_diag)
+                        tqdm.write(f"  [Diag] loss components -> order: {order_loss.item():.6f} | "
+                                   f"padding: {padding_loss.item():.6f} | "
+                                   f"scale: {getattr(seq2seq_loss, 'push_to_pad_scale_factor', 'n/a')}")
 
         if is_main_process and (batch_idx % log_interval == 0 or batch_idx == last_step):
             # Calculate ETA
@@ -330,6 +358,8 @@ def train(
         distributed: bool = False,
         is_main_process: bool = True,
         use_amp: bool = False,
+        diagnostic_log_loss_breakdown: bool = False,
+        diagnostic_log_target_blocks: bool = False,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -364,6 +394,8 @@ def train(
             distributed=distributed,
             is_main_process=is_main_process,
             scaler=scaler,
+            diagnostic_log_loss_breakdown=diagnostic_log_loss_breakdown,
+            diagnostic_log_target_blocks=diagnostic_log_target_blocks,
         )
         
         # Save at the end of each epoch if the flag is set
