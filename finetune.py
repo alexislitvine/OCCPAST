@@ -101,15 +101,6 @@ def parse_args():
     # Data preparation only
     parser.add_argument('--prepare-only', action='store_true', default=False, help='Only prepare data (write data_train.csv, data_val.csv, and key.csv) then exit before model/dataloader/training initialization')
 
-    # Description augmentation
-    parser.add_argument('--include-descriptions', action='store_true', default=False, help='Include code descriptions in the training input to help contextualize predictions')
-    parser.add_argument('--description-prob', type=float, default=0.5, help='Probability of including description in input when --include-descriptions is enabled (default: 0.5)')
-    parser.add_argument('--description-template', type=str, default='{occ} [DESC: {desc}]', help='Template for formatting input with description. Use {occ} for occupational text and {desc} for code description')
-    parser.add_argument('--descriptions-file', type=str, default=None, help='Path to CSV file containing code-to-description mappings')
-    parser.add_argument('--descriptions-code-col', type=str, default=None, help='Column name in --descriptions-file containing the codes')
-    parser.add_argument('--descriptions-text-col', type=str, default=None, help='Column name in --descriptions-file containing the descriptions')
-    parser.add_argument('--descriptions-lang-col', type=str, default=None, help='Column name in --descriptions-file containing language codes (for multilingual descriptions)')
-
     # All codes file for complete key generation
     parser.add_argument('--all-codes-file', type=str, default=None, help='Path to CSV file containing all unique codes for the target system. These codes will be included in the key even if they do not appear in the training data.')
     parser.add_argument('--all-codes-col', type=str, default=None, help='Column name in --all-codes-file containing the codes. If not specified, will try common column names (pst2_1, system_code, code) or use first column.')
@@ -121,17 +112,6 @@ def parse_args():
 
     if args.log_wandb and not has_wandb:
         raise ImportError('Specified --log-wandb, but wandb is not installed')
-
-    if args.include_descriptions:
-        if args.descriptions_file is not None:
-            if args.descriptions_code_col is None or args.descriptions_text_col is None:
-                raise ValueError(
-                    'When using --descriptions-file, must specify both '
-                    '--descriptions-code-col and --descriptions-text-col'
-                )
-        else:
-            print('Warning: --include-descriptions enabled but no --descriptions-file provided. '
-                  'No descriptions will be included in training.')
 
     return args
 
@@ -342,13 +322,6 @@ def setup_datasets(
         num_classes_flat: int,
         map_code_label: dict[str, int],
         distributed: bool = False,
-        include_descriptions: bool = False,
-        description_prob: float = 0.5,
-        description_template: str = '{occ} [DESC: {desc}]',
-        descriptions_file: str = None,
-        descriptions_code_col: str = None,
-        descriptions_text_col: str = None,
-        descriptions_lang_col: str = None,
 ) -> tuple[OccDatasetMixerInMemMultipleFiles, OccDatasetMixerInMemMultipleFiles]:
     dataset_train = OccDatasetMixerInMemMultipleFiles(
         fnames_data=[os.path.join(save_path, 'data_train.csv')],
@@ -359,13 +332,6 @@ def setup_datasets(
         training=True,
         target_cols=target_cols,
         map_code_label=map_code_label,
-        include_descriptions=include_descriptions,
-        description_prob=description_prob,
-        description_template=description_template,
-        descriptions_file=descriptions_file,
-        descriptions_code_col=descriptions_code_col,
-        descriptions_text_col=descriptions_text_col,
-        descriptions_lang_col=descriptions_lang_col,
     )
 
     dataset_val = OccDatasetMixerInMemMultipleFiles(
@@ -377,7 +343,6 @@ def setup_datasets(
         training=False,
         target_cols=target_cols,
         map_code_label=map_code_label,
-        # Note: include_descriptions is False for validation to evaluate on clean inputs
     )
 
     return dataset_train, dataset_val
@@ -495,13 +460,6 @@ def main():
         num_classes_flat=num_classes_flat,
         map_code_label=map_code_label,
         distributed=distributed,
-        include_descriptions=args.include_descriptions,
-        description_prob=args.description_prob,
-        description_template=args.description_template,
-        descriptions_file=args.descriptions_file,
-        descriptions_code_col=args.descriptions_code_col,
-        descriptions_text_col=args.descriptions_text_col,
-        descriptions_lang_col=args.descriptions_lang_col,
     )
 
     # Data loaders with distributed samplers if needed
