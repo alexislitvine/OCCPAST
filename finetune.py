@@ -50,8 +50,6 @@ TEXT_COLUMNS = [
     "pst2_3",
     "pst2_4",
     "pst2_5",
-    "RowID",
-    "split",
     "lang",
 ]
 
@@ -62,8 +60,6 @@ EMPTY_STANDARD = {
     "pst2_3": " ",
     "pst2_4": " ",
     "pst2_5": " ",
-    "RowID": "",
-    "split": "",
     "lang": "",
 }
 
@@ -376,6 +372,12 @@ def prepare_data(
         allow_codes_shorter_than_block_size=allow_codes_shorter_than_block_size,
     )
     print(f'Target column preparation complete. {len(data):,} observations remaining.')
+    if len(data) == 0:
+        raise ValueError(
+            'No usable observations remain after target column validation. '
+            'Check label formatting, --drop-bad-labels, and '
+            '--allow-codes-shorter-than-block-size settings.'
+        )
 
     # Build code <-> label mapping
     print('Building code-to-label mapping...')
@@ -412,6 +414,10 @@ def prepare_data(
     data_val = data.sample(int(len(data) * share_val), random_state=42)
     data_train = data.drop(data_val.index)
     print(f'Split complete: {len(data_train):,} training observations, {len(data_val):,} validation observations.')
+    if len(data_train) == 0:
+        raise ValueError(
+            'Training split is empty. Reduce --share-val or provide more data.'
+        )
 
     # Shuffle training data to avoid issues with sequential ordering of different data types
     print('Shuffling training data...')
