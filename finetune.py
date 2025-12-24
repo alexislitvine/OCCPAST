@@ -50,8 +50,6 @@ TEXT_COLUMNS = [
     "pst2_3",
     "pst2_4",
     "pst2_5",
-    "RowID",
-    "split",
     "lang",
 ]
 
@@ -62,8 +60,6 @@ EMPTY_STANDARD = {
     "pst2_3": " ",
     "pst2_4": " ",
     "pst2_5": " ",
-    "RowID": "",
-    "split": "",
     "lang": "",
 }
 
