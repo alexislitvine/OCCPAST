@@ -43,6 +43,80 @@ except ImportError:
 
 from train_mixer import load_states
 
+TEXT_COLUMNS = [
+    "occ1",
+    "pst2_1",
+    "pst2_2",
+    "pst2_3",
+    "pst2_4",
+    "pst2_5",
+    "RowID",
+    "split",
+    "lang",
+]
+
+EMPTY_STANDARD = {
+    "occ1": "",
+    "pst2_1": "",
+    "pst2_2": " ",
+    "pst2_3": " ",
+    "pst2_4": " ",
+    "pst2_5": " ",
+    "RowID": "",
+    "split": "",
+    "lang": "",
+}
+
+
+def assert_canine_safe(df: pd.DataFrame) -> None:
+    lens = (
+        df[TEXT_COLUMNS]
+        .astype("string")
+        .fillna("")
+        .apply(lambda col: col.str.len())
+    )
+
+    if (lens == 0).any().any():
+        raise AssertionError(
+            "CANINE UNSAFE: zero-length strings detected:\n"
+            + (lens == 0).sum().to_string()
+        )
+
+
+def canonicalize_for_canine(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enforce the exact text/emptiness standard used in christian_training_original.csv.
+
+    Guarantees:
+    - No NaNs in text columns
+    - No zero-length strings
+    - Identical placeholder geometry for CANINE
+    """
+
+    df = df.copy()
+
+    for col in TEXT_COLUMNS:
+        placeholder = EMPTY_STANDARD[col]
+
+        # Ensure column exists
+        if col not in df.columns:
+            df[col] = placeholder
+            continue
+
+        # Force string dtype
+        s = df[col].astype("string")
+
+        # Replace NaN
+        s = s.fillna(placeholder)
+
+        # Replace any strip-empty strings ("", "   ", "\t")
+        strip_empty = s.map(lambda x: str(x).strip() == "")
+        s = s.where(~strip_empty, placeholder)
+
+        df[col] = s
+
+    return df
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -288,6 +362,10 @@ def prepare_data(
 
     data = data[[input_col, *formatter.target_cols, 'lang']]
     data = data.rename(columns={input_col: 'occ1'})
+
+    print('Canonicalizing data for CANINE...')
+    data = canonicalize_for_canine(data)
+    assert_canine_safe(data)
 
     # Value checks, subsetting, and changing some values
     print('Validating and preparing target columns...')
