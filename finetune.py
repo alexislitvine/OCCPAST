@@ -50,8 +50,6 @@ TEXT_COLUMNS = [
     "pst2_3",
     "pst2_4",
     "pst2_5",
-    "RowID",
-    "split",
     "lang",
 ]
 
@@ -62,8 +60,6 @@ EMPTY_STANDARD = {
     "pst2_3": " ",
     "pst2_4": " ",
     "pst2_5": " ",
-    "RowID": "",
-    "split": "",
     "lang": "",
 }
 
@@ -235,6 +231,15 @@ def check_if_data_prepared(save_path: str) -> dict[str, int] | None:
     if not os.path.isfile(os.path.join(save_path, 'key.csv')):
         return None
 
+    data_train = pd.read_csv(os.path.join(save_path, 'data_train.csv'))
+    data_val = pd.read_csv(os.path.join(save_path, 'data_val.csv'))
+    if len(data_train) == 0 or len(data_val) == 0:
+        print(
+            'Prepared data exists but is empty. Regenerating '
+            f'from source data into {save_path}.'
+        )
+        return None
+
     mapping_df = pd.read_csv(
         os.path.join(save_path, 'key.csv'),
         dtype={'system_code': str, 'code': int},
@@ -376,6 +381,12 @@ def prepare_data(
         allow_codes_shorter_than_block_size=allow_codes_shorter_than_block_size,
     )
     print(f'Target column preparation complete. {len(data):,} observations remaining.')
+    if len(data) == 0:
+        raise ValueError(
+            'No usable observations remain after target column validation. '
+            'Check label formatting, --drop-bad-labels, and '
+            '--allow-codes-shorter-than-block-size settings.'
+        )
 
     # Build code <-> label mapping
     print('Building code-to-label mapping...')
@@ -412,6 +423,10 @@ def prepare_data(
     data_val = data.sample(int(len(data) * share_val), random_state=42)
     data_train = data.drop(data_val.index)
     print(f'Split complete: {len(data_train):,} training observations, {len(data_val):,} validation observations.')
+    if len(data_train) == 0:
+        raise ValueError(
+            'Training split is empty. Reduce --share-val or provide more data.'
+        )
 
     # Shuffle training data to avoid issues with sequential ordering of different data types
     print('Shuffling training data...')
@@ -599,6 +614,12 @@ def main():
         descriptions_text_col=args.descriptions_text_col,
         descriptions_lang_col=args.descriptions_lang_col,
     )
+    if len(dataset_train) == 0:
+        raise ValueError(
+            'Prepared training dataset is empty. Remove prepared data at '
+            f'{args.save_path} to force regeneration or verify that the '
+            'prepared data_train.csv contains rows.'
+        )
 
     # Data loaders with distributed samplers if needed
     # Build DataLoader kwargs
