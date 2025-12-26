@@ -116,7 +116,7 @@ def parse_args():
 
     # Debugging: PST2 sample diagnostics
     parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
-    parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed for selecting PST2 debug rows.')
+    parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed (int) for selecting PST2 debug rows.')
 
     args = parser.parse_args()
 
@@ -197,7 +197,13 @@ def print_pst2_sample_diagnostics(
             if EOS_IDX in block[:-1]:
                 eos_early = True
                 break
-        truncation = (token_len == formatter.max_seq_len) or eos_early
+        overflow = False
+        if serialized is not None:
+            if formatter.sep_value:
+                overflow = len(serialized.split(formatter.sep_value)) > formatter.max_num_codes
+            else:
+                overflow = formatter.max_num_codes < 1
+        truncation = overflow or eos_early
 
         print(f'  row_index={idx}')
         print(f'    raw occ1={row["occ1"]!r}')
@@ -207,7 +213,7 @@ def print_pst2_sample_diagnostics(
         print(f'    target token length={token_len} last_20_tokens={last_tokens}')
         print(f'    non_padding_tokens={non_pad_tokens}')
         print(f'    separator_block_boundaries={block_boundaries}')
-        print(f'    truncation={truncation} (len==max_seq_len or EOS before block end)')
+        print(f'    truncation={truncation} (overflow or EOS before block end)')
 
 
 def check_if_data_prepared(save_path: str) -> dict[str, int] | None:
