@@ -176,6 +176,7 @@ def prepare_target_cols(
         drop_bad_rows: bool = False,
         allow_codes_shorter_than_block_size: bool = False,
 ) -> pd.DataFrame:
+    debug_enabled = os.getenv("OCCPAST_DEBUG_PST2", "").lower() in {"1", "true", "yes"}
     # All cases of space (' ') are cast to NaN
     for i, target_col in enumerate(formatter.target_cols):
         # Some NaN values instead coded as spaces
@@ -200,7 +201,7 @@ def prepare_target_cols(
         try:
             formatted = formatter.transform_label(data.iloc[i])
             row = data.iloc[i]
-            if DEBUG_COUNT < DEBUG_LIMIT and pd.notna(row.get("pst2_2")):
+            if debug_enabled and DEBUG_COUNT < DEBUG_LIMIT and pd.notna(row.get("pst2_2")):
                 serialized = formatter.sanitize(row)
                 non_pad = int((formatted != PAD_IDX).sum())
                 last_tokens = formatted[-20:].tolist()
@@ -231,6 +232,7 @@ def prepare_target_cols(
                     last_tokens,
                     "\n  truncation:",
                     trunc,
+                    flush=True,
                 )
                 DEBUG_COUNT += 1
             passes_formatter.append(True)
@@ -261,6 +263,12 @@ def prepare_target_cols(
             print(f'{len(len_less_than_block_size):,} cases of labels shorter than block size. Assuming such codes are allowed since --allow-codes-shorter-than-block-size was specified.')
         else:
             raise ValueError(f'{len(len_less_than_block_size):,} cases of labels shorter than block size, which may indicate that leading zeroes have been dropped by accident. If these cases are exptected, specify --allow-codes-shorter-than-block-size \nExample rows: {data.iloc[len_less_than_block_size].head(10)}')
+
+    if debug_enabled and DEBUG_COUNT == 0:
+        print(
+            "[DEBUG][prepare_target_cols] No rows with pst2_2 found for debug logging.",
+            flush=True,
+        )
 
     return data
 

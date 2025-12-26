@@ -852,6 +852,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             descriptions_lang_col=descriptions_lang_col,
         )
         self._debug_target_samples = 0
+        self._debug_pst2_enabled = os.getenv("OCCPAST_DEBUG_PST2", "").lower() in {"1", "true", "yes"}
 
     def _load_descriptions(
             self,
@@ -984,7 +985,9 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         occ_descr: str = record.occ1
         lang: str = record.lang
         targets_seq2seq = self.formatter.transform_label(record)
-        if self._debug_target_samples < 5 and pd.notna(record.get("pst2_2")):
+        if (self._debug_pst2_enabled
+            and self._debug_target_samples < 5
+            and pd.notna(record.get("pst2_2"))):
             serialized = self.formatter.sanitize(record)
             non_pad = int((targets_seq2seq != PAD_IDX).sum())
             last_tokens = targets_seq2seq[-20:].tolist()
@@ -1012,6 +1015,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
                 last_tokens,
                 "\n  truncation:",
                 trunc,
+                flush=True,
             )
             self._debug_target_samples += 1
         target_linear = self._get_target_linear(record)
