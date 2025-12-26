@@ -114,6 +114,10 @@ def parse_args():
     parser.add_argument('--all-codes-file', type=str, default=None, help='Path to CSV file containing all unique codes for the target system. These codes will be included in the key even if they do not appear in the training data.')
     parser.add_argument('--all-codes-col', type=str, default=None, help='Column name in --all-codes-file containing the codes. If not specified, will try common column names (pst2_1, system_code, code) or use first column.')
 
+    # Debugging: PST2 sample diagnostics
+    parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
+    parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed for selecting PST2 debug rows.')
+
     args = parser.parse_args()
 
     if args.language != 'unk' and args.language_col is not None:
@@ -134,6 +138,76 @@ def parse_args():
                   'No descriptions will be included in training.')
 
     return args
+
+
+def _is_present_pst2(value: str | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float):
+        return False
+    value = str(value)
+    return value not in {'', ' ', '?'}
+
+
+def print_pst2_sample_diagnostics(
+        data_path: str,
+        formatter: BlockyFormatter,
+        sample_size: int,
+        seed: int,
+) -> None:
+    if sample_size <= 0:
+        return
+
+    if 'pst2_1' not in formatter.target_cols or 'pst2_2' not in formatter.target_cols:
+        print('PST2 debug sample requested, but target_cols do not include pst2_1 and pst2_2. Skipping.')
+        return
+
+    data = pd.read_csv(data_path, dtype=str)
+    for col in ['occ1', 'pst2_1', 'pst2_2']:
+        if col not in data.columns:
+            print(f'PST2 debug sample requested, but {col} is missing from {data_path}. Skipping.')
+            return
+
+    has_both = data['pst2_1'].apply(_is_present_pst2) & data['pst2_2'].apply(_is_present_pst2)
+    data = data[has_both]
+    if data.empty:
+        print('PST2 debug sample requested, but no rows with both pst2_1 and pst2_2 present were found.')
+        return
+
+    sample_size = min(sample_size, len(data))
+    sample = data.sample(n=sample_size, random_state=seed)
+
+    print(f'PST2 debug sample diagnostics (n={sample_size}, seed={seed}):')
+    for idx, row in sample.iterrows():
+        serialized = formatter.sanitize(row)
+        labels = formatter.transform_label(row)
+        labels_int = labels.astype(int).tolist()
+        token_len = len(labels_int)
+        last_tokens = labels_int[-20:]
+        non_pad_tokens = int((labels != PAD_IDX).sum())
+        block_boundaries = [
+            1 + (block_idx + 1) * formatter.block_size
+            for block_idx in range(formatter.max_num_codes - 1)
+        ]
+        eos_early = False
+        for block_idx in range(formatter.max_num_codes):
+            start = 1 + block_idx * formatter.block_size
+            end = start + formatter.block_size
+            block = labels_int[start:end]
+            if EOS_IDX in block[:-1]:
+                eos_early = True
+                break
+        truncation = (token_len == formatter.max_seq_len) or eos_early
+
+        print(f'  row_index={idx}')
+        print(f'    raw occ1={row["occ1"]!r}')
+        print(f'    raw pst2_1={row["pst2_1"]!r}')
+        print(f'    raw pst2_2={row["pst2_2"]!r}')
+        print(f'    serialized target={serialized!r}')
+        print(f'    target token length={token_len} last_20_tokens={last_tokens}')
+        print(f'    non_padding_tokens={non_pad_tokens}')
+        print(f'    separator_block_boundaries={block_boundaries}')
+        print(f'    truncation={truncation} (len==max_seq_len or EOS before block end)')
 
 
 def check_if_data_prepared(save_path: str) -> dict[str, int] | None:
@@ -447,6 +521,12 @@ def main():
             all_codes_col=args.all_codes_col,
         )
         print("Data preparation stage completed.")
+        print_pst2_sample_diagnostics(
+            data_path=os.path.join(args.save_path, 'data_train.csv'),
+            formatter=formatter,
+            sample_size=args.debug_pst2_samples,
+            seed=args.debug_pst2_seed,
+        )
     
     # Wait for main process to finish data preparation
     if distributed:
