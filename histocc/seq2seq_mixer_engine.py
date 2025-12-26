@@ -19,7 +19,6 @@ from .utils import (
 )
 from .model_assets import Seq2SeqMixerOccCANINE
 from .loss import LossMixer
-from .prediction_assets import OccCANINE
 from .utils.decoder import mixer_greedy_decode
 
 
@@ -351,6 +350,26 @@ def _pst2_value_present(value: str | None) -> bool:
     return value not in {'', ' ', '?'}
 
 
+def _split_str_s2s(pred: str, sep_value: str) -> list[str] | str:
+    if sep_value and sep_value in pred:
+        return pred.split(sep_value)
+    return pred
+
+
+def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: bool) -> str:
+    if not use_within_block_sep:
+        return code
+    if code in inv_key:
+        return code
+    parts = code.split(',')
+    while len(parts) > 1 and parts[-1] == '0':
+        parts = parts[:-1]
+        normalized = ','.join(parts)
+        if normalized in inv_key:
+            return normalized
+    return code
+
+
 def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -> str:
     seq_len = formatter.max_seq_len
     block_size = formatter.block_size
@@ -392,10 +411,7 @@ def _run_pst2_eval_probe(
     sample_indices = [eligible_positions[i] for i in sample_tensor.tolist()]
 
     inv_key = dataset.map_code_label
-    helper = OccCANINE.__new__(OccCANINE)
-    helper.formatter = formatter
-    helper.use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
-    helper.key = {v: k for k, v in inv_key.items()}
+    use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
 
     model.eval()
     block2_nonpad_count = 0
@@ -439,13 +455,13 @@ def _run_pst2_eval_probe(
 
             pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
             pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
-            pred_block1_norm = OccCANINE._normalize_code_for_lookup(helper, pred_block1_raw, inv_key)
-            pred_block2_norm = OccCANINE._normalize_code_for_lookup(helper, pred_block2_raw, inv_key)
+            pred_block1_norm = _normalize_code_for_lookup(pred_block1_raw, inv_key, use_within_block_sep)
+            pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
             pred_block1_in_key = pred_block1_norm in inv_key
             pred_block2_in_key = pred_block2_norm in inv_key
 
             formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
-            split_pred = OccCANINE._split_str_s2s(helper, formatted_pred)
+            split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
             split_pred_list = split_pred if isinstance(split_pred, list) else [split_pred]
 
             if block2_nonpad:
