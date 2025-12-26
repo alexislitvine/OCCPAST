@@ -1,5 +1,7 @@
 import os
 import time
+from collections import Counter
+from dataclasses import dataclass
 
 import torch
 from torch.amp import autocast, GradScaler
@@ -8,7 +10,7 @@ from tqdm import tqdm
 from torch import nn
 from sklearn.metrics import accuracy_score
 
-from .formatter import PAD_IDX
+from .formatter import BOS_IDX, EOS_IDX, PAD_IDX
 from .utils import (
     create_mask,
     Averager,
@@ -17,6 +19,8 @@ from .utils import (
 )
 from .model_assets import Seq2SeqMixerOccCANINE
 from .loss import LossMixer
+from .prediction_assets import OccCANINE
+from .utils.decoder import mixer_greedy_decode
 
 
 def _save_model_checkpoint(
@@ -308,7 +312,214 @@ def evaluate(
                        f'Flat Acc: {flat_accs.avg:.2f}% | '
                        f'Val Loss: {losses.avg:.6f}')
 
+    _run_pst2_eval_probe(
+        model=model,
+        data_loader=data_loader,
+        device=device,
+        sample_size=200,
+        seed=42,
+    )
+
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg
+
+
+@dataclass
+class _PST2ProbeRow:
+    index: int
+    occ1: str
+    pst2_1: str
+    pst2_2: str
+    pred_block1_tokens: list[int]
+    pred_block2_tokens: list[int]
+    pred_block1_raw: str
+    pred_block2_raw: str
+    pred_block1_norm: str
+    pred_block2_norm: str
+    pred_block1_in_key: bool
+    pred_block2_in_key: bool
+    formatted_pred: str
+    split_pred: list[str] | str
+    block2_nonpad: bool
+
+
+def _pst2_value_present(value: str | None) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float):
+        return False
+    value = str(value)
+    return value not in {'', ' ', '?'}
+
+
+def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -> str:
+    seq_len = formatter.max_seq_len
+    block_size = formatter.block_size
+    start = 1 + block_index * block_size
+    end = start + block_size
+    seq = [PAD_IDX] * seq_len
+    seq[0] = BOS_IDX
+    seq[-1] = EOS_IDX
+    seq[start:end] = block_tokens
+    return formatter.clean_pred(torch.tensor(seq).numpy())
+
+
+def _run_pst2_eval_probe(
+        model: nn.Module,
+        data_loader: torch.utils.data.DataLoader,
+        device: torch.device,
+        sample_size: int = 200,
+        seed: int = 42,
+) -> None:
+    dataset = data_loader.dataset
+    formatter = dataset.formatter
+    if not hasattr(dataset, 'frame'):
+        return
+    if 'pst2_2' not in dataset.frame.columns:
+        return
+    if dataset.map_code_label is None:
+        print('PST2 eval probe skipped: dataset has no map_code_label.')
+        return
+
+    has_second = dataset.frame['pst2_2'].apply(_pst2_value_present).to_numpy()
+    eligible_positions = [idx for idx, flag in enumerate(has_second) if flag]
+    if not eligible_positions:
+        print('PST2 eval probe: no rows with pst2_2 present in eval dataset.')
+        return
+
+    rng = torch.Generator().manual_seed(seed)
+    sample_size = min(sample_size, len(eligible_positions))
+    sample_tensor = torch.randperm(len(eligible_positions), generator=rng)[:sample_size]
+    sample_indices = [eligible_positions[i] for i in sample_tensor.tolist()]
+
+    inv_key = dataset.map_code_label
+    helper = OccCANINE.__new__(OccCANINE)
+    helper.formatter = formatter
+    helper.use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
+    helper.key = {v: k for k, v in inv_key.items()}
+
+    model.eval()
+    block2_nonpad_count = 0
+    norm2_in_key_count = 0
+    format_contains_sep_value_count = 0
+    split_returns_2_count = 0
+    norm2_miss_counter = Counter()
+
+    examples_a: list[_PST2ProbeRow] = []
+    examples_b: list[_PST2ProbeRow] = []
+    examples_c: list[_PST2ProbeRow] = []
+
+    print('\n' + '=' * 80)
+    print('PST2 EVAL PROBE (deterministic sample)')
+    print(f'  sample_size={sample_size} seed={seed}')
+    print(f'  PAD_IDX={PAD_IDX} block_size={formatter.block_size} max_num_codes={formatter.max_num_codes}')
+
+    batch_size = 32
+    for offset in range(0, len(sample_indices), batch_size):
+        batch_indices = sample_indices[offset:offset + batch_size]
+        batch_items = [dataset[idx] for idx in batch_indices]
+        input_ids = torch.stack([item['input_ids'] for item in batch_items]).to(device, non_blocking=True)
+        attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
+
+        outputs = mixer_greedy_decode(
+            model=model,
+            descr=input_ids,
+            input_attention_mask=attention_mask,
+            device=device,
+            max_len=formatter.max_seq_len,
+            start_symbol=BOS_IDX,
+        )
+        preds_seq = outputs[0].cpu().numpy()
+
+        for row_pos, dataset_idx in enumerate(batch_indices):
+            record = dataset.frame.iloc[dataset_idx]
+            raw_seq = preds_seq[row_pos].tolist()
+            block1_tokens = raw_seq[1:1 + formatter.block_size]
+            block2_tokens = raw_seq[1 + formatter.block_size:1 + 2 * formatter.block_size]
+            block2_nonpad = any(tok != PAD_IDX for tok in block2_tokens)
+
+            pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
+            pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
+            pred_block1_norm = OccCANINE._normalize_code_for_lookup(helper, pred_block1_raw, inv_key)
+            pred_block2_norm = OccCANINE._normalize_code_for_lookup(helper, pred_block2_raw, inv_key)
+            pred_block1_in_key = pred_block1_norm in inv_key
+            pred_block2_in_key = pred_block2_norm in inv_key
+
+            formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
+            split_pred = OccCANINE._split_str_s2s(helper, formatted_pred)
+            split_pred_list = split_pred if isinstance(split_pred, list) else [split_pred]
+
+            if block2_nonpad:
+                block2_nonpad_count += 1
+            if pred_block2_in_key:
+                norm2_in_key_count += 1
+            if formatter.sep_value and formatter.sep_value in formatted_pred:
+                format_contains_sep_value_count += 1
+            if len(split_pred_list) == 2:
+                split_returns_2_count += 1
+            if block2_nonpad and not pred_block2_in_key:
+                norm2_miss_counter[pred_block2_norm] += 1
+
+            row = _PST2ProbeRow(
+                index=int(dataset_idx),
+                occ1=str(record['occ1']),
+                pst2_1=str(record['pst2_1']),
+                pst2_2=str(record['pst2_2']),
+                pred_block1_tokens=block1_tokens,
+                pred_block2_tokens=block2_tokens,
+                pred_block1_raw=pred_block1_raw,
+                pred_block2_raw=pred_block2_raw,
+                pred_block1_norm=pred_block1_norm,
+                pred_block2_norm=pred_block2_norm,
+                pred_block1_in_key=pred_block1_in_key,
+                pred_block2_in_key=pred_block2_in_key,
+                formatted_pred=formatted_pred,
+                split_pred=split_pred,
+                block2_nonpad=block2_nonpad,
+            )
+
+            if block2_nonpad and not pred_block2_in_key and len(examples_a) < 10:
+                examples_a.append(row)
+            if block2_nonpad and pred_block2_in_key and len(split_pred_list) == 1 and len(examples_b) < 10:
+                examples_b.append(row)
+            if not block2_nonpad and len(examples_c) < 10:
+                examples_c.append(row)
+
+            if offset == 0 and row_pos == 0:
+                print(f'  first_pred_tokens_head={raw_seq[:5]} tail={raw_seq[-5:]}')
+
+    total = float(sample_size)
+    print('\nSummary counters:')
+    print(f'  % pred_block2_nonpad: {block2_nonpad_count / total:.2%}')
+    print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
+    print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
+    print(f'  % split_returns_2: {split_returns_2_count / total:.2%}')
+
+    print('\nTop-20 normalized block-2 strings missing from key:')
+    for code, count in norm2_miss_counter.most_common(20):
+        print(f'  {code!r}: {count}')
+
+    def _print_examples(label: str, rows: list[_PST2ProbeRow]) -> None:
+        print(f'\nExamples ({label}):')
+        if not rows:
+            print('  (none)')
+            return
+        for row in rows:
+            print(f'  row_index={row.index}')
+            print(f'    occ1={row.occ1!r}')
+            print(f'    gold pst2_1={row.pst2_1!r} pst2_2={row.pst2_2!r}')
+            print(f'    pred_block1_tokens={row.pred_block1_tokens}')
+            print(f'    pred_block2_tokens={row.pred_block2_tokens}')
+            print(f'    pred_block1_raw={row.pred_block1_raw!r}')
+            print(f'    pred_block2_raw={row.pred_block2_raw!r}')
+            print(f'    pred_block1_norm={row.pred_block1_norm!r} in_key={row.pred_block1_in_key}')
+            print(f'    pred_block2_norm={row.pred_block2_norm!r} in_key={row.pred_block2_in_key}')
+            print(f'    formatted_pred={row.formatted_pred!r}')
+            print(f'    split_pred={row.split_pred}')
+
+    _print_examples('A) block2_nonpad=True but norm2_in_key=False', examples_a)
+    _print_examples('B) block2_nonpad=True, norm2_in_key=True but split_returns_1', examples_b)
+    _print_examples('C) block2_nonpad=False', examples_c)
+    print('=' * 80 + '\n')
 
 
 def train(
