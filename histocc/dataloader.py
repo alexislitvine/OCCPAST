@@ -851,6 +851,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             descriptions_text_col=descriptions_text_col,
             descriptions_lang_col=descriptions_lang_col,
         )
+        self._debug_target_samples = 0
 
     def _load_descriptions(
             self,
@@ -983,6 +984,36 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         occ_descr: str = record.occ1
         lang: str = record.lang
         targets_seq2seq = self.formatter.transform_label(record)
+        if self._debug_target_samples < 5 and pd.notna(record.get("pst2_2")):
+            serialized = self.formatter.sanitize(record)
+            non_pad = int((targets_seq2seq != PAD_IDX).sum())
+            last_tokens = targets_seq2seq[-20:].tolist()
+            boundary_pos = 1 + self.formatter.block_size
+            eos_positions = np.where(targets_seq2seq == EOS_IDX)[0].tolist()
+            trunc = len(targets_seq2seq) == self.formatter.max_seq_len
+            print(
+                "\n[DEBUG][dataset] occ1:",
+                record.occ1,
+                "\n  pst2_1:",
+                record.get("pst2_1"),
+                "\n  pst2_2:",
+                record.get("pst2_2"),
+                "\n  serialized:",
+                repr(serialized),
+                "\n  tokens_len:",
+                len(targets_seq2seq),
+                "\n  non_pad:",
+                non_pad,
+                "\n  block_boundary_pos:",
+                boundary_pos,
+                "\n  eos_positions:",
+                eos_positions,
+                "\n  last_20_tokens:",
+                last_tokens,
+                "\n  truncation:",
+                trunc,
+            )
+            self._debug_target_samples += 1
         target_linear = self._get_target_linear(record)
 
         # Optionally include description in the input during training

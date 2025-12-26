@@ -187,6 +187,8 @@ def prepare_target_cols(
 
     # Send all through formatter and track whether that works
     passes_formatter: list[bool] = []
+    DEBUG_LIMIT = 5
+    DEBUG_COUNT = 0
 
     # Track whether length shorter that block size, as that may indicate
     # that leading zeros have been dropped. We can do this by tracking
@@ -197,6 +199,40 @@ def prepare_target_cols(
     for i in range(len(data)):
         try:
             formatted = formatter.transform_label(data.iloc[i])
+            row = data.iloc[i]
+            if DEBUG_COUNT < DEBUG_LIMIT and pd.notna(row.get("pst2_2")):
+                serialized = formatter.sanitize(row)
+                non_pad = int((formatted != PAD_IDX).sum())
+                last_tokens = formatted[-20:].tolist()
+                # Block boundary is the code separator (no explicit token)
+                boundary_pos = 1 + formatter.block_size  # BOS + first block
+                trunc = len(formatted) == formatter.max_seq_len
+                eos_positions = np.where(formatted == EOS_IDX)[0].tolist()
+                print(
+                    "\n[DEBUG][prepare_target_cols] row",
+                    i,
+                    "\n  occ1:",
+                    row.get("occ1"),
+                    "\n  pst2_1:",
+                    row.get("pst2_1"),
+                    "\n  pst2_2:",
+                    row.get("pst2_2"),
+                    "\n  serialized:",
+                    repr(serialized),
+                    "\n  tokens_len:",
+                    len(formatted),
+                    "\n  non_pad:",
+                    non_pad,
+                    "\n  block_boundary_pos:",
+                    boundary_pos,
+                    "\n  eos_positions:",
+                    eos_positions,
+                    "\n  last_20_tokens:",
+                    last_tokens,
+                    "\n  truncation:",
+                    trunc,
+                )
+                DEBUG_COUNT += 1
             passes_formatter.append(True)
 
             if EOS_IDX in formatted[:-1]:
