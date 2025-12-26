@@ -413,7 +413,8 @@ def _run_pst2_eval_probe(
     inv_key = dataset.map_code_label
     use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
 
-    model.eval()
+    model_to_decode = model.module if hasattr(model, 'module') else model
+    model_to_decode.eval()
     block2_nonpad_count = 0
     norm2_in_key_count = 0
     format_contains_sep_value_count = 0
@@ -437,7 +438,7 @@ def _run_pst2_eval_probe(
         attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
 
         outputs = mixer_greedy_decode(
-            model=model,
+            model=model_to_decode,
             descr=input_ids,
             input_attention_mask=attention_mask,
             device=device,
