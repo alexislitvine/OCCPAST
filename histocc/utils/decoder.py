@@ -15,6 +15,10 @@ def greedy_decode(
         device: torch.device,
         max_len: int,
         start_symbol: int,
+        pad_idx: int | None = None,
+        block_size: int | None = None,
+        max_num_codes: int | None = None,
+        disallow_pad_in_block: bool = False,
         ) -> tuple[Tensor, Tensor]:
     memory = model.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
@@ -22,6 +26,9 @@ def greedy_decode(
     # Initialize sequence by placing BoS symbol.
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
+    code_region_len = None
+    if disallow_pad_in_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
+        code_region_len = block_size * max_num_codes
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -32,6 +39,9 @@ def greedy_decode(
             target_mask=target_mask,
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
+
+        if disallow_pad_in_block and code_region_len is not None and seq.shape[1] <= code_region_len:
+            out[..., pad_idx] = torch.finfo(out.dtype).min
 
         next_token = torch.argmax(out, dim=2).detach()
         next_prob = torch.max(nn.functional.softmax(out, dim=2), dim=2)[0].detach()
@@ -51,6 +61,10 @@ def mixer_greedy_decode(
         max_len: int,
         start_symbol: int,
         linear_topk: int = 5,
+        pad_idx: int | None = None,
+        block_size: int | None = None,
+        max_num_codes: int | None = None,
+        disallow_pad_in_block: bool = False,
         ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     memory, pooled_memory = model.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
@@ -65,6 +79,9 @@ def mixer_greedy_decode(
     # Initialize sequence by placing BoS symbol.
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
+    code_region_len = None
+    if disallow_pad_in_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
+        code_region_len = block_size * max_num_codes
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -75,6 +92,9 @@ def mixer_greedy_decode(
             target_mask=target_mask,
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
+
+        if disallow_pad_in_block and code_region_len is not None and seq.shape[1] <= code_region_len:
+            out[..., pad_idx] = torch.finfo(out.dtype).min
 
         next_token = torch.argmax(out, dim=2).detach()
         next_prob = torch.max(nn.functional.softmax(out, dim=2), dim=2)[0].detach()

@@ -100,6 +100,12 @@ def main():
         default="/home/alexis/PST_PREDICT/models/",
         help="Root directory containing PST models in subfolders. Each model folder should contain a last.bin file."
     )
+    parser.add_argument(
+        "--disallow-pad-in-block",
+        action="store_true",
+        default=False,
+        help="Disallow PAD during greedy decoding inside code blocks (seq2seq inference)."
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
@@ -172,7 +178,10 @@ def main():
         raise ValueError("Non unique ids after preprocessing!")
 
     # --- run predictions on df (same as before) ---
-    mod_hisco = OccCANINE(verbose=True)
+    mod_hisco = OccCANINE(
+        verbose=True,
+        disallow_pad_in_block=args.disallow_pad_in_block,
+    )
 
     # Discover PST models with last.bin under model_root and select
     model_root = Path(args.model_root)
@@ -220,6 +229,7 @@ def main():
         system="pst",
         use_within_block_sep=True,
         verbose=True,
+        disallow_pad_in_block=args.disallow_pad_in_block,
     )
 
     print("Running HISCO predictions…")
