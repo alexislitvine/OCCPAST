@@ -328,6 +328,8 @@ class _PST2ProbeRow:
     occ1: str
     pst2_1: str
     pst2_2: str
+    gold2_norm: str
+    gold2_in_key: bool
     pred_block1_tokens: list[int]
     pred_block2_tokens: list[int]
     pred_block1_raw: str
@@ -420,6 +422,8 @@ def _run_pst2_eval_probe(
     format_contains_sep_value_count = 0
     split_returns_2_count = 0
     norm2_miss_counter = Counter()
+    gold2_in_key_count = 0
+    gold2_miss_counter = Counter()
 
     examples_a: list[_PST2ProbeRow] = []
     examples_b: list[_PST2ProbeRow] = []
@@ -460,6 +464,9 @@ def _run_pst2_eval_probe(
             pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
             pred_block1_in_key = pred_block1_norm in inv_key
             pred_block2_in_key = pred_block2_norm in inv_key
+            gold2_raw = str(record['pst2_2'])
+            gold2_norm = _normalize_code_for_lookup(gold2_raw, inv_key, use_within_block_sep)
+            gold2_in_key = gold2_norm in inv_key
 
             formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
             split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
@@ -469,18 +476,24 @@ def _run_pst2_eval_probe(
                 block2_nonpad_count += 1
             if pred_block2_in_key:
                 norm2_in_key_count += 1
+            if gold2_in_key:
+                gold2_in_key_count += 1
             if formatter.sep_value and formatter.sep_value in formatted_pred:
                 format_contains_sep_value_count += 1
             if len(split_pred_list) == 2:
                 split_returns_2_count += 1
             if block2_nonpad and not pred_block2_in_key:
                 norm2_miss_counter[pred_block2_norm] += 1
+            if not gold2_in_key:
+                gold2_miss_counter[gold2_norm] += 1
 
             row = _PST2ProbeRow(
                 index=int(dataset_idx),
                 occ1=str(record['occ1']),
                 pst2_1=str(record['pst2_1']),
                 pst2_2=str(record['pst2_2']),
+                gold2_norm=gold2_norm,
+                gold2_in_key=gold2_in_key,
                 pred_block1_tokens=block1_tokens,
                 pred_block2_tokens=block2_tokens,
                 pred_block1_raw=pred_block1_raw,
@@ -508,12 +521,17 @@ def _run_pst2_eval_probe(
     print('\nSummary counters:')
     print(f'  % pred_block2_nonpad: {block2_nonpad_count / total:.2%}')
     print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
+    print(f'  % gold2_in_key: {gold2_in_key_count / total:.2%}')
     print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
     print(f'  % split_returns_2: {split_returns_2_count / total:.2%}')
 
     print('\nTop-20 normalized block-2 strings missing from key:')
     for code, count in norm2_miss_counter.most_common(20):
         print(f'  {code!r}: {count}')
+    if gold2_miss_counter:
+        print('\nTop-20 gold pst2_2 strings missing from key:')
+        for code, count in gold2_miss_counter.most_common(20):
+            print(f'  {code!r}: {count}')
 
     def _print_examples(label: str, rows: list[_PST2ProbeRow]) -> None:
         print(f'\nExamples ({label}):')
@@ -530,6 +548,7 @@ def _run_pst2_eval_probe(
             print(f'    pred_block2_raw={row.pred_block2_raw!r}')
             print(f'    pred_block1_norm={row.pred_block1_norm!r} in_key={row.pred_block1_in_key}')
             print(f'    pred_block2_norm={row.pred_block2_norm!r} in_key={row.pred_block2_in_key}')
+            print(f'    gold2_norm={row.gold2_norm!r} in_key={row.gold2_in_key}')
             print(f'    formatted_pred={row.formatted_pred!r}')
             print(f'    split_pred={row.split_pred}')
 
