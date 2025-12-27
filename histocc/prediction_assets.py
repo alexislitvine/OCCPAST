@@ -162,7 +162,7 @@ class OccCANINE:
             descriptions: pd.DataFrame | None = None,
             use_within_block_sep: bool = False, # Should be True for systems with ',' between digits
             target_cols: list[str] | None = None,
-            disallow_pad_in_block: bool = False,
+            disallow_pad_inside_block: bool = False,
     ):
         """
         Initializes the OccCANINE model with specified configurations.
@@ -203,7 +203,7 @@ class OccCANINE:
         # System
         self.system = system
         self.use_within_block_sep = use_within_block_sep
-        self.disallow_pad_in_block = disallow_pad_in_block
+        self.disallow_pad_inside_block = disallow_pad_inside_block
 
         if self.system == "hisco": # TODO: Handle other model specs
             # Formatter
@@ -509,7 +509,7 @@ class OccCANINE:
             deduplicate: bool = False,
             order_invariant_conf: bool = True,
             debug: bool = False,
-            disallow_pad_in_block: bool | None = None,
+            disallow_pad_inside_block: bool | None = None,
     ):
         """
         Makes predictions on a batch of occupational strings.
@@ -550,8 +550,8 @@ class OccCANINE:
         """
         # Store debug flag for use in other methods
         self._debug = debug
-        if disallow_pad_in_block is not None:
-            self.disallow_pad_in_block = disallow_pad_in_block
+        if disallow_pad_inside_block is not None:
+            self.disallow_pad_inside_block = disallow_pad_inside_block
         
         # Validate prediction arguments' compatability
         prediction_type = self._validate_and_update_prediction_parameters(behavior, prediction_type)
@@ -830,7 +830,7 @@ class OccCANINE:
                 pad_idx = PAD_IDX,
                 block_size = data_loader.dataset.formatter.block_size,
                 max_num_codes = data_loader.dataset.formatter.max_num_codes,
-                disallow_pad_in_block = self.disallow_pad_in_block,
+                disallow_pad_inside_block = self.disallow_pad_inside_block,
                 )
 
             outputs_s2s = outputs[0].cpu().numpy()

@@ -101,7 +101,7 @@ def main():
         help="Root directory containing PST models in subfolders. Each model folder should contain a last.bin file."
     )
     parser.add_argument(
-        "--disallow-pad-in-block",
+        "--disallow-pad-inside-block",
         action="store_true",
         default=False,
         help="Disallow PAD during greedy decoding inside code blocks (seq2seq inference)."
@@ -180,7 +180,7 @@ def main():
     # --- run predictions on df (same as before) ---
     mod_hisco = OccCANINE(
         verbose=True,
-        disallow_pad_in_block=args.disallow_pad_in_block,
+        disallow_pad_inside_block=args.disallow_pad_inside_block,
     )
 
     # Discover PST models with last.bin under model_root and select
@@ -229,7 +229,7 @@ def main():
         system="pst",
         use_within_block_sep=True,
         verbose=True,
-        disallow_pad_in_block=args.disallow_pad_in_block,
+        disallow_pad_inside_block=args.disallow_pad_inside_block,
     )
 
     print("Running HISCO predictions…")

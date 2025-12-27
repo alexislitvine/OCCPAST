@@ -73,7 +73,7 @@ def train_one_epoch(
         distributed: bool = False,
         is_main_process: bool = True,
         scaler: GradScaler | None = None,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
         ) -> int:
     model = model.train()
 
@@ -200,7 +200,7 @@ def train_one_epoch(
                 data_loader=data_loader_eval,
                 loss_fn=loss_fn,
                 device=device,
-                disallow_pad_in_block=disallow_pad_in_block,
+                disallow_pad_inside_block=disallow_pad_inside_block,
             )
             model.train()
             
@@ -246,7 +246,7 @@ def evaluate(
         loss_fn: nn.Module,
         device: torch.device,
         log_interval: int = 100,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
         ):
     model = model.eval()
 
@@ -320,7 +320,7 @@ def evaluate(
         device=device,
         sample_size=200,
         seed=42,
-        disallow_pad_in_block=disallow_pad_in_block,
+        disallow_pad_inside_block=disallow_pad_inside_block,
     )
 
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg
@@ -394,7 +394,7 @@ def _run_pst2_eval_probe(
         device: torch.device,
         sample_size: int = 200,
         seed: int = 42,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
 ) -> None:
     dataset = data_loader.dataset
     formatter = dataset.formatter
@@ -424,6 +424,9 @@ def _run_pst2_eval_probe(
     model_to_decode.eval()
     block2_nonpad_count = 0
     block2_nonpad_with_pad_count = 0
+    pad_inside_block_count = 0
+    pad_inside_block_total = 0
+    blocks_emitted_counter = Counter()
     norm2_in_key_count = 0
     format_contains_sep_value_count = 0
     split_returns_2_count = 0
@@ -447,6 +450,7 @@ def _run_pst2_eval_probe(
         input_ids = torch.stack([item['input_ids'] for item in batch_items]).to(device, non_blocking=True)
         attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
 
+        decode_max_num_codes = min(2, formatter.max_num_codes)
         outputs = mixer_greedy_decode(
             model=model_to_decode,
             descr=input_ids,
@@ -456,8 +460,8 @@ def _run_pst2_eval_probe(
             start_symbol=BOS_IDX,
             pad_idx=PAD_IDX,
             block_size=formatter.block_size,
-            max_num_codes=formatter.max_num_codes,
-            disallow_pad_in_block=disallow_pad_in_block,
+            max_num_codes=decode_max_num_codes,
+            disallow_pad_inside_block=disallow_pad_inside_block,
         )
         preds_seq = outputs[0].cpu().numpy()
 
@@ -468,6 +472,17 @@ def _run_pst2_eval_probe(
             block2_tokens = raw_seq[1 + formatter.block_size:1 + 2 * formatter.block_size]
             block2_nonpad = any(tok != PAD_IDX for tok in block2_tokens)
             block2_has_pad = any(tok == PAD_IDX for tok in block2_tokens)
+            code_region_tokens = raw_seq[1:1 + decode_max_num_codes * formatter.block_size]
+            pad_inside_block_total += decode_max_num_codes * (formatter.block_size - 1)
+            pad_inside_block_count += sum(
+                tok == PAD_IDX for idx, tok in enumerate(code_region_tokens) if idx % formatter.block_size != 0
+            )
+            emitted_blocks = 0
+            for block_start in range(1, 1 + decode_max_num_codes * formatter.block_size, formatter.block_size):
+                if raw_seq[block_start] == PAD_IDX:
+                    break
+                emitted_blocks += 1
+            blocks_emitted_counter[emitted_blocks] += 1
 
             pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
             pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
@@ -537,6 +552,9 @@ def _run_pst2_eval_probe(
         print(f'  % block2_nonpad_with_pad: {block2_nonpad_with_pad_count / block2_nonpad_count:.2%}')
         if block2_nonpad_with_pad_count:
             print('  WARN: block2_nonpad rows still contain PAD tokens inside the block.')
+    if pad_inside_block_total:
+        print(f'  % pad_inside_block: {pad_inside_block_count / pad_inside_block_total:.2%}')
+    print(f'  blocks_emitted distribution: {dict(blocks_emitted_counter)}')
     print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
     print(f'  % gold2_in_key: {gold2_in_key_count / total:.2%}')
     print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
@@ -594,7 +612,7 @@ def train(
         distributed: bool = False,
         is_main_process: bool = True,
         use_amp: bool = False,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -629,7 +647,7 @@ def train(
             distributed=distributed,
             is_main_process=is_main_process,
             scaler=scaler,
-            disallow_pad_in_block=disallow_pad_in_block,
+            disallow_pad_inside_block=disallow_pad_inside_block,
         )
         
         # Save at the end of each epoch if the flag is set

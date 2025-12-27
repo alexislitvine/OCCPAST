@@ -18,7 +18,7 @@ def greedy_decode(
         pad_idx: int | None = None,
         block_size: int | None = None,
         max_num_codes: int | None = None,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
         ) -> tuple[Tensor, Tensor]:
     memory = model.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
@@ -27,8 +27,9 @@ def greedy_decode(
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
     code_region_len = None
-    if disallow_pad_in_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
+    if disallow_pad_inside_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
         code_region_len = block_size * max_num_codes
+    finished_code_region = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -40,11 +41,28 @@ def greedy_decode(
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
 
-        if disallow_pad_in_block and code_region_len is not None and seq.shape[1] <= code_region_len:
-            out[..., pad_idx] = torch.finfo(out.dtype).min
+        if disallow_pad_inside_block and code_region_len is not None and seq.shape[1] <= code_region_len:
+            pos = seq.shape[1] - 1
+            pos_in_block = pos % block_size
+            if pos_in_block != 0:
+                out[..., pad_idx] = torch.finfo(out.dtype).min
 
         next_token = torch.argmax(out, dim=2).detach()
         next_prob = torch.max(nn.functional.softmax(out, dim=2), dim=2)[0].detach()
+
+        if disallow_pad_inside_block and code_region_len is not None and pad_idx is not None:
+            pos = seq.shape[1] - 1
+            pos_in_block = pos % block_size
+            in_code_region = pos >= 0 and pos < code_region_len
+            pad_at_boundary = (next_token.squeeze(1) == pad_idx) & (pos_in_block == 0) & in_code_region
+            if pad_at_boundary.any():
+                finished_code_region = finished_code_region | pad_at_boundary
+            if finished_code_region.any() and pos < code_region_len:
+                next_token = torch.where(
+                    finished_code_region.unsqueeze(1),
+                    torch.full_like(next_token, pad_idx),
+                    next_token,
+                )
 
         # Extend sequence by adding prediction of next token.
         seq = torch.cat([seq, next_token], dim=1)
@@ -64,7 +82,7 @@ def mixer_greedy_decode(
         pad_idx: int | None = None,
         block_size: int | None = None,
         max_num_codes: int | None = None,
-        disallow_pad_in_block: bool = False,
+        disallow_pad_inside_block: bool = False,
         ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     memory, pooled_memory = model.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
@@ -80,8 +98,9 @@ def mixer_greedy_decode(
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
     code_region_len = None
-    if disallow_pad_in_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
+    if disallow_pad_inside_block and pad_idx is not None and block_size is not None and max_num_codes is not None:
         code_region_len = block_size * max_num_codes
+    finished_code_region = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -93,11 +112,28 @@ def mixer_greedy_decode(
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
 
-        if disallow_pad_in_block and code_region_len is not None and seq.shape[1] <= code_region_len:
-            out[..., pad_idx] = torch.finfo(out.dtype).min
+        if disallow_pad_inside_block and code_region_len is not None and seq.shape[1] <= code_region_len:
+            pos = seq.shape[1] - 1
+            pos_in_block = pos % block_size
+            if pos_in_block != 0:
+                out[..., pad_idx] = torch.finfo(out.dtype).min
 
         next_token = torch.argmax(out, dim=2).detach()
         next_prob = torch.max(nn.functional.softmax(out, dim=2), dim=2)[0].detach()
+
+        if disallow_pad_inside_block and code_region_len is not None and pad_idx is not None:
+            pos = seq.shape[1] - 1
+            pos_in_block = pos % block_size
+            in_code_region = pos >= 0 and pos < code_region_len
+            pad_at_boundary = (next_token.squeeze(1) == pad_idx) & (pos_in_block == 0) & in_code_region
+            if pad_at_boundary.any():
+                finished_code_region = finished_code_region | pad_at_boundary
+            if finished_code_region.any() and pos < code_region_len:
+                next_token = torch.where(
+                    finished_code_region.unsqueeze(1),
+                    torch.full_like(next_token, pad_idx),
+                    next_token,
+                )
 
         # Extend sequence by adding prediction of next token.
         seq = torch.cat([seq, next_token], dim=1)
