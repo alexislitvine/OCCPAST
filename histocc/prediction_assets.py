@@ -513,6 +513,7 @@ class OccCANINE:
             debug: bool = False,
             disallow_pad_inside_block: bool | None = None,
             disallow_zero_at_block_start: bool | None = None,
+            max_num_codes: int | None = None,
     ):
         """
         Makes predictions on a batch of occupational strings.
@@ -825,6 +826,7 @@ class OccCANINE:
 
             batch_time_data.update(time.time() - end)
 
+            decoder_max_num_codes = max_num_codes if max_num_codes is not None else data_loader.dataset.formatter.max_num_codes
             outputs = decoder(
                 model = model,
                 descr = input_ids,
@@ -834,7 +836,7 @@ class OccCANINE:
                 start_symbol = BOS_IDX,
                 pad_idx = PAD_IDX,
                 block_size = data_loader.dataset.formatter.block_size,
-                max_num_codes = data_loader.dataset.formatter.max_num_codes,
+                max_num_codes = decoder_max_num_codes,
                 disallow_pad_inside_block = self.disallow_pad_inside_block,
                 disallow_zero_at_block_start = self.disallow_zero_at_block_start,
                 zero_idx = data_loader.dataset.formatter.map_char_idx.get('0'),

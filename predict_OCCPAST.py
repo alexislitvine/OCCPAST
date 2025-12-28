@@ -112,6 +112,12 @@ def main():
         default=False,
         help="Disallow predicting token '0' at the start of each block during greedy decoding."
     )
+    parser.add_argument(
+        "--max-num-codes",
+        type=int,
+        default=None,
+        help="Override max_num_codes for greedy decoding during prediction."
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
@@ -245,6 +251,7 @@ def main():
         df.occ1_clean.tolist(),
         k_pred=HOW_MANY_PREDS,
         debug=args.debug,
+        max_num_codes=args.max_num_codes,
     )
     pred_hisco["id"] = df["id"].tolist()
     pred_hisco["occ1"] = df["occ1_original"].tolist()
@@ -258,6 +265,7 @@ def main():
         df.occ1_clean.tolist(),
         k_pred=HOW_MANY_PREDS,
         debug=args.debug,
+        max_num_codes=args.max_num_codes,
     )
     pred_pst["id"] = df["id"].tolist()
     pred_pst["occ1"] = df["occ1_original"].tolist()
