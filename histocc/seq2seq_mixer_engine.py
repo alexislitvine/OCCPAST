@@ -101,6 +101,7 @@ def train_one_epoch(
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
+        gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
 
         batch_time_data.update(time.time() - end)
 
@@ -285,9 +286,10 @@ def evaluate(
             out_linear=out_linear,
             target_seq2seq=targets_seq2seq,
             target_linear=targets_linear,
+            gold_num_codes=gold_num_codes,
             )
         loss_linear = loss_fn.loss_fn_linear(out_linear, targets_linear)
-        loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq)
+        loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq, gold_num_codes=gold_num_codes)
 
         losses.update(loss.item(), out_seq2seq.size(0))
         losses_linear.update(loss_linear.item(), out_seq2seq.size(0))
