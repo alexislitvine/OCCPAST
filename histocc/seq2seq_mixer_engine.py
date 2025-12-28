@@ -74,6 +74,7 @@ def train_one_epoch(
         is_main_process: bool = True,
         scaler: GradScaler | None = None,
         disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
         ) -> int:
     model = model.train()
 
@@ -201,6 +202,7 @@ def train_one_epoch(
                 loss_fn=loss_fn,
                 device=device,
                 disallow_pad_inside_block=disallow_pad_inside_block,
+                disallow_zero_at_block_start=disallow_zero_at_block_start,
             )
             model.train()
             
@@ -247,6 +249,7 @@ def evaluate(
         device: torch.device,
         log_interval: int = 100,
         disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
         ):
     model = model.eval()
 
@@ -321,6 +324,7 @@ def evaluate(
         sample_size=200,
         seed=42,
         disallow_pad_inside_block=disallow_pad_inside_block,
+        disallow_zero_at_block_start=disallow_zero_at_block_start,
     )
 
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg
@@ -395,6 +399,7 @@ def _run_pst2_eval_probe(
         sample_size: int = 200,
         seed: int = 42,
         disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
 ) -> None:
     dataset = data_loader.dataset
     formatter = dataset.formatter
@@ -427,10 +432,13 @@ def _run_pst2_eval_probe(
     pad_inside_block_count = 0
     pad_inside_block_total = 0
     blocks_emitted_counter = Counter()
+    block_start_zero_count = 0
+    block_start_total = 0
     norm2_in_key_count = 0
     format_contains_sep_value_count = 0
     split_returns_2_count = 0
     norm2_miss_counter = Counter()
+    pred_block2_raw_counter = Counter()
     gold2_in_key_count = 0
     gold2_miss_counter = Counter()
 
@@ -451,6 +459,7 @@ def _run_pst2_eval_probe(
         attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
 
         decode_max_num_codes = min(2, formatter.max_num_codes)
+        zero_idx = formatter.map_char_idx.get('0')
         outputs = mixer_greedy_decode(
             model=model_to_decode,
             descr=input_ids,
@@ -462,6 +471,8 @@ def _run_pst2_eval_probe(
             block_size=formatter.block_size,
             max_num_codes=decode_max_num_codes,
             disallow_pad_inside_block=disallow_pad_inside_block,
+            disallow_zero_at_block_start=disallow_zero_at_block_start,
+            zero_idx=zero_idx,
         )
         preds_seq = outputs[0].cpu().numpy()
 
@@ -483,6 +494,11 @@ def _run_pst2_eval_probe(
                     break
                 emitted_blocks += 1
             blocks_emitted_counter[emitted_blocks] += 1
+            if zero_idx is not None:
+                for block_start in range(1, 1 + decode_max_num_codes * formatter.block_size, formatter.block_size):
+                    block_start_total += 1
+                    if raw_seq[block_start] == zero_idx:
+                        block_start_zero_count += 1
 
             pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
             pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
@@ -514,6 +530,7 @@ def _run_pst2_eval_probe(
                 norm2_miss_counter[pred_block2_norm] += 1
             if not gold2_in_key:
                 gold2_miss_counter[gold2_norm] += 1
+            pred_block2_raw_counter[pred_block2_raw] += 1
 
             row = _PST2ProbeRow(
                 index=int(dataset_idx),
@@ -555,6 +572,8 @@ def _run_pst2_eval_probe(
     if pad_inside_block_total:
         print(f'  % pad_inside_block: {pad_inside_block_count / pad_inside_block_total:.2%}')
     print(f'  blocks_emitted distribution: {dict(blocks_emitted_counter)}')
+    if block_start_total:
+        print(f'  % block_starts_predicted_zero: {block_start_zero_count / block_start_total:.2%}')
     print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
     print(f'  % gold2_in_key: {gold2_in_key_count / total:.2%}')
     print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
@@ -567,6 +586,9 @@ def _run_pst2_eval_probe(
         print('\nTop-20 gold pst2_2 strings missing from key:')
         for code, count in gold2_miss_counter.most_common(20):
             print(f'  {code!r}: {count}')
+    print('\nTop-10 block-2 raw strings:')
+    for code, count in pred_block2_raw_counter.most_common(10):
+        print(f'  {code!r}: {count}')
 
     def _print_examples(label: str, rows: list[_PST2ProbeRow]) -> None:
         print(f'\nExamples ({label}):')
@@ -613,6 +635,7 @@ def train(
         is_main_process: bool = True,
         use_amp: bool = False,
         disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -648,6 +671,7 @@ def train(
             is_main_process=is_main_process,
             scaler=scaler,
             disallow_pad_inside_block=disallow_pad_inside_block,
+            disallow_zero_at_block_start=disallow_zero_at_block_start,
         )
         
         # Save at the end of each epoch if the flag is set

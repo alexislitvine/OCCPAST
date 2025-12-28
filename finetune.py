@@ -118,6 +118,7 @@ def parse_args():
     parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
     parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed (int) for selecting PST2 debug rows.')
     parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Disallow PAD during greedy decoding inside code blocks during eval/probing.')
+    parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
 
     args = parser.parse_args()
 
@@ -721,6 +722,7 @@ def main():
         is_main_process=is_main_process(),
         use_amp=args.use_amp,
         disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
     )
     
     # Cleanup distributed training

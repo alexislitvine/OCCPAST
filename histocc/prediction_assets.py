@@ -163,6 +163,7 @@ class OccCANINE:
             use_within_block_sep: bool = False, # Should be True for systems with ',' between digits
             target_cols: list[str] | None = None,
             disallow_pad_inside_block: bool = False,
+            disallow_zero_at_block_start: bool = False,
     ):
         """
         Initializes the OccCANINE model with specified configurations.
@@ -204,6 +205,7 @@ class OccCANINE:
         self.system = system
         self.use_within_block_sep = use_within_block_sep
         self.disallow_pad_inside_block = disallow_pad_inside_block
+        self.disallow_zero_at_block_start = disallow_zero_at_block_start
 
         if self.system == "hisco": # TODO: Handle other model specs
             # Formatter
@@ -510,6 +512,7 @@ class OccCANINE:
             order_invariant_conf: bool = True,
             debug: bool = False,
             disallow_pad_inside_block: bool | None = None,
+            disallow_zero_at_block_start: bool | None = None,
     ):
         """
         Makes predictions on a batch of occupational strings.
@@ -552,6 +555,8 @@ class OccCANINE:
         self._debug = debug
         if disallow_pad_inside_block is not None:
             self.disallow_pad_inside_block = disallow_pad_inside_block
+        if disallow_zero_at_block_start is not None:
+            self.disallow_zero_at_block_start = disallow_zero_at_block_start
         
         # Validate prediction arguments' compatability
         prediction_type = self._validate_and_update_prediction_parameters(behavior, prediction_type)
@@ -831,6 +836,8 @@ class OccCANINE:
                 block_size = data_loader.dataset.formatter.block_size,
                 max_num_codes = data_loader.dataset.formatter.max_num_codes,
                 disallow_pad_inside_block = self.disallow_pad_inside_block,
+                disallow_zero_at_block_start = self.disallow_zero_at_block_start,
+                zero_idx = data_loader.dataset.formatter.map_char_idx.get('0'),
                 )
 
             outputs_s2s = outputs[0].cpu().numpy()

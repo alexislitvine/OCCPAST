@@ -106,6 +106,12 @@ def main():
         default=False,
         help="Disallow PAD during greedy decoding inside code blocks (seq2seq inference)."
     )
+    parser.add_argument(
+        "--disallow-zero-at-block-start",
+        action="store_true",
+        default=False,
+        help="Disallow predicting token '0' at the start of each block during greedy decoding."
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
@@ -181,6 +187,7 @@ def main():
     mod_hisco = OccCANINE(
         verbose=True,
         disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
     )
 
     # Discover PST models with last.bin under model_root and select
@@ -230,6 +237,7 @@ def main():
         use_within_block_sep=True,
         verbose=True,
         disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
     )
 
     print("Running HISCO predictions…")
