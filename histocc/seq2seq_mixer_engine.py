@@ -102,7 +102,6 @@ def train_one_epoch(
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
         gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
-        gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
 
         batch_time_data.update(time.time() - end)
 
@@ -252,8 +251,16 @@ def evaluate(
         log_interval: int = 100,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        require_gold_num_codes: bool = False,
         ):
     model = model.eval()
+    if not hasattr(evaluate, "_logged_file"):
+        evaluate._logged_file = True
+        rank = 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(f'evaluate() running from {__file__}')
 
     losses = Averager()
     losses_linear = Averager()
@@ -268,6 +275,11 @@ def evaluate(
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
+        gold_num_codes = batch.get('gold_num_codes')
+        if gold_num_codes is not None:
+            gold_num_codes = gold_num_codes.to(device, non_blocking=True)
+        elif require_gold_num_codes:
+            raise ValueError("gold_num_codes is required for evaluate(), but was not found in the batch.")
 
         # Prepare target as input for seq2seq model
         target_seq2seq_input = targets_seq2seq[:, :-1]
