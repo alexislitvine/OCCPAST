@@ -103,6 +103,7 @@ def train_one_epoch(
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
         gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
         gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
+        gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
 
         batch_time_data.update(time.time() - end)
 
