@@ -844,6 +844,26 @@ class OccCANINE:
 
             outputs_s2s = outputs[0].cpu().numpy()
             probs_s2s = outputs[1].cpu().numpy()
+            formatter = data_loader.dataset.formatter
+            key_lookup = getattr(data_loader.dataset, "map_code_label", None) or self.key
+
+            for row_idx, raw_seq in enumerate(outputs_s2s):
+                block2_start = 1 + formatter.block_size
+                block2_end = block2_start + formatter.block_size
+                block2_tokens = raw_seq[block2_start:block2_end]
+                if (block2_tokens == PAD_IDX).all():
+                    continue
+                if (block2_tokens == PAD_IDX).any():
+                    raw_seq[block2_start:block2_end] = PAD_IDX
+                    continue
+                seq_len = formatter.max_seq_len
+                seq = [PAD_IDX] * seq_len
+                seq[0] = BOS_IDX
+                seq[-1] = EOS_IDX
+                seq[block2_start:block2_end] = block2_tokens.tolist()
+                block2_raw = formatter.clean_pred(torch.tensor(seq).numpy())
+                if block2_raw not in key_lookup:
+                    raw_seq[block2_start:block2_end] = PAD_IDX
 
             # Compute order invariant confidence
             if order_invariant_conf:

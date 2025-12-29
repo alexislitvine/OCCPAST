@@ -254,6 +254,7 @@ class BlockOrderInvariantLoss(nn.Module):
             block_size: int = 5,
             push_to_pad_scale_factor: float = 1.0,
             push_to_pad_label_smoothing: float = 0.0,
+            gate_weight: float = 2.0,
     ):
         super().__init__()
 
@@ -261,6 +262,7 @@ class BlockOrderInvariantLoss(nn.Module):
         self.nb_blocks = nb_blocks
         self.block_size = block_size
         self.push_to_pad_scale_factor = push_to_pad_scale_factor
+        self.gate_weight = gate_weight
 
         # Loss to push towards occupations, and where loss is
         # invariant towards the order of predicted "blocks"
@@ -288,20 +290,40 @@ class BlockOrderInvariantLoss(nn.Module):
             self,
             yhat: Tensor, # [BATCH_SIZE, VOCAB, BLOCK_SIZE * NB_BLOCKS]
             target_mask: Tensor,
+            gold_num_codes: Tensor | None = None,
     ) -> Tensor:
         padding_loss = self.padding_cross_entropy(
             yhat,
             self.padding_mask.repeat(yhat.size(0), 1), # expand mask to batch size
         )
 
-        # Block-wise push towards padding
-        padding_loss = padding_loss.view(yhat.size(0), self.nb_blocks, self.block_size).mean(dim=2)
+        if gold_num_codes is None:
+            # Block-wise push towards padding
+            padding_loss = padding_loss.view(yhat.size(0), self.nb_blocks, self.block_size).mean(dim=2)
 
-        # Only count as loss if no target block, otherwise set to zero
-        # to not push towards padding where predictions should occur
-        padding_loss[~target_mask] = 0
+            # Only count as loss if no target block, otherwise set to zero
+            # to not push towards padding where predictions should occur
+            padding_loss[~target_mask] = 0
 
-        return padding_loss.mean()
+            return padding_loss.mean()
+
+        seq_len = self.nb_blocks * self.block_size
+        positions = torch.arange(seq_len, device=padding_loss.device).unsqueeze(0)
+        cutoff = gold_num_codes.unsqueeze(1) * self.block_size
+        weight_mask = positions >= cutoff
+        gate_pos = self.block_size
+        single_mask = gold_num_codes == 1
+        if single_mask.any():
+            weight_mask = weight_mask & (~single_mask.unsqueeze(1))
+            weight_mask = weight_mask.to(padding_loss.dtype)
+            weight_mask[single_mask, :] = 0
+            weight_mask[single_mask, gate_pos] = self.gate_weight
+        else:
+            weight_mask = weight_mask.to(padding_loss.dtype)
+
+        denom = weight_mask.sum(dim=1).clamp(min=1)
+        weighted_loss = (padding_loss * weight_mask).sum(dim=1) / denom
+        return weighted_loss.mean()
 
     def _order_invariant_loss(
             self,
@@ -417,7 +439,7 @@ class BlockOrderInvariantLoss(nn.Module):
         target_mask = self._get_target_mask(target) if gold_num_codes is None else self._get_target_mask_from_gold(gold_num_codes)
 
         order_invariant_loss = self._order_invariant_loss(yhat, target, target_mask, gold_num_codes=gold_num_codes)
-        push_to_pad_loss = self._push_to_pad(yhat, target_mask)
+        push_to_pad_loss = self._push_to_pad(yhat, target_mask, gold_num_codes=gold_num_codes)
 
         loss = order_invariant_loss + self.push_to_pad_scale_factor * push_to_pad_loss
 
