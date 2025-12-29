@@ -61,3 +61,17 @@ def test_evaluate_handles_gold_num_codes():
         device=torch.device("cpu"),
         log_interval=1,
     )
+
+
+def test_stack_sampled_items_handles_strings_and_tensors():
+    from histocc.seq2seq_mixer_engine import _stack_sampled_items
+
+    sampled_items = [
+        {"input_ids": torch.tensor([1, 2]), "occ1": "foo", "gold_num_codes": 1},
+        {"input_ids": torch.tensor([3, 4]), "occ1": "bar", "gold_num_codes": 2},
+    ]
+    stacked = _stack_sampled_items(sampled_items, is_main_process=False)
+    assert torch.is_tensor(stacked["input_ids"])
+    assert stacked["input_ids"].shape == (2, 2)
+    assert stacked["occ1"] == ["foo", "bar"]
+    assert torch.is_tensor(stacked["gold_num_codes"])

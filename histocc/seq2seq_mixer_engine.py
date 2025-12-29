@@ -57,6 +57,39 @@ def _save_model_checkpoint(
     torch.save(states, os.path.join(save_dir, 'last.bin'))
 
 
+def _stack_sampled_items(
+        sampled_items: list[dict[str, torch.Tensor | str | int | float]],
+        is_main_process: bool,
+        ) -> dict[str, torch.Tensor | list]:
+    stacked_batch: dict[str, torch.Tensor | list] = {}
+    for key in sampled_items[0].keys():
+        values = [item[key] for item in sampled_items]
+        first = values[0]
+        if torch.is_tensor(first):
+            try:
+                stacked_batch[key] = torch.stack(values)
+            except RuntimeError as exc:
+                raise ValueError(f"Failed to stack tensor key='{key}' with shapes {[v.shape for v in values]}") from exc
+            continue
+        if isinstance(first, (int, float)):
+            stacked_batch[key] = torch.tensor(values)
+            continue
+        if isinstance(first, str):
+            if is_main_process and not hasattr(_stack_sampled_items, "_logged_str_key"):
+                _stack_sampled_items._logged_str_key = True
+                print(
+                    "Doubles-quota sampling: non-tensor key encountered "
+                    f"key={key!r} type={type(first)} example={first!r} keys={list(sampled_items[0].keys())}"
+                )
+            stacked_batch[key] = values
+            continue
+        try:
+            stacked_batch[key] = torch.tensor(values)
+        except Exception as exc:
+            raise ValueError(f"Unsupported batch key={key!r} type={type(first)}") from exc
+    return stacked_batch
+
+
 def train_one_epoch(
         model: Seq2SeqMixerOccCANINE,
         data_loader: torch.utils.data.DataLoader,
@@ -132,9 +165,15 @@ def train_one_epoch(
                         replace_idx = singles_idx[:replace_count]
                         sampled_indices = random.choices(double_indices, k=replace_count)
                         sampled_items = [dataset[idx] for idx in sampled_indices]
-                        for key in batch:
-                            stacked = torch.stack([item[key] for item in sampled_items])
-                            batch[key][replace_idx] = stacked
+                        stacked_items = _stack_sampled_items(sampled_items, is_main_process=is_main_process)
+                        for key, stacked in stacked_items.items():
+                            if torch.is_tensor(batch[key]):
+                                if not torch.is_tensor(stacked):
+                                    raise ValueError(f"Expected tensor for key '{key}' but got {type(stacked)}")
+                                batch[key][replace_idx] = stacked.to(batch[key].device)
+                            else:
+                                for idx, row_idx in enumerate(replace_idx):
+                                    batch[key][row_idx] = stacked[idx]
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
