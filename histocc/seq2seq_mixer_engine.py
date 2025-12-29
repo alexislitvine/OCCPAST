@@ -1,5 +1,6 @@
 import os
 import time
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 
@@ -476,8 +477,10 @@ def _run_pst2_eval_probe(
 
         block2_nonpad_count = 0
         block2_nonpad_with_pad_count = 0
-        pad_inside_block_count = 0
-        pad_inside_block_total = 0
+        pad_inside_block_pred_count = 0
+        pad_inside_block_pred_total = 0
+        pad_inside_block_gold_count = 0
+        pad_inside_block_gold_total = 0
         blocks_emitted_counter = Counter()
         block_start_zero_count = 0
         block_start_total = 0
@@ -492,12 +495,18 @@ def _run_pst2_eval_probe(
         gold_has2_count = 0
         gold_has2_with_pred_has2 = 0
         gold_single_with_pred_has2 = 0
+        gating_tp = 0
+        gating_fp = 0
+        gating_fn = 0
+        gating_tn = 0
         gold_has2_exact_match = 0
         gold_has2_block2_in_key = 0
         pred_has2_block2_in_key = 0
         block2_token_match = 0
         block2_token_total = 0
         pad_prob_bins = {i: {"count": 0, "gold_has2": 0} for i in range(5)}
+        pad_prob_singles = []
+        pad_prob_doubles = []
 
         batch_size = 32
         for offset in range(0, len(sample_indices), batch_size):
@@ -551,10 +560,6 @@ def _run_pst2_eval_probe(
                 block2_nonpad = any(tok != PAD_IDX for tok in block2_tokens)
                 block2_has_pad = any(tok == PAD_IDX for tok in block2_tokens)
                 code_region_tokens = raw_seq[1:1 + decode_max_num_codes * formatter.block_size]
-                pad_inside_block_total += decode_max_num_codes * (formatter.block_size - 1)
-                pad_inside_block_count += sum(
-                    tok == PAD_IDX for idx, tok in enumerate(code_region_tokens) if idx % formatter.block_size != 0
-                )
                 emitted_blocks = 0
                 for block_start in range(1, 1 + decode_max_num_codes * formatter.block_size, formatter.block_size):
                     if raw_seq[block_start] == PAD_IDX:
@@ -591,6 +596,9 @@ def _run_pst2_eval_probe(
                         gold_has2_with_pred_has2 += 1
                         if pred_block2_norm == gold2_norm:
                             gold_has2_exact_match += 1
+                        gating_tp += 1
+                    else:
+                        gating_fn += 1
                     gold_has2_block2_in_key += int(pred_block2_in_key)
                     gold_block2_tokens = batch_items[row_pos]['targets_seq2seq'][1 + formatter.block_size:1 + 2 * formatter.block_size]
                     block2_token_match += int((torch.tensor(block2_tokens) == gold_block2_tokens).sum())
@@ -598,6 +606,20 @@ def _run_pst2_eval_probe(
                 else:
                     if pred_has2:
                         gold_single_with_pred_has2 += 1
+                        gating_fp += 1
+                    else:
+                        gating_tn += 1
+
+                if pred_has2:
+                    pad_inside_block_pred_total += formatter.block_size - 1
+                    pad_inside_block_pred_count += sum(
+                        tok == PAD_IDX for idx, tok in enumerate(block2_tokens) if idx % formatter.block_size != 0
+                    )
+                if gold_has2:
+                    pad_inside_block_gold_total += formatter.block_size - 1
+                    pad_inside_block_gold_count += sum(
+                        tok == PAD_IDX for idx, tok in enumerate(block2_tokens) if idx % formatter.block_size != 0
+                    )
 
                 if pred_has2 and pred_block2_in_key:
                     pred_has2_block2_in_key += 1
@@ -606,6 +628,10 @@ def _run_pst2_eval_probe(
                 bin_idx = min(int(pad_prob * 5), 4)
                 pad_prob_bins[bin_idx]["count"] += 1
                 pad_prob_bins[bin_idx]["gold_has2"] += int(gold_has2)
+                if gold_has2:
+                    pad_prob_doubles.append(pad_prob)
+                else:
+                    pad_prob_singles.append(pad_prob)
 
                 if block2_nonpad:
                     block2_nonpad_count += 1
@@ -662,8 +688,10 @@ def _run_pst2_eval_probe(
             print(f'  % block2_nonpad_with_pad: {block2_nonpad_with_pad_count / block2_nonpad_count:.2%}')
             if block2_nonpad_with_pad_count:
                 print('  WARN: block2_nonpad rows still contain PAD tokens inside the block.')
-        if pad_inside_block_total:
-            print(f'  % pad_inside_block: {pad_inside_block_count / pad_inside_block_total:.2%}')
+        if pad_inside_block_pred_total:
+            print(f'  % pad_inside_block | pred_has2: {pad_inside_block_pred_count / pad_inside_block_pred_total:.2%}')
+        if pad_inside_block_gold_total:
+            print(f'  % pad_inside_block | gold_has2: {pad_inside_block_gold_count / pad_inside_block_gold_total:.2%}')
         print(f'  blocks_emitted distribution: {dict(blocks_emitted_counter)}')
         if block_start_total:
             print(f'  % block_starts_predicted_zero: {block_start_zero_count / block_start_total:.2%}')
@@ -676,6 +704,7 @@ def _run_pst2_eval_probe(
         recall = gold_has2_with_pred_has2 / gold_has2_count if gold_has2_count else 0.0
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
         print(f'  gating precision/recall/F1: {precision:.2%}/{recall:.2%}/{f1:.2%}')
+        print(f'  gating confusion: TP={gating_tp} FP={gating_fp} FN={gating_fn} TN={gating_tn}')
         if gold_has2_count:
             print(f'  EM_block2 | gold_has2: {gold_has2_exact_match / gold_has2_count:.2%}')
             print(f'  token_acc_block2 | gold_has2: {block2_token_match / block2_token_total:.2%}')
@@ -685,6 +714,11 @@ def _run_pst2_eval_probe(
         single_total = total - gold_has2_count
         if single_total:
             print(f'  FPR(pred_has2 | gold_has2=False): {gold_single_with_pred_has2 / single_total:.2%}')
+
+        if pad_prob_singles:
+            print(f'  p(PAD@pos8) singles mean/median: {statistics.fmean(pad_prob_singles):.4f}/{statistics.median(pad_prob_singles):.4f}')
+        if pad_prob_doubles:
+            print(f'  p(PAD@pos8) doubles mean/median: {statistics.fmean(pad_prob_doubles):.4f}/{statistics.median(pad_prob_doubles):.4f}')
 
         print('  Calibration (PAD prob at block2 start):')
         for bin_idx in range(5):
