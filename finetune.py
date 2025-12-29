@@ -117,6 +117,10 @@ def parse_args():
     # Debugging: PST2 sample diagnostics
     parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
     parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed (int) for selecting PST2 debug rows.')
+    parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Disallow PAD during greedy decoding inside code blocks during eval/probing.')
+    parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
+    parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
+    parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
 
     args = parser.parse_args()
 
@@ -719,6 +723,10 @@ def main():
         distributed=distributed,
         is_main_process=is_main_process(),
         use_amp=args.use_amp,
+        disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+        min_double_steps=args.min_double_steps,
+        min_double_ratio=args.min_double_ratio,
     )
     
     # Cleanup distributed training

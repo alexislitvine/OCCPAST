@@ -162,6 +162,8 @@ class OccCANINE:
             descriptions: pd.DataFrame | None = None,
             use_within_block_sep: bool = False, # Should be True for systems with ',' between digits
             target_cols: list[str] | None = None,
+            disallow_pad_inside_block: bool = False,
+            disallow_zero_at_block_start: bool = False,
     ):
         """
         Initializes the OccCANINE model with specified configurations.
@@ -202,6 +204,8 @@ class OccCANINE:
         # System
         self.system = system
         self.use_within_block_sep = use_within_block_sep
+        self.disallow_pad_inside_block = disallow_pad_inside_block
+        self.disallow_zero_at_block_start = disallow_zero_at_block_start
 
         if self.system == "hisco": # TODO: Handle other model specs
             # Formatter
@@ -507,6 +511,9 @@ class OccCANINE:
             deduplicate: bool = False,
             order_invariant_conf: bool = True,
             debug: bool = False,
+            disallow_pad_inside_block: bool | None = None,
+            disallow_zero_at_block_start: bool | None = None,
+            max_num_codes: int | None = None,
     ):
         """
         Makes predictions on a batch of occupational strings.
@@ -547,6 +554,10 @@ class OccCANINE:
         """
         # Store debug flag for use in other methods
         self._debug = debug
+        if disallow_pad_inside_block is not None:
+            self.disallow_pad_inside_block = disallow_pad_inside_block
+        if disallow_zero_at_block_start is not None:
+            self.disallow_zero_at_block_start = disallow_zero_at_block_start
         
         # Validate prediction arguments' compatability
         prediction_type = self._validate_and_update_prediction_parameters(behavior, prediction_type)
@@ -815,6 +826,7 @@ class OccCANINE:
 
             batch_time_data.update(time.time() - end)
 
+            decoder_max_num_codes = max_num_codes if max_num_codes is not None else data_loader.dataset.formatter.max_num_codes
             outputs = decoder(
                 model = model,
                 descr = input_ids,
@@ -822,10 +834,36 @@ class OccCANINE:
                 device = self.device,
                 max_len = data_loader.dataset.formatter.max_seq_len,
                 start_symbol = BOS_IDX,
+                pad_idx = PAD_IDX,
+                block_size = data_loader.dataset.formatter.block_size,
+                max_num_codes = decoder_max_num_codes,
+                disallow_pad_inside_block = self.disallow_pad_inside_block,
+                disallow_zero_at_block_start = self.disallow_zero_at_block_start,
+                zero_idx = data_loader.dataset.formatter.map_char_idx.get('0'),
                 )
 
             outputs_s2s = outputs[0].cpu().numpy()
             probs_s2s = outputs[1].cpu().numpy()
+            formatter = data_loader.dataset.formatter
+            key_lookup = getattr(data_loader.dataset, "map_code_label", None) or self.key
+
+            for row_idx, raw_seq in enumerate(outputs_s2s):
+                block2_start = 1 + formatter.block_size
+                block2_end = block2_start + formatter.block_size
+                block2_tokens = raw_seq[block2_start:block2_end]
+                if (block2_tokens == PAD_IDX).all():
+                    continue
+                if (block2_tokens == PAD_IDX).any():
+                    raw_seq[block2_start:block2_end] = PAD_IDX
+                    continue
+                seq_len = formatter.max_seq_len
+                seq = [PAD_IDX] * seq_len
+                seq[0] = BOS_IDX
+                seq[-1] = EOS_IDX
+                seq[block2_start:block2_end] = block2_tokens.tolist()
+                block2_raw = formatter.clean_pred(torch.tensor(seq).numpy())
+                if block2_raw not in key_lookup:
+                    raw_seq[block2_start:block2_end] = PAD_IDX
 
             # Compute order invariant confidence
             if order_invariant_conf:

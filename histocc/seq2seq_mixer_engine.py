@@ -1,5 +1,6 @@
 import os
 import time
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 
@@ -17,6 +18,7 @@ from .utils import (
     order_invariant_accuracy,
     update_summary,
 )
+from .utils.masking import generate_square_subsequent_mask
 from .model_assets import Seq2SeqMixerOccCANINE
 from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
@@ -73,6 +75,10 @@ def train_one_epoch(
         distributed: bool = False,
         is_main_process: bool = True,
         scaler: GradScaler | None = None,
+        disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
+        min_double_steps: int = 0,
+        min_double_ratio: float = 0.0,
         ) -> int:
     model = model.train()
 
@@ -95,10 +101,45 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(iterator):
         current_step += 1
 
+        if min_double_steps and current_step <= min_double_steps and min_double_ratio > 0:
+            dataset = data_loader.dataset
+            if not hasattr(dataset, "_double_indices"):
+                target_cols = getattr(dataset, "target_cols", [])
+                double_indices = []
+                single_indices = []
+                if hasattr(dataset, "frame") and target_cols:
+                    second_col = target_cols[1] if len(target_cols) > 1 else None
+                    if second_col is not None:
+                        for idx, val in enumerate(dataset.frame[second_col].tolist()):
+                            if _pst2_value_present(val):
+                                double_indices.append(idx)
+                            else:
+                                single_indices.append(idx)
+                dataset._double_indices = double_indices
+                dataset._single_indices = single_indices
+
+            double_indices = getattr(dataset, "_double_indices", [])
+            if double_indices:
+                gold_num_codes = batch['gold_num_codes']
+                batch_size = gold_num_codes.size(0)
+                min_doubles = int(min_double_ratio * batch_size + 0.999)
+                current_doubles = int((gold_num_codes >= 2).sum().item())
+                if current_doubles < min_doubles:
+                    singles_idx = (gold_num_codes < 2).nonzero(as_tuple=False).flatten().tolist()
+                    replace_count = min(len(singles_idx), min_doubles - current_doubles)
+                    if replace_count > 0:
+                        replace_idx = singles_idx[:replace_count]
+                        sampled_indices = random.choices(double_indices, k=replace_count)
+                        sampled_items = [dataset[idx] for idx in sampled_indices]
+                        for key in batch:
+                            stacked = torch.stack([item[key] for item in sampled_items])
+                            batch[key][replace_idx] = stacked
+
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
+        gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
 
         batch_time_data.update(time.time() - end)
 
@@ -199,6 +240,8 @@ def train_one_epoch(
                 data_loader=data_loader_eval,
                 loss_fn=loss_fn,
                 device=device,
+                disallow_pad_inside_block=disallow_pad_inside_block,
+                disallow_zero_at_block_start=disallow_zero_at_block_start,
             )
             model.train()
             
@@ -244,8 +287,18 @@ def evaluate(
         loss_fn: nn.Module,
         device: torch.device,
         log_interval: int = 100,
+        disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
+        require_gold_num_codes: bool = False,
         ):
     model = model.eval()
+    if not hasattr(evaluate, "_logged_file"):
+        evaluate._logged_file = True
+        rank = 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(f'evaluate() running from {__file__}')
 
     losses = Averager()
     losses_linear = Averager()
@@ -260,6 +313,11 @@ def evaluate(
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
+        gold_num_codes = batch.get('gold_num_codes')
+        if gold_num_codes is not None:
+            gold_num_codes = gold_num_codes.to(device, non_blocking=True)
+        elif require_gold_num_codes:
+            raise ValueError("gold_num_codes is required for evaluate(), but was not found in the batch.")
 
         # Prepare target as input for seq2seq model
         target_seq2seq_input = targets_seq2seq[:, :-1]
@@ -279,9 +337,10 @@ def evaluate(
             out_linear=out_linear,
             target_seq2seq=targets_seq2seq,
             target_linear=targets_linear,
+            gold_num_codes=gold_num_codes,
             )
         loss_linear = loss_fn.loss_fn_linear(out_linear, targets_linear)
-        loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq)
+        loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq, gold_num_codes=gold_num_codes)
 
         losses.update(loss.item(), out_seq2seq.size(0))
         losses_linear.update(loss_linear.item(), out_seq2seq.size(0))
@@ -317,6 +376,8 @@ def evaluate(
         device=device,
         sample_size=200,
         seed=42,
+        disallow_pad_inside_block=disallow_pad_inside_block,
+        disallow_zero_at_block_start=disallow_zero_at_block_start,
     )
 
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg
@@ -390,6 +451,8 @@ def _run_pst2_eval_probe(
         device: torch.device,
         sample_size: int = 200,
         seed: int = 42,
+        disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
 ) -> None:
     dataset = data_loader.dataset
     formatter = dataset.formatter
@@ -406,24 +469,13 @@ def _run_pst2_eval_probe(
     if not eligible_positions:
         print('PST2 eval probe: no rows with pst2_2 present in eval dataset.')
         return
-
-    rng = torch.Generator().manual_seed(seed)
-    sample_size = min(sample_size, len(eligible_positions))
-    sample_tensor = torch.randperm(len(eligible_positions), generator=rng)[:sample_size]
-    sample_indices = [eligible_positions[i] for i in sample_tensor.tolist()]
+    single_positions = [idx for idx, flag in enumerate(has_second) if not flag]
 
     inv_key = dataset.map_code_label
     use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
 
     model_to_decode = model.module if hasattr(model, 'module') else model
     model_to_decode.eval()
-    block2_nonpad_count = 0
-    norm2_in_key_count = 0
-    format_contains_sep_value_count = 0
-    split_returns_2_count = 0
-    norm2_miss_counter = Counter()
-    gold2_in_key_count = 0
-    gold2_miss_counter = Counter()
 
     examples_a: list[_PST2ProbeRow] = []
     examples_b: list[_PST2ProbeRow] = []
@@ -434,103 +486,298 @@ def _run_pst2_eval_probe(
     print(f'  sample_size={sample_size} seed={seed}')
     print(f'  PAD_IDX={PAD_IDX} block_size={formatter.block_size} max_num_codes={formatter.max_num_codes}')
 
-    batch_size = 32
-    for offset in range(0, len(sample_indices), batch_size):
-        batch_indices = sample_indices[offset:offset + batch_size]
-        batch_items = [dataset[idx] for idx in batch_indices]
-        input_ids = torch.stack([item['input_ids'] for item in batch_items]).to(device, non_blocking=True)
-        attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
+    eval_configs = [
+        ("realistic", 0.05),
+        ("balanced", 0.50),
+    ]
 
-        outputs = mixer_greedy_decode(
-            model=model_to_decode,
-            descr=input_ids,
-            input_attention_mask=attention_mask,
-            device=device,
-            max_len=formatter.max_seq_len,
-            start_symbol=BOS_IDX,
-        )
-        preds_seq = outputs[0].cpu().numpy()
+    for label, target_double_rate in eval_configs:
+        rng = torch.Generator().manual_seed(seed + int(target_double_rate * 100))
+        sample_total = min(sample_size, len(dataset.frame))
+        desired_doubles = min(int(sample_total * target_double_rate), len(eligible_positions))
+        desired_singles = min(sample_total - desired_doubles, len(single_positions))
+        if desired_doubles + desired_singles == 0:
+            continue
 
-        for row_pos, dataset_idx in enumerate(batch_indices):
-            record = dataset.frame.iloc[dataset_idx]
-            raw_seq = preds_seq[row_pos].tolist()
-            block1_tokens = raw_seq[1:1 + formatter.block_size]
-            block2_tokens = raw_seq[1 + formatter.block_size:1 + 2 * formatter.block_size]
-            block2_nonpad = any(tok != PAD_IDX for tok in block2_tokens)
+        double_indices = []
+        if desired_doubles:
+            double_perm = torch.randperm(len(eligible_positions), generator=rng)[:desired_doubles]
+            double_indices = [eligible_positions[i] for i in double_perm.tolist()]
 
-            pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
-            pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
-            pred_block1_norm = _normalize_code_for_lookup(pred_block1_raw, inv_key, use_within_block_sep)
-            pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
-            pred_block1_in_key = pred_block1_norm in inv_key
-            pred_block2_in_key = pred_block2_norm in inv_key
-            gold2_raw = str(record['pst2_2'])
-            gold2_norm = _normalize_code_for_lookup(gold2_raw, inv_key, use_within_block_sep)
-            gold2_in_key = gold2_norm in inv_key
+        single_indices = []
+        if desired_singles:
+            single_perm = torch.randperm(len(single_positions), generator=rng)[:desired_singles]
+            single_indices = [single_positions[i] for i in single_perm.tolist()]
 
-            formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
-            split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
-            split_pred_list = split_pred if isinstance(split_pred, list) else [split_pred]
+        sample_indices = double_indices + single_indices
 
-            if block2_nonpad:
-                block2_nonpad_count += 1
-            if pred_block2_in_key:
-                norm2_in_key_count += 1
-            if gold2_in_key:
-                gold2_in_key_count += 1
-            if formatter.sep_value and formatter.sep_value in formatted_pred:
-                format_contains_sep_value_count += 1
-            if len(split_pred_list) == 2:
-                split_returns_2_count += 1
-            if block2_nonpad and not pred_block2_in_key:
-                norm2_miss_counter[pred_block2_norm] += 1
-            if not gold2_in_key:
-                gold2_miss_counter[gold2_norm] += 1
+        block2_nonpad_count = 0
+        block2_nonpad_with_pad_count = 0
+        pad_inside_block_pred_count = 0
+        pad_inside_block_pred_total = 0
+        pad_inside_block_gold_count = 0
+        pad_inside_block_gold_total = 0
+        blocks_emitted_counter = Counter()
+        block_start_zero_count = 0
+        block_start_total = 0
+        norm2_in_key_count = 0
+        format_contains_sep_value_count = 0
+        split_returns_2_count = 0
+        norm2_miss_counter = Counter()
+        pred_block2_raw_counter = Counter()
+        gold2_in_key_count = 0
+        gold2_miss_counter = Counter()
+        pred_has2_count = 0
+        gold_has2_count = 0
+        gold_has2_with_pred_has2 = 0
+        gold_single_with_pred_has2 = 0
+        gating_tp = 0
+        gating_fp = 0
+        gating_fn = 0
+        gating_tn = 0
+        gold_has2_exact_match = 0
+        gold_has2_block2_in_key = 0
+        pred_has2_block2_in_key = 0
+        pred_has2_valid_count = 0
+        block2_token_match = 0
+        block2_token_total = 0
+        pad_prob_bins = {i: {"count": 0, "gold_has2": 0} for i in range(5)}
+        pad_prob_singles = []
+        pad_prob_doubles = []
 
-            row = _PST2ProbeRow(
-                index=int(dataset_idx),
-                occ1=str(record['occ1']),
-                pst2_1=str(record['pst2_1']),
-                pst2_2=str(record['pst2_2']),
-                gold2_norm=gold2_norm,
-                gold2_in_key=gold2_in_key,
-                pred_block1_tokens=block1_tokens,
-                pred_block2_tokens=block2_tokens,
-                pred_block1_raw=pred_block1_raw,
-                pred_block2_raw=pred_block2_raw,
-                pred_block1_norm=pred_block1_norm,
-                pred_block2_norm=pred_block2_norm,
-                pred_block1_in_key=pred_block1_in_key,
-                pred_block2_in_key=pred_block2_in_key,
-                formatted_pred=formatted_pred,
-                split_pred=split_pred,
-                block2_nonpad=block2_nonpad,
+        batch_size = 32
+        for offset in range(0, len(sample_indices), batch_size):
+            batch_indices = sample_indices[offset:offset + batch_size]
+            batch_items = [dataset[idx] for idx in batch_indices]
+            input_ids = torch.stack([item['input_ids'] for item in batch_items]).to(device, non_blocking=True)
+            attention_mask = torch.stack([item['attention_mask'] for item in batch_items]).to(device, non_blocking=True)
+
+            decode_max_num_codes = min(2, formatter.max_num_codes)
+            zero_idx = formatter.map_char_idx.get('0')
+            outputs = mixer_greedy_decode(
+                model=model_to_decode,
+                descr=input_ids,
+                input_attention_mask=attention_mask,
+                device=device,
+                max_len=formatter.max_seq_len,
+                start_symbol=BOS_IDX,
+                pad_idx=PAD_IDX,
+                block_size=formatter.block_size,
+                max_num_codes=decode_max_num_codes,
+                disallow_pad_inside_block=disallow_pad_inside_block,
+                disallow_zero_at_block_start=disallow_zero_at_block_start,
+                zero_idx=zero_idx,
             )
+            preds_seq = outputs[0].cpu().numpy()
 
-            if block2_nonpad and not pred_block2_in_key and len(examples_a) < 10:
-                examples_a.append(row)
-            if block2_nonpad and pred_block2_in_key and len(split_pred_list) == 1 and len(examples_b) < 10:
-                examples_b.append(row)
-            if not block2_nonpad and len(examples_c) < 10:
-                examples_c.append(row)
+            block2_start = 1 + formatter.block_size
+            prefix_len = block2_start
+            prefix_seq = torch.tensor(
+                [preds_seq[i][:prefix_len] for i in range(len(batch_indices))],
+                device=device,
+                dtype=torch.long,
+            )
+            target_mask = generate_square_subsequent_mask(prefix_len, device).type(torch.bool)
+            memory = model_to_decode.encode(input_ids, attention_mask)
+            if isinstance(memory, tuple):
+                memory = memory[0]
+            block2_logits = model_to_decode.decode(
+                memory=memory,
+                target=prefix_seq,
+                target_mask=target_mask,
+                target_padding_mask=None,
+            )[:, -1, :]
+            block2_pad_probs = torch.softmax(block2_logits, dim=1)[:, PAD_IDX].detach().cpu().numpy()
 
-            if offset == 0 and row_pos == 0:
-                print(f'  first_pred_tokens_head={raw_seq[:5]} tail={raw_seq[-5:]}')
+            for row_pos, dataset_idx in enumerate(batch_indices):
+                record = dataset.frame.iloc[dataset_idx]
+                raw_seq = preds_seq[row_pos].tolist()
+                block1_tokens = raw_seq[1:1 + formatter.block_size]
+                block2_tokens = raw_seq[1 + formatter.block_size:1 + 2 * formatter.block_size]
+                block2_nonpad = any(tok != PAD_IDX for tok in block2_tokens)
+                block2_has_pad = any(tok == PAD_IDX for tok in block2_tokens)
+                code_region_tokens = raw_seq[1:1 + decode_max_num_codes * formatter.block_size]
+                emitted_blocks = 0
+                for block_start in range(1, 1 + decode_max_num_codes * formatter.block_size, formatter.block_size):
+                    if raw_seq[block_start] == PAD_IDX:
+                        break
+                    emitted_blocks += 1
+                blocks_emitted_counter[emitted_blocks] += 1
+                if zero_idx is not None:
+                    for block_start in range(1, 1 + decode_max_num_codes * formatter.block_size, formatter.block_size):
+                        block_start_total += 1
+                        if raw_seq[block_start] == zero_idx:
+                            block_start_zero_count += 1
 
-    total = float(sample_size)
-    print('\nSummary counters:')
-    print(f'  % pred_block2_nonpad: {block2_nonpad_count / total:.2%}')
-    print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
-    print(f'  % gold2_in_key: {gold2_in_key_count / total:.2%}')
-    print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
-    print(f'  % split_returns_2: {split_returns_2_count / total:.2%}')
+                pred_block1_raw = _decode_block_string(formatter, block1_tokens, 0)
+                pred_block2_raw = _decode_block_string(formatter, block2_tokens, 1)
+                pred_block1_norm = _normalize_code_for_lookup(pred_block1_raw, inv_key, use_within_block_sep)
+                pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
+                pred_block1_in_key = pred_block1_norm in inv_key
+                pred_block2_in_key = pred_block2_norm in inv_key
+                gold2_raw = str(record['pst2_2'])
+                gold2_norm = _normalize_code_for_lookup(gold2_raw, inv_key, use_within_block_sep)
+                gold2_in_key = gold2_norm in inv_key
+                gold_has2 = _pst2_value_present(record['pst2_2'])
 
-    print('\nTop-20 normalized block-2 strings missing from key:')
-    for code, count in norm2_miss_counter.most_common(20):
-        print(f'  {code!r}: {count}')
-    if gold2_miss_counter:
-        print('\nTop-20 gold pst2_2 strings missing from key:')
-        for code, count in gold2_miss_counter.most_common(20):
+                formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
+                split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
+                split_pred_list = split_pred if isinstance(split_pred, list) else [split_pred]
+
+                pred_has2 = block2_nonpad
+                pred_has2_valid = pred_has2 and pred_block2_in_key and not block2_has_pad
+                if pred_has2:
+                    pred_has2_count += 1
+                if gold_has2:
+                    gold_has2_count += 1
+                    if pred_has2:
+                        gold_has2_with_pred_has2 += 1
+                        if pred_block2_norm == gold2_norm:
+                            gold_has2_exact_match += 1
+                        gating_tp += 1
+                    else:
+                        gating_fn += 1
+                    gold_has2_block2_in_key += int(pred_block2_in_key)
+                    gold_block2_tokens = batch_items[row_pos]['targets_seq2seq'][1 + formatter.block_size:1 + 2 * formatter.block_size]
+                    block2_token_match += int((torch.tensor(block2_tokens) == gold_block2_tokens).sum())
+                    block2_token_total += formatter.block_size
+                else:
+                    if pred_has2:
+                        gold_single_with_pred_has2 += 1
+                        gating_fp += 1
+                    else:
+                        gating_tn += 1
+
+                if pred_has2:
+                    pad_inside_block_pred_total += formatter.block_size - 1
+                    pad_inside_block_pred_count += sum(
+                        tok == PAD_IDX for idx, tok in enumerate(block2_tokens) if idx % formatter.block_size != 0
+                    )
+                if gold_has2:
+                    pad_inside_block_gold_total += formatter.block_size - 1
+                    pad_inside_block_gold_count += sum(
+                        tok == PAD_IDX for idx, tok in enumerate(gold_block2_tokens.tolist()) if idx % formatter.block_size != 0
+                    )
+
+                if pred_has2 and pred_block2_in_key:
+                    pred_has2_block2_in_key += 1
+                if pred_has2_valid:
+                    pred_has2_valid_count += 1
+
+                pad_prob = float(block2_pad_probs[row_pos])
+                bin_idx = min(int(pad_prob * 5), 4)
+                pad_prob_bins[bin_idx]["count"] += 1
+                pad_prob_bins[bin_idx]["gold_has2"] += int(gold_has2)
+                if gold_has2:
+                    pad_prob_doubles.append(pad_prob)
+                else:
+                    pad_prob_singles.append(pad_prob)
+
+                if block2_nonpad:
+                    block2_nonpad_count += 1
+                    if block2_has_pad:
+                        block2_nonpad_with_pad_count += 1
+                if pred_block2_in_key:
+                    norm2_in_key_count += 1
+                if gold2_in_key:
+                    gold2_in_key_count += 1
+                if formatter.sep_value and formatter.sep_value in formatted_pred:
+                    format_contains_sep_value_count += 1
+                if len(split_pred_list) == 2:
+                    split_returns_2_count += 1
+                if block2_nonpad and not pred_block2_in_key:
+                    norm2_miss_counter[pred_block2_norm] += 1
+                if not gold2_in_key:
+                    gold2_miss_counter[gold2_norm] += 1
+                pred_block2_raw_counter[pred_block2_raw] += 1
+
+                row = _PST2ProbeRow(
+                    index=int(dataset_idx),
+                    occ1=str(record['occ1']),
+                    pst2_1=str(record['pst2_1']),
+                    pst2_2=str(record['pst2_2']),
+                    gold2_norm=gold2_norm,
+                    gold2_in_key=gold2_in_key,
+                    pred_block1_tokens=block1_tokens,
+                    pred_block2_tokens=block2_tokens,
+                    pred_block1_raw=pred_block1_raw,
+                    pred_block2_raw=pred_block2_raw,
+                    pred_block1_norm=pred_block1_norm,
+                    pred_block2_norm=pred_block2_norm,
+                    pred_block1_in_key=pred_block1_in_key,
+                    pred_block2_in_key=pred_block2_in_key,
+                    formatted_pred=formatted_pred,
+                    split_pred=split_pred,
+                    block2_nonpad=block2_nonpad,
+                )
+
+                if block2_nonpad and not pred_block2_in_key and len(examples_a) < 10:
+                    examples_a.append(row)
+                if block2_nonpad and pred_block2_in_key and len(split_pred_list) == 1 and len(examples_b) < 10:
+                    examples_b.append(row)
+                if not block2_nonpad and len(examples_c) < 10:
+                    examples_c.append(row)
+
+                if offset == 0 and row_pos == 0:
+                    print(f'  first_pred_tokens_head={raw_seq[:5]} tail={raw_seq[-5:]}')
+
+        total = float(len(sample_indices))
+        print(f'\n[{label}] Summary counters:')
+        print(f'  % pred_block2_nonpad: {block2_nonpad_count / total:.2%}')
+        if block2_nonpad_count:
+            print(f'  % block2_nonpad_with_pad: {block2_nonpad_with_pad_count / block2_nonpad_count:.2%}')
+            if block2_nonpad_with_pad_count:
+                print('  WARN: block2_nonpad rows still contain PAD tokens inside the block.')
+        if pad_inside_block_pred_total:
+            print(f'  % pad_inside_block | pred_has2: {pad_inside_block_pred_count / pad_inside_block_pred_total:.2%}')
+        if pad_inside_block_gold_total:
+            print(f'  % pad_inside_block | gold_has2: {pad_inside_block_gold_count / pad_inside_block_gold_total:.2%}')
+        print(f'  blocks_emitted distribution: {dict(blocks_emitted_counter)}')
+        if block_start_total:
+            print(f'  % block_starts_predicted_zero: {block_start_zero_count / block_start_total:.2%}')
+        print(f'  % norm2_in_key: {norm2_in_key_count / total:.2%}')
+        print(f'  % gold2_in_key: {gold2_in_key_count / total:.2%}')
+        print(f'  % format_contains_sep_value: {format_contains_sep_value_count / total:.2%}')
+        print(f'  % split_returns_2: {split_returns_2_count / total:.2%}')
+
+        precision = gold_has2_with_pred_has2 / pred_has2_count if pred_has2_count else 0.0
+        recall = gold_has2_with_pred_has2 / gold_has2_count if gold_has2_count else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+        print(f'  gating precision/recall/F1: {precision:.2%}/{recall:.2%}/{f1:.2%}')
+        print(f'  gating confusion: TP={gating_tp} FP={gating_fp} FN={gating_fn} TN={gating_tn}')
+        if gold_has2_count:
+            print(f'  EM_block2 | gold_has2: {gold_has2_exact_match / gold_has2_count:.2%}')
+            print(f'  token_acc_block2 | gold_has2: {block2_token_match / block2_token_total:.2%}')
+            print(f'  % block2_in_key | gold_has2: {gold_has2_block2_in_key / gold_has2_count:.2%}')
+        if pred_has2_count:
+            print(f'  % block2_in_key | pred_has2: {pred_has2_block2_in_key / pred_has2_count:.2%}')
+            print(f'  % block2_valid_post_sanitize | pred_has2: {pred_has2_valid_count / pred_has2_count:.2%}')
+        single_total = total - gold_has2_count
+        if single_total:
+            print(f'  FPR(pred_has2 | gold_has2=False): {gold_single_with_pred_has2 / single_total:.2%}')
+
+        if pad_prob_singles:
+            print(f'  p(PAD@pos8) singles mean/median: {statistics.fmean(pad_prob_singles):.4f}/{statistics.median(pad_prob_singles):.4f}')
+        if pad_prob_doubles:
+            print(f'  p(PAD@pos8) doubles mean/median: {statistics.fmean(pad_prob_doubles):.4f}/{statistics.median(pad_prob_doubles):.4f}')
+
+        print('  Calibration (PAD prob at block2 start):')
+        for bin_idx in range(5):
+            bucket = pad_prob_bins[bin_idx]
+            if bucket["count"] == 0:
+                continue
+            rate = bucket["gold_has2"] / bucket["count"]
+            print(f'    bin[{bin_idx}] count={bucket["count"]} gold_has2_rate={rate:.2%}')
+
+        print('\nTop-20 normalized block-2 strings missing from key:')
+        for code, count in norm2_miss_counter.most_common(20):
+            print(f'  {code!r}: {count}')
+        if gold2_miss_counter:
+            print('\nTop-20 gold pst2_2 strings missing from key:')
+            for code, count in gold2_miss_counter.most_common(20):
+                print(f'  {code!r}: {count}')
+        print('\nTop-10 block-2 raw strings:')
+        for code, count in pred_block2_raw_counter.most_common(10):
             print(f'  {code!r}: {count}')
 
     def _print_examples(label: str, rows: list[_PST2ProbeRow]) -> None:
@@ -577,6 +824,10 @@ def train(
         distributed: bool = False,
         is_main_process: bool = True,
         use_amp: bool = False,
+        disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
+        min_double_steps: int = 0,
+        min_double_ratio: float = 0.0,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -611,6 +862,10 @@ def train(
             distributed=distributed,
             is_main_process=is_main_process,
             scaler=scaler,
+            disallow_pad_inside_block=disallow_pad_inside_block,
+            disallow_zero_at_block_start=disallow_zero_at_block_start,
+            min_double_steps=min_double_steps,
+            min_double_ratio=min_double_ratio,
         )
         
         # Save at the end of each epoch if the flag is set
