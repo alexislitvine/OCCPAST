@@ -2,6 +2,8 @@ import os
 import time
 import statistics
 import random
+
+import numpy as np
 from collections import Counter
 from dataclasses import dataclass
 
@@ -57,36 +59,50 @@ def _save_model_checkpoint(
     torch.save(states, os.path.join(save_dir, 'last.bin'))
 
 
-def _stack_sampled_items(
+def collate_sampled_items(
         sampled_items: list[dict[str, torch.Tensor | str | int | float]],
-        is_main_process: bool,
+        *,
+        rank: int | None = None,
         ) -> dict[str, torch.Tensor | list]:
     stacked_batch: dict[str, torch.Tensor | list] = {}
     for key in sampled_items[0].keys():
         values = [item[key] for item in sampled_items]
-        first = values[0]
-        if torch.is_tensor(first):
-            try:
+        types_seen = {type(v) for v in values}
+        if all(torch.is_tensor(v) for v in values):
+            shapes = [v.shape for v in values]
+            if len({s for s in shapes}) == 1:
                 stacked_batch[key] = torch.stack(values)
-            except RuntimeError as exc:
-                raise ValueError(f"Failed to stack tensor key='{key}' with shapes {[v.shape for v in values]}") from exc
+            else:
+                if all(len(s) == 1 for s in shapes):
+                    max_len = max(s[0] for s in shapes)
+                    padded = [
+                        torch.nn.functional.pad(v, (0, max_len - v.shape[0]))
+                        for v in values
+                    ]
+                    stacked_batch[key] = torch.stack(padded)
+                else:
+                    raise ValueError(f"Failed to stack key='{key}' with shapes {shapes}")
             continue
-        if isinstance(first, (int, float)):
+        if all(isinstance(v, np.ndarray) for v in values):
+            stacked_batch[key] = torch.stack([torch.from_numpy(v) for v in values])
+            continue
+        if all(isinstance(v, (int, float, bool)) for v in values):
             stacked_batch[key] = torch.tensor(values)
             continue
-        if isinstance(first, str):
-            if is_main_process and not hasattr(_stack_sampled_items, "_logged_str_key"):
-                _stack_sampled_items._logged_str_key = True
-                print(
-                    "Doubles-quota sampling: non-tensor key encountered "
-                    f"key={key!r} type={type(first)} example={first!r} keys={list(sampled_items[0].keys())}"
-                )
+        if any(isinstance(v, str) for v in values) or len(types_seen) > 1:
+            if rank == 0:
+                logged = getattr(collate_sampled_items, "_logged_keys", set())
+                if key not in logged:
+                    logged.add(key)
+                    collate_sampled_items._logged_keys = logged
+                    example = values[0]
+                    print(
+                        "Doubles-quota sampling: non-stackable key "
+                        f"key={key!r} types={sorted(t.__name__ for t in types_seen)} example={example!r}"
+                    )
             stacked_batch[key] = values
             continue
-        try:
-            stacked_batch[key] = torch.tensor(values)
-        except Exception as exc:
-            raise ValueError(f"Unsupported batch key={key!r} type={type(first)}") from exc
+        stacked_batch[key] = values
     return stacked_batch
 
 
@@ -165,7 +181,10 @@ def train_one_epoch(
                         replace_idx = singles_idx[:replace_count]
                         sampled_indices = random.choices(double_indices, k=replace_count)
                         sampled_items = [dataset[idx] for idx in sampled_indices]
-                        stacked_items = _stack_sampled_items(sampled_items, is_main_process=is_main_process)
+                        rank = None
+                        if torch.distributed.is_available() and torch.distributed.is_initialized():
+                            rank = torch.distributed.get_rank()
+                        stacked_items = collate_sampled_items(sampled_items, rank=rank)
                         for key, stacked in stacked_items.items():
                             if torch.is_tensor(batch[key]):
                                 if not torch.is_tensor(stacked):
