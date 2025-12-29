@@ -414,11 +414,6 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
-    # optional sanity log
-    print(f"[rank={os.getenv('RANK','0')}] local_rank={local_rank} -> cuda:{torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
-    if is_main_process():
-        print(f"[DDP] distributed={distributed} world_size={world_size}")
-
     # Target-side tokenization
     formatter = construct_general_purpose_formatter(
         block_size=args.block_size,
