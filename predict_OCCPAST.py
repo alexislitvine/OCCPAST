@@ -100,6 +100,24 @@ def main():
         default="/home/alexis/PST_PREDICT/models/",
         help="Root directory containing PST models in subfolders. Each model folder should contain a last.bin file."
     )
+    parser.add_argument(
+        "--disallow-pad-inside-block",
+        action="store_true",
+        default=False,
+        help="Disallow PAD during greedy decoding inside code blocks (seq2seq inference)."
+    )
+    parser.add_argument(
+        "--disallow-zero-at-block-start",
+        action="store_true",
+        default=False,
+        help="Disallow predicting token '0' at the start of each block during greedy decoding."
+    )
+    parser.add_argument(
+        "--max-num-codes",
+        type=int,
+        default=None,
+        help="Override max_num_codes for greedy decoding during prediction."
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
@@ -172,7 +190,11 @@ def main():
         raise ValueError("Non unique ids after preprocessing!")
 
     # --- run predictions on df (same as before) ---
-    mod_hisco = OccCANINE(verbose=True)
+    mod_hisco = OccCANINE(
+        verbose=True,
+        disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+    )
 
     # Discover PST models with last.bin under model_root and select
     model_root = Path(args.model_root)
@@ -220,6 +242,8 @@ def main():
         system="pst",
         use_within_block_sep=True,
         verbose=True,
+        disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
     )
 
     print("Running HISCO predictions…")
@@ -227,6 +251,7 @@ def main():
         df.occ1_clean.tolist(),
         k_pred=HOW_MANY_PREDS,
         debug=args.debug,
+        max_num_codes=args.max_num_codes,
     )
     pred_hisco["id"] = df["id"].tolist()
     pred_hisco["occ1"] = df["occ1_original"].tolist()
@@ -240,6 +265,7 @@ def main():
         df.occ1_clean.tolist(),
         k_pred=HOW_MANY_PREDS,
         debug=args.debug,
+        max_num_codes=args.max_num_codes,
     )
     pred_pst["id"] = df["id"].tolist()
     pred_pst["occ1"] = df["occ1_original"].tolist()

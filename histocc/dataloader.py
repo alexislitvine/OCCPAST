@@ -974,6 +974,27 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
 
         return target
 
+    def _get_gold_num_codes(self, record: pd.Series) -> int:
+        num_codes = 0
+        for target_col in self.target_cols:
+            code = record[target_col]
+
+            if isinstance(code, float):
+                if math.isnan(code):
+                    break
+                code = int(code)
+
+            if code is None:
+                break
+
+            code_str = str(code).strip()
+            if code_str in {'', ' ', '?'}:
+                break
+
+            num_codes += 1
+
+        return num_codes
+
     def __len__(self) -> int:
         return len(self.frame)
 
@@ -984,6 +1005,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         lang: str = record.lang
         targets_seq2seq = self.formatter.transform_label(record)
         target_linear = self._get_target_linear(record)
+        gold_num_codes = self._get_gold_num_codes(record)
 
         # Optionally include description in the input during training
         if (self.include_descriptions and self.training and
@@ -1017,6 +1039,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             'attention_mask': encoded_input_seq['attention_mask'].flatten(),
             'targets_seq2seq': torch.tensor(targets_seq2seq, dtype=torch.long),
             'targets_linear': torch.tensor(target_linear, dtype=torch.float),
+            'gold_num_codes': torch.tensor(gold_num_codes, dtype=torch.long),
         }
 
         return batch_data
