@@ -28,6 +28,43 @@ from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
 
 
+_ddp_collective_seq = {"value": 0}
+
+
+def _ddp_debug_collective(tag: str, step: int, device: torch.device) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if os.getenv("DEBUG_DDP_SYNC") != "1":
+        return
+    _ddp_collective_seq["value"] += 1
+    seq = _ddp_collective_seq["value"]
+    if dist.get_rank() == 0:
+        print(f"[DDP SYNC] step {step} seq {seq} about to {tag}")
+    seq_tensor = torch.tensor(seq, device=device)
+    dist.all_reduce(seq_tensor, op=dist.ReduceOp.SUM)
+    expected = seq * dist.get_world_size()
+    if seq_tensor.item() != expected:
+        raise RuntimeError(
+            f"DDP collective desync at step {step} tag={tag} "
+            f"seq={seq} sum={seq_tensor.item()} expected={expected}"
+        )
+
+
+def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    _ddp_debug_collective(f"barrier:{tag}", step, device)
+    dist.barrier()
+
+
+def ddp_broadcast(tensor: torch.Tensor, tag: str, step: int, device: torch.device) -> torch.Tensor:
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    _ddp_debug_collective(f"broadcast:{tag}", step, device)
+    dist.broadcast(tensor, src=0)
+    return tensor
+
+
 def _save_model_checkpoint(
         model: Seq2SeqMixerOccCANINE,
         optimizer: torch.optim.Optimizer,
@@ -429,17 +466,14 @@ def train_one_epoch(
         debug_ddp_eval = os.getenv("DEBUG_DDP_EVAL") == "1"
         if eval_interval is not None and distributed and dist.is_available() and dist.is_initialized():
             eval_tensor = torch.tensor(1 if is_eval_step and is_main_process else 0, device=device)
-            dist.broadcast(eval_tensor, src=0)
+            ddp_broadcast(eval_tensor, "eval_flag", current_step, device)
             is_eval_step = bool(eval_tensor.item())
         if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
-            if debug_ddp_eval and is_main_process:
-                print(f"[DDP EVAL] rank0 about to barrier (pre-probe) step {current_step}")
-            dist.barrier()
-            if debug_ddp_eval and not is_main_process:
-                print(f"[DDP EVAL] rank{dist.get_rank()} waiting for probe eval step {current_step}")
+            ddp_sync_point("pre_eval", current_step, device)
+            eval_error = None
             if is_main_process:
                 if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank0 entering probe eval step {current_step}")
+                    print(f"[DDP EVAL] rank0 entering eval step {current_step}")
                 try:
                     tqdm.write('\n' + '='*80)
                     tqdm.write('Starting evaluation pass...')
@@ -453,6 +487,7 @@ def train_one_epoch(
                         disallow_zero_at_block_start=disallow_zero_at_block_start,
                         compute_gating_metrics=compute_gating_metrics,
                         require_gold_num_codes=compute_gating_metrics,
+                        run_probe=False,
                     )
                     model.train()
                     
@@ -510,29 +545,40 @@ def train_one_epoch(
                         filename=os.path.join(save_dir, 'logs.csv'),
                         log_wandb=log_wandb,
                     )
-                finally:
-                    if debug_ddp_eval:
-                        print(f"[DDP EVAL] rank0 about to barrier (post-probe) step {current_step}")
-                    dist.barrier()
-                    if debug_ddp_eval:
-                        print(f"[DDP EVAL] rank0 exited probe eval step {current_step}")
-            else:
+                except Exception as exc:
+                    eval_error = exc
+            ddp_sync_point("post_eval", current_step, device)
+            if eval_error is not None:
+                raise eval_error
+
+            ddp_sync_point("pre_probe", current_step, device)
+            probe_error = None
+            if is_main_process:
                 if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank{dist.get_rank()} about to barrier (post-probe) step {current_step}")
-                dist.barrier()
-                if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank{dist.get_rank()} exited probe eval step {current_step}")
-            if debug_ddp_eval and is_main_process:
-                print(f"[DDP EVAL] rank0 about to broadcast switch flag {current_step}")
+                    print(f"[DDP EVAL] rank0 entering probe eval step {current_step}")
+                try:
+                    _run_pst2_eval_probe(
+                        model=model,
+                        data_loader=data_loader_eval,
+                        device=device,
+                        sample_size=200,
+                        seed=42,
+                        disallow_pad_inside_block=disallow_pad_inside_block,
+                        disallow_zero_at_block_start=disallow_zero_at_block_start,
+                    )
+                except Exception as exc:
+                    probe_error = exc
+            ddp_sync_point("post_probe", current_step, device)
+            if probe_error is not None:
+                raise probe_error
+
             switch_tensor = torch.tensor(
                 1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
                 device=device,
             )
-            dist.broadcast(switch_tensor, src=0)
+            ddp_broadcast(switch_tensor, "switch_flag", current_step, device)
             if late_phase_state is not None and switch_tensor.item() == 1:
                 late_phase_state["pending_switch"] = True
-            if debug_ddp_eval and is_main_process:
-                print(f"[DDP EVAL] rank0 finished eval sync {current_step}")
         elif is_eval_step and is_main_process:
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
@@ -546,6 +592,7 @@ def train_one_epoch(
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
                 compute_gating_metrics=compute_gating_metrics,
                 require_gold_num_codes=compute_gating_metrics,
+                run_probe=True,
             )
             model.train()
             
@@ -641,6 +688,7 @@ def evaluate(
         disallow_zero_at_block_start: bool = False,
         require_gold_num_codes: bool = False,
         compute_gating_metrics: bool = False,
+        run_probe: bool = True,
         ):
     model = model.eval()
     if not hasattr(evaluate, "_logged_file"):
@@ -757,15 +805,16 @@ def evaluate(
                        f'Flat Acc: {flat_accs.avg:.2f}% | '
                        f'Val Loss: {losses.avg:.6f}')
 
-    _run_pst2_eval_probe(
-        model=model,
-        data_loader=data_loader,
-        device=device,
-        sample_size=200,
-        seed=42,
-        disallow_pad_inside_block=disallow_pad_inside_block,
-        disallow_zero_at_block_start=disallow_zero_at_block_start,
-    )
+    if run_probe:
+        _run_pst2_eval_probe(
+            model=model,
+            data_loader=data_loader,
+            device=device,
+            sample_size=200,
+            seed=42,
+            disallow_pad_inside_block=disallow_pad_inside_block,
+            disallow_zero_at_block_start=disallow_zero_at_block_start,
+        )
 
     precision = gating_tp / (gating_tp + gating_fp) if (gating_tp + gating_fp) else 0.0
     recall = gating_tp / (gating_tp + gating_fn) if (gating_tp + gating_fn) else 0.0
