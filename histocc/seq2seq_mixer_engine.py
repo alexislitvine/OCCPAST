@@ -31,7 +31,7 @@ from .utils.decoder import mixer_greedy_decode
 _ddp_collective_seq = {"value": 0}
 
 
-def _ddp_debug_collective(tag: str, step: int, device: torch.device) -> None:
+def _ddp_debug_collective(tag: str, step: int) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
     if os.getenv("DEBUG_DDP") != "1":
@@ -39,32 +39,33 @@ def _ddp_debug_collective(tag: str, step: int, device: torch.device) -> None:
     _ddp_collective_seq["value"] += 1
     seq = _ddp_collective_seq["value"]
     rank = dist.get_rank()
-    if rank == 0:
-        print(f"[DDP SYNC] step {step} seq {seq} about to {tag}")
-    print(f"[DDP SYNC] rank{rank} before all_reduce tag={tag} numel=1")
-    seq_tensor = torch.tensor(seq, device=device)
-    dist.all_reduce(seq_tensor, op=dist.ReduceOp.SUM)
-    print(f"[DDP SYNC] rank{rank} after all_reduce tag={tag} numel=1")
-    expected = seq * dist.get_world_size()
-    if seq_tensor.item() != expected:
-        raise RuntimeError(
-            f"DDP collective desync at step {step} tag={tag} "
-            f"seq={seq} sum={seq_tensor.item()} expected={expected}"
-        )
+    print(f"[DDP SYNC] rank{rank} entering {tag} step={step} seq={seq}", flush=True)
 
 
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
-    _ddp_debug_collective(f"barrier:{tag}", step, device)
+    _ddp_debug_collective(f"barrier:{tag}", step)
+    if os.getenv("DEBUG_DDP") == "1":
+        rank = dist.get_rank()
+        print(f"[rank{rank}] entering barrier: {tag}", flush=True)
     dist.barrier()
+    if os.getenv("DEBUG_DDP") == "1":
+        rank = dist.get_rank()
+        print(f"[rank{rank}] leaving barrier: {tag}", flush=True)
 
 
 def ddp_broadcast(tensor: torch.Tensor, tag: str, step: int, device: torch.device) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
         return tensor
-    _ddp_debug_collective(f"broadcast:{tag}", step, device)
+    _ddp_debug_collective(f"broadcast:{tag}", step)
+    if os.getenv("DEBUG_DDP") == "1":
+        rank = dist.get_rank()
+        print(f"[rank{rank}] entering broadcast: {tag}", flush=True)
     dist.broadcast(tensor, src=0)
+    if os.getenv("DEBUG_DDP") == "1":
+        rank = dist.get_rank()
+        print(f"[rank{rank}] leaving broadcast: {tag}", flush=True)
     return tensor
 
 
@@ -295,6 +296,11 @@ def train_one_epoch(
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
 
     for batch_idx, batch in enumerate(iterator):
+        if is_main_process and dist.is_available() and dist.is_initialized():
+            debug_detail = os.getenv("TORCH_DISTRIBUTED_DEBUG")
+            if debug_detail and not hasattr(train_one_epoch, "_logged_ddp_debug"):
+                train_one_epoch._logged_ddp_debug = True
+                print(f"[DDP] TORCH_DISTRIBUTED_DEBUG={debug_detail}", flush=True)
         # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
             _apply_late_phase_switch(
@@ -477,7 +483,7 @@ def train_one_epoch(
                 print(f"[DDP EVAL] rank{rank} entering eval section step {current_step}")
             if debug_ddp_eval and is_main_process:
                 print(f"[DDP EVAL] rank0 pre_eval barrier step {current_step}")
-            dist.barrier()
+            ddp_sync_point("pre_eval", current_step, device)
             eval_error = None
             probe_error = None
             eval_loss = float("nan")
@@ -598,11 +604,11 @@ def train_one_epoch(
                     tensor = torch.tensor(value, device=device)
                     if debug_ddp_eval and is_main_process:
                         print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}")
-                    dist.broadcast(tensor, src=0)
+                    ddp_broadcast(tensor, f"metric:{name}", current_step, device)
             finally:
                 if debug_ddp_eval and is_main_process:
                     print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}")
-                dist.barrier()
+                ddp_sync_point("post_eval", current_step, device)
                 if debug_ddp_eval:
                     print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
             if eval_error is not None:
