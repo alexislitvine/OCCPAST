@@ -8,6 +8,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
@@ -106,6 +107,108 @@ def collate_sampled_items(
     return stacked_batch
 
 
+def _is_gate_stable(late_phase_state: dict) -> bool:
+    history = late_phase_state["gate_metric_history"]
+    window = late_phase_state["gate_stabilize_window"]
+    if window <= 0 or len(history) < window:
+        return False
+    recent = history[-window:]
+    return (
+        max(recent) - min(recent) <= late_phase_state["gate_stabilize_delta"]
+        and min(recent) >= late_phase_state["gate_stabilize_min"]
+    )
+
+
+def _apply_late_phase_switch(
+        late_phase_state: dict,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler,
+        current_step: int,
+        save_dir: str | None,
+        log_wandb: bool,
+        ) -> None:
+    if late_phase_state["late_switch_once"] and late_phase_state["enabled"]:
+        late_phase_state["pending_switch"] = False
+        return
+
+    target_lrs = [group["lr"] * late_phase_state["late_lr_mult"] for group in optimizer.param_groups]
+    for group, target_lr in zip(optimizer.param_groups, target_lrs):
+        group["lr"] = target_lr
+    scheduler.base_lrs = list(target_lrs)
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = list(target_lrs)
+
+    late_phase_state["enabled"] = True
+    late_phase_state["pending_switch"] = False
+    late_phase_state["grad_accum_steps"] = late_phase_state["late_grad_accum"]
+    late_phase_state["late_warmup_total"] = late_phase_state["late_warmup_steps"]
+    late_phase_state["late_warmup_remaining"] = late_phase_state["late_warmup_steps"]
+    late_phase_state["late_warmup_step"] = 0
+    late_phase_state["late_warmup_target_lrs"] = target_lrs
+
+    if save_dir is None:
+        return
+
+    effective_batch = (
+        late_phase_state["batch_size"]
+        * late_phase_state["world_size"]
+        * late_phase_state["grad_accum_steps"]
+    )
+    update_summary(
+        current_step,
+        metrics={
+            "late_phase_enabled": int(late_phase_state["enabled"]),
+            "grad_accum_steps": late_phase_state["grad_accum_steps"],
+            "effective_batch": effective_batch,
+            "late_switch_lr": target_lrs[0],
+        },
+        filename=os.path.join(save_dir, 'logs.csv'),
+        log_wandb=log_wandb,
+    )
+
+
+def _apply_late_warmup_step(
+        late_phase_state: dict,
+        optimizer: torch.optim.Optimizer,
+        current_step: int,
+        save_dir: str | None,
+        log_wandb: bool,
+        ) -> None:
+    if late_phase_state["late_warmup_remaining"] <= 0:
+        return
+
+    late_phase_state["late_warmup_step"] += 1
+    warmup_total = max(late_phase_state["late_warmup_total"], 1)
+    warmup_factor = late_phase_state["late_warmup_step"] / warmup_total
+    target_lrs = late_phase_state["late_warmup_target_lrs"]
+    for group, target_lr in zip(optimizer.param_groups, target_lrs):
+        group["lr"] = target_lr * warmup_factor
+
+    late_phase_state["late_warmup_remaining"] -= 1
+    if late_phase_state["late_warmup_remaining"] != 0 or save_dir is None:
+        return
+
+    for group, target_lr in zip(optimizer.param_groups, target_lrs):
+        group["lr"] = target_lr
+
+    effective_batch = (
+        late_phase_state["batch_size"]
+        * late_phase_state["world_size"]
+        * late_phase_state["grad_accum_steps"]
+    )
+    update_summary(
+        current_step,
+        metrics={
+            "late_phase_enabled": int(late_phase_state["enabled"]),
+            "grad_accum_steps": late_phase_state["grad_accum_steps"],
+            "effective_batch": effective_batch,
+            "late_warmup_end_lr": target_lrs[0],
+        },
+        filename=os.path.join(save_dir, 'logs.csv'),
+        log_wandb=log_wandb,
+    )
+
+
 def train_one_epoch(
         model: Seq2SeqMixerOccCANINE,
         data_loader: torch.utils.data.DataLoader,
@@ -129,6 +232,7 @@ def train_one_epoch(
         disallow_zero_at_block_start: bool = False,
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
+        late_phase_state: dict | None = None,
         ) -> int:
     model = model.train()
 
@@ -137,6 +241,8 @@ def train_one_epoch(
     batch_time = Averager()
     batch_time_data = Averager()
     samples_per_sec = Averager()
+    grad_accum_steps = 1 if late_phase_state is None else late_phase_state["grad_accum_steps"]
+    accum_counter = 0
     
     # Check GPU availability once
     has_cuda = torch.cuda.is_available()
@@ -149,6 +255,18 @@ def train_one_epoch(
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
 
     for batch_idx, batch in enumerate(iterator):
+        # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
+        if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
+            _apply_late_phase_switch(
+                late_phase_state=late_phase_state,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                current_step=current_step,
+                save_dir=save_dir,
+                log_wandb=log_wandb,
+            )
+            grad_accum_steps = late_phase_state["grad_accum_steps"]
+
         current_step += 1
 
         if min_double_steps and current_step <= min_double_steps and min_double_ratio > 0:
@@ -241,20 +359,36 @@ def train_one_epoch(
         losses.update(loss.item(), out_seq2seq.size(0))
 
         # Backward pass & step with optional AMP
-        optimizer.zero_grad()
+        if accum_counter == 0:
+            optimizer.zero_grad()
+        loss = loss / grad_accum_steps
         
         if scaler is not None:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        
-        scheduler.step()
+        accum_counter += 1
+        if accum_counter == grad_accum_steps:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            accum_counter = 0
+
+            if late_phase_state is not None and late_phase_state["late_warmup_remaining"] > 0:
+                _apply_late_warmup_step(
+                    late_phase_state=late_phase_state,
+                    optimizer=optimizer,
+                    current_step=current_step,
+                    save_dir=save_dir,
+                    log_wandb=log_wandb,
+                )
+            else:
+                scheduler.step()
 
         elapsed = time.time() - end
         batch_time.update(elapsed)
@@ -267,7 +401,7 @@ def train_one_epoch(
             eta_str = f"{int(eta_seconds // 60)}m{int(eta_seconds % 60):02d}s"
             
             # Get current learning rate
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]['lr']
             
             tqdm.write(f'[Epoch {epoch}] Batch {batch_idx + 1}/{len(data_loader)} | '
                        f'Loss: {losses.avg:.6f} | '
@@ -294,13 +428,16 @@ def train_one_epoch(
         if eval_interval is not None and current_step % eval_interval == 0 and is_main_process:
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
-            eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc = evaluate(
+            compute_gating_metrics = late_phase_state is not None
+            eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
                 model=model,
                 data_loader=data_loader_eval,
                 loss_fn=loss_fn,
                 device=device,
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
+                compute_gating_metrics=compute_gating_metrics,
+                require_gold_num_codes=compute_gating_metrics,
             )
             model.train()
             
@@ -313,8 +450,31 @@ def train_one_epoch(
             tqdm.write(f'Sequence Accuracy   : {eval_seq_acc:.2f}%')
             tqdm.write(f'Token Accuracy      : {eval_token_acc:.2f}%')
             tqdm.write(f'Flat Accuracy       : {eval_flat_acc:.2f}%')
-            tqdm.write(f'Learning Rate       : {scheduler.get_last_lr()[0]:.2e}')
+            tqdm.write(f'Learning Rate       : {optimizer.param_groups[0]["lr"]:.2e}')
             tqdm.write('='*80 + '\n')
+
+            late_phase_metrics = {}
+            if late_phase_state is not None:
+                effective_batch = late_phase_state["batch_size"] * late_phase_state["world_size"] * late_phase_state["grad_accum_steps"]
+                late_phase_metrics.update(
+                    {
+                        "late_phase_enabled": int(late_phase_state["enabled"]),
+                        "grad_accum_steps": late_phase_state["grad_accum_steps"],
+                        "effective_batch": effective_batch,
+                    }
+                )
+
+            gating_summary = gating_metrics or {}
+            if late_phase_state is not None and gating_summary:
+                gate_metric = late_phase_state["gate_stabilize_metric"]
+                if gate_metric in gating_summary:
+                    history = late_phase_state["gate_metric_history"]
+                    history.append(gating_summary[gate_metric])
+                    if (
+                        (not late_phase_state["enabled"] or not late_phase_state["late_switch_once"])
+                        and _is_gate_stable(late_phase_state)
+                    ):
+                        late_phase_state["pending_switch"] = True
 
             update_summary(
                 current_step,
@@ -328,13 +488,51 @@ def train_one_epoch(
                     'seq_acc': eval_seq_acc,
                     'token_acc': eval_token_acc,
                     'flat_acc': eval_flat_acc,
-                    'lr': scheduler.get_last_lr()[0],
+                    'lr': optimizer.param_groups[0]['lr'],
+                    **gating_summary,
+                    **late_phase_metrics,
                 },
                 filename=os.path.join(save_dir, 'logs.csv'),
                 log_wandb=log_wandb,
             )
 
+        if (
+            eval_interval is not None
+            and current_step % eval_interval == 0
+            and distributed
+            and dist.is_available()
+            and dist.is_initialized()
+        ):
+            switch_tensor = torch.tensor(
+                1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
+                device=device,
+            )
+            dist.broadcast(switch_tensor, src=0)
+            if late_phase_state is not None and switch_tensor.item() == 1:
+                late_phase_state["pending_switch"] = True
+
         end = time.time()
+
+    if accum_counter:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        accum_counter = 0
+        if late_phase_state is not None and late_phase_state["late_warmup_remaining"] > 0:
+            _apply_late_warmup_step(
+                late_phase_state=late_phase_state,
+                optimizer=optimizer,
+                current_step=current_step,
+                save_dir=save_dir,
+                log_wandb=log_wandb,
+            )
+        else:
+            scheduler.step()
 
     return current_step
 
@@ -349,6 +547,7 @@ def evaluate(
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
         require_gold_num_codes: bool = False,
+        compute_gating_metrics: bool = False,
         ):
     model = model.eval()
     if not hasattr(evaluate, "_logged_file"):
@@ -366,6 +565,11 @@ def evaluate(
     token_accs = Averager()
     seq_accs = Averager()
     flat_accs = Averager()
+    gating_tp = 0
+    gating_fp = 0
+    gating_fn = 0
+    gating_tn = 0
+    formatter = getattr(data_loader.dataset, "formatter", None)
 
     for batch_idx, batch in enumerate(data_loader):
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -422,6 +626,37 @@ def evaluate(
         acc_flat = accuracy_score(preds_linear, targets_linear.cpu())
         flat_accs.update(acc_flat, preds_linear.size(0))
 
+        if compute_gating_metrics:
+            if formatter is None:
+                raise ValueError("compute_gating_metrics=True requires dataset.formatter to be present.")
+            if gold_num_codes is None:
+                raise ValueError("compute_gating_metrics=True requires gold_num_codes in the batch.")
+            decode_max_num_codes = min(2, formatter.max_num_codes)
+            zero_idx = formatter.map_char_idx.get('0') if hasattr(formatter, "map_char_idx") else None
+            outputs = mixer_greedy_decode(
+                model=model,
+                descr=input_ids,
+                input_attention_mask=attention_mask,
+                device=device,
+                max_len=formatter.max_seq_len,
+                start_symbol=BOS_IDX,
+                pad_idx=PAD_IDX,
+                block_size=formatter.block_size,
+                max_num_codes=decode_max_num_codes,
+                disallow_pad_inside_block=disallow_pad_inside_block,
+                disallow_zero_at_block_start=disallow_zero_at_block_start,
+                zero_idx=zero_idx,
+            )
+            preds_seq = outputs[0].cpu().numpy()
+            block2_start = 1 + formatter.block_size
+            block2_tokens = preds_seq[:, block2_start:block2_start + formatter.block_size]
+            pred_has2 = (block2_tokens != PAD_IDX).any(axis=1)
+            gold_has2 = (gold_num_codes >= 2).detach().cpu().numpy()
+            gating_tp += int((pred_has2 & gold_has2).sum())
+            gating_fn += int((~pred_has2 & gold_has2).sum())
+            gating_fp += int((pred_has2 & ~gold_has2).sum())
+            gating_tn += int((~pred_has2 & ~gold_has2).sum())
+
         if batch_idx % log_interval == 0:
             tqdm.write(f'  Eval Batch {batch_idx + 1}/{len(data_loader)} | '
                        f'Seq Acc: {seq_accs.avg:.2f}% | '
@@ -439,7 +674,20 @@ def evaluate(
         disallow_zero_at_block_start=disallow_zero_at_block_start,
     )
 
-    return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg
+    precision = gating_tp / (gating_tp + gating_fp) if (gating_tp + gating_fp) else 0.0
+    recall = gating_tp / (gating_tp + gating_fn) if (gating_tp + gating_fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    gating_metrics = {
+        "gating_precision": precision,
+        "gating_recall": recall,
+        "gating_f1": f1,
+        "gating_tp": gating_tp,
+        "gating_fp": gating_fp,
+        "gating_fn": gating_fn,
+        "gating_tn": gating_tn,
+    } if compute_gating_metrics else None
+
+    return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg, gating_metrics
 
 
 @dataclass
@@ -887,9 +1135,54 @@ def train(
         disallow_zero_at_block_start: bool = False,
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
+        gate_stabilize_metric: str = "gating_f1",
+        gate_stabilize_window: int = 5,
+        gate_stabilize_delta: float = 0.02,
+        gate_stabilize_min: float = 0.90,
+        late_grad_accum: int = 1,
+        late_lr_mult: float = 1.0,
+        late_warmup_steps: int = 0,
+        late_switch_once: bool = True,
+        batch_size: int | None = None,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
+
+    world_size = 1
+    if distributed and dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+    elif data_loaders.get("data_loader_train") is not None:
+        world_size = getattr(data_loaders["data_loader_train"].sampler, "num_replicas", 1)
+    if batch_size is None:
+        batch_size = data_loaders["data_loader_train"].batch_size
+
+    enable_late_phase = (
+        late_grad_accum > 1
+        or late_lr_mult != 1.0
+        or late_warmup_steps > 0
+    )
+    late_phase_state = None
+    if enable_late_phase:
+        late_phase_state = {
+            "enabled": False,
+            "pending_switch": False,
+            "grad_accum_steps": 1,
+            "late_grad_accum": late_grad_accum,
+            "late_lr_mult": late_lr_mult,
+            "late_warmup_steps": late_warmup_steps,
+            "late_warmup_total": 0,
+            "late_warmup_remaining": 0,
+            "late_warmup_step": 0,
+            "late_warmup_target_lrs": [],
+            "gate_metric_history": [],
+            "gate_stabilize_metric": gate_stabilize_metric,
+            "gate_stabilize_window": gate_stabilize_window,
+            "gate_stabilize_delta": gate_stabilize_delta,
+            "gate_stabilize_min": gate_stabilize_min,
+            "late_switch_once": late_switch_once,
+            "batch_size": batch_size,
+            "world_size": world_size,
+        }
     
     epoch = 0
     while current_step < total_steps:
@@ -925,6 +1218,7 @@ def train(
             disallow_zero_at_block_start=disallow_zero_at_block_start,
             min_double_steps=min_double_steps,
             min_double_ratio=min_double_ratio,
+            late_phase_state=late_phase_state,
         )
         
         # Save at the end of each epoch if the flag is set

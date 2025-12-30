@@ -121,6 +121,14 @@ def parse_args():
     parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
     parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
     parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
+    parser.add_argument('--gate-stabilize-metric', type=str, default='gating_f1', help='Metric name to monitor for gating stabilization.')
+    parser.add_argument('--gate-stabilize-window', type=int, default=5, help='Number of eval points to check for gating stabilization.')
+    parser.add_argument('--gate-stabilize-delta', type=float, default=0.02, help='Maximum allowed metric range within stabilization window.')
+    parser.add_argument('--gate-stabilize-min', type=float, default=0.90, help='Minimum metric value required within stabilization window.')
+    parser.add_argument('--late-grad-accum', type=int, default=2, help='Gradient accumulation steps after gating stabilization.')
+    parser.add_argument('--late-lr-mult', type=float, default=0.4, help='Multiplier applied to LR when switching to late phase.')
+    parser.add_argument('--late-warmup-steps', type=int, default=1000, help='Warmup steps after switching to late phase.')
+    parser.add_argument('--late-switch-once', action=argparse.BooleanOptionalAction, default=True, help='Only switch to late phase once when stabilization is detected.')
 
     args = parser.parse_args()
 
@@ -727,6 +735,15 @@ def main():
         disallow_zero_at_block_start=args.disallow_zero_at_block_start,
         min_double_steps=args.min_double_steps,
         min_double_ratio=args.min_double_ratio,
+        gate_stabilize_metric=args.gate_stabilize_metric,
+        gate_stabilize_window=args.gate_stabilize_window,
+        gate_stabilize_delta=args.gate_stabilize_delta,
+        gate_stabilize_min=args.gate_stabilize_min,
+        late_grad_accum=args.late_grad_accum,
+        late_lr_mult=args.late_lr_mult,
+        late_warmup_steps=args.late_warmup_steps,
+        late_switch_once=args.late_switch_once,
+        batch_size=args.batch_size,
     )
     
     # Cleanup distributed training
