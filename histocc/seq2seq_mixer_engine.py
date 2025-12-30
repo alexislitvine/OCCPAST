@@ -427,6 +427,10 @@ def train_one_epoch(
 
         is_eval_step = eval_interval is not None and current_step % eval_interval == 0
         debug_ddp_eval = os.getenv("DEBUG_DDP_EVAL") == "1"
+        if eval_interval is not None and distributed and dist.is_available() and dist.is_initialized():
+            eval_tensor = torch.tensor(1 if is_eval_step and is_main_process else 0, device=device)
+            dist.broadcast(eval_tensor, src=0)
+            is_eval_step = bool(eval_tensor.item())
         if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
             if debug_ddp_eval and is_main_process:
                 print(f"[DDP EVAL] rank0 about to barrier (pre-probe) step {current_step}")
