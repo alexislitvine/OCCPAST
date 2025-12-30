@@ -466,7 +466,19 @@ def train_one_epoch(
                 tqdm.write(f'  GPU Memory - Allocated: {torch.cuda.max_memory_allocated() / (1024 ** 3):.2f} GB | '
                            f'Reserved: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB')
 
-        if save_interval is not None and current_step % save_interval == 0 and is_main_process and not save_each_epoch:
+        if save_interval is not None and current_step % save_interval == 0 and distributed and dist.is_available() and dist.is_initialized():
+            ddp_sync_point("pre_checkpoint", current_step, device)
+            if is_main_process and not save_each_epoch:
+                _save_model_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    current_step=current_step,
+                    save_dir=save_dir,
+                    dataset_map_code_label=data_loader.dataset.map_code_label,
+                )
+            ddp_sync_point("post_checkpoint", current_step, device)
+        elif save_interval is not None and current_step % save_interval == 0 and is_main_process and not save_each_epoch:
             _save_model_checkpoint(
                 model=model,
                 optimizer=optimizer,
