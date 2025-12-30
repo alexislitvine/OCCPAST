@@ -613,13 +613,21 @@ def train_one_epoch(
             finally:
                 if debug_ddp_eval and is_main_process:
                     print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}")
-            ddp_sync_point("post_eval", current_step, device)
-            if debug_ddp_eval:
-                print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
-            if eval_error is not None:
-                raise eval_error
-            if probe_error is not None:
-                raise probe_error
+                ddp_sync_point("post_eval", current_step, device)
+                if debug_ddp_eval:
+                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
+
+            eval_failed = torch.tensor(
+                1 if (eval_error is not None or probe_error is not None) else 0,
+                device=device,
+            )
+            ddp_broadcast(eval_failed, "eval_failed", current_step, device)
+            if eval_failed.item() == 1:
+                if eval_error is not None:
+                    raise eval_error
+                if probe_error is not None:
+                    raise probe_error
+                raise RuntimeError("Eval/probe failed on rank0; aborting on all ranks.")
 
             switch_tensor = torch.tensor(
                 1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
