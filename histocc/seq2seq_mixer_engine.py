@@ -622,6 +622,7 @@ def train_one_epoch(
                 if debug_ddp_eval and is_main_process:
                     print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}", flush=True)
                 ddp_broadcast(tensor, f"metric:{name}", current_step, device)
+            ddp_sync_point("post_eval_broadcasts", current_step, device)
             if eval_failed.item() == 1:
                 if eval_error is not None:
                     raise eval_error
