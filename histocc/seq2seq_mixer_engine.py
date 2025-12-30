@@ -469,106 +469,141 @@ def train_one_epoch(
             ddp_broadcast(eval_tensor, "eval_flag", current_step, device)
             is_eval_step = bool(eval_tensor.item())
         if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
-            ddp_sync_point("pre_eval", current_step, device)
+            rank = dist.get_rank()
+            if debug_ddp_eval:
+                print(f"[DDP EVAL] rank{rank} entering eval section step {current_step}")
+            if debug_ddp_eval and is_main_process:
+                print(f"[DDP EVAL] rank0 pre_eval barrier step {current_step}")
+            dist.barrier()
             eval_error = None
-            if is_main_process:
-                if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank0 entering eval step {current_step}")
-                try:
-                    tqdm.write('\n' + '='*80)
-                    tqdm.write('Starting evaluation pass...')
-                    compute_gating_metrics = late_phase_state is not None
-                    eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
-                        model=model,
-                        data_loader=data_loader_eval,
-                        loss_fn=loss_fn,
-                        device=device,
-                        disallow_pad_inside_block=disallow_pad_inside_block,
-                        disallow_zero_at_block_start=disallow_zero_at_block_start,
-                        compute_gating_metrics=compute_gating_metrics,
-                        require_gold_num_codes=compute_gating_metrics,
-                        run_probe=False,
-                    )
-                    model.train()
-                    
-                    # Print evaluation summary
-                    tqdm.write('='*80)
-                    tqdm.write(f'EVALUATION RESULTS (Step {current_step})')
-                    tqdm.write('='*80)
-                    tqdm.write(f'Validation Loss     : {eval_loss:.6f} (Linear: {eval_loss_linear:.6f}, Seq2Seq: {eval_loss_seq2seq:.6f})')
-                    tqdm.write(f'Training Loss       : {losses.avg:.6f}')
-                    tqdm.write(f'Sequence Accuracy   : {eval_seq_acc:.2f}%')
-                    tqdm.write(f'Token Accuracy      : {eval_token_acc:.2f}%')
-                    tqdm.write(f'Flat Accuracy       : {eval_flat_acc:.2f}%')
-                    tqdm.write(f'Learning Rate       : {optimizer.param_groups[0]["lr"]:.2e}')
-                    tqdm.write('='*80 + '\n')
-
-                    late_phase_metrics = {}
-                    if late_phase_state is not None:
-                        effective_batch = late_phase_state["batch_size"] * late_phase_state["world_size"] * late_phase_state["grad_accum_steps"]
-                        late_phase_metrics.update(
-                            {
-                                "late_phase_enabled": int(late_phase_state["enabled"]),
-                                "grad_accum_steps": late_phase_state["grad_accum_steps"],
-                                "effective_batch": effective_batch,
-                            }
+            probe_error = None
+            eval_loss = float("nan")
+            eval_loss_linear = float("nan")
+            eval_loss_seq2seq = float("nan")
+            eval_seq_acc = float("nan")
+            eval_token_acc = float("nan")
+            eval_flat_acc = float("nan")
+            gating_summary = {}
+            late_phase_metrics = {}
+            try:
+                if is_main_process:
+                    if debug_ddp_eval:
+                        print(f"[DDP EVAL] rank0 entering eval step {current_step}")
+                    try:
+                        tqdm.write('\n' + '='*80)
+                        tqdm.write('Starting evaluation pass...')
+                        compute_gating_metrics = late_phase_state is not None
+                        eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
+                            model=model,
+                            data_loader=data_loader_eval,
+                            loss_fn=loss_fn,
+                            device=device,
+                            disallow_pad_inside_block=disallow_pad_inside_block,
+                            disallow_zero_at_block_start=disallow_zero_at_block_start,
+                            compute_gating_metrics=compute_gating_metrics,
+                            require_gold_num_codes=compute_gating_metrics,
+                            run_probe=False,
                         )
+                        model.train()
+                        
+                        # Print evaluation summary
+                        tqdm.write('='*80)
+                        tqdm.write(f'EVALUATION RESULTS (Step {current_step})')
+                        tqdm.write('='*80)
+                        tqdm.write(f'Validation Loss     : {eval_loss:.6f} (Linear: {eval_loss_linear:.6f}, Seq2Seq: {eval_loss_seq2seq:.6f})')
+                        tqdm.write(f'Training Loss       : {losses.avg:.6f}')
+                        tqdm.write(f'Sequence Accuracy   : {eval_seq_acc:.2f}%')
+                        tqdm.write(f'Token Accuracy      : {eval_token_acc:.2f}%')
+                        tqdm.write(f'Flat Accuracy       : {eval_flat_acc:.2f}%')
+                        tqdm.write(f'Learning Rate       : {optimizer.param_groups[0]["lr"]:.2e}')
+                        tqdm.write('='*80 + '\n')
 
-                    gating_summary = gating_metrics or {}
-                    if late_phase_state is not None and gating_summary:
-                        gate_metric = late_phase_state["gate_stabilize_metric"]
-                        if gate_metric in gating_summary:
-                            history = late_phase_state["gate_metric_history"]
-                            history.append(gating_summary[gate_metric])
-                            if (
-                                (not late_phase_state["enabled"] or not late_phase_state["late_switch_once"])
-                                and _is_gate_stable(late_phase_state)
-                            ):
-                                late_phase_state["pending_switch"] = True
+                        if late_phase_state is not None:
+                            effective_batch = late_phase_state["batch_size"] * late_phase_state["world_size"] * late_phase_state["grad_accum_steps"]
+                            late_phase_metrics.update(
+                                {
+                                    "late_phase_enabled": int(late_phase_state["enabled"]),
+                                    "grad_accum_steps": late_phase_state["grad_accum_steps"],
+                                    "effective_batch": effective_batch,
+                                }
+                            )
 
-                    update_summary(
-                        current_step,
-                        metrics={
-                            'batch_time': batch_time.avg,
-                            'batch_time_data': batch_time_data.avg,
-                            'train_loss': losses.avg,
-                            'val_loss': eval_loss,
-                            'val_loss_linear': eval_loss_linear,
-                            'val_loss_seq2seq': eval_loss_seq2seq,
-                            'seq_acc': eval_seq_acc,
-                            'token_acc': eval_token_acc,
-                            'flat_acc': eval_flat_acc,
-                            'lr': optimizer.param_groups[0]['lr'],
-                            **gating_summary,
-                            **late_phase_metrics,
-                        },
-                        filename=os.path.join(save_dir, 'logs.csv'),
-                        log_wandb=log_wandb,
-                    )
-                except Exception as exc:
-                    eval_error = exc
-            ddp_sync_point("post_eval", current_step, device)
+                        gating_summary = gating_metrics or {}
+                        if late_phase_state is not None and gating_summary:
+                            gate_metric = late_phase_state["gate_stabilize_metric"]
+                            if gate_metric in gating_summary:
+                                history = late_phase_state["gate_metric_history"]
+                                history.append(gating_summary[gate_metric])
+                                if (
+                                    (not late_phase_state["enabled"] or not late_phase_state["late_switch_once"])
+                                    and _is_gate_stable(late_phase_state)
+                                ):
+                                    late_phase_state["pending_switch"] = True
+
+                        update_summary(
+                            current_step,
+                            metrics={
+                                'batch_time': batch_time.avg,
+                                'batch_time_data': batch_time_data.avg,
+                                'train_loss': losses.avg,
+                                'val_loss': eval_loss,
+                                'val_loss_linear': eval_loss_linear,
+                                'val_loss_seq2seq': eval_loss_seq2seq,
+                                'seq_acc': eval_seq_acc,
+                                'token_acc': eval_token_acc,
+                                'flat_acc': eval_flat_acc,
+                                'lr': optimizer.param_groups[0]['lr'],
+                                **gating_summary,
+                                **late_phase_metrics,
+                            },
+                            filename=os.path.join(save_dir, 'logs.csv'),
+                            log_wandb=log_wandb,
+                        )
+                    except Exception as exc:
+                        eval_error = exc
+                    try:
+                        _run_pst2_eval_probe(
+                            model=model,
+                            data_loader=data_loader_eval,
+                            device=device,
+                            sample_size=200,
+                            seed=42,
+                            disallow_pad_inside_block=disallow_pad_inside_block,
+                            disallow_zero_at_block_start=disallow_zero_at_block_start,
+                        )
+                    except Exception as exc:
+                        probe_error = exc
+                metrics_to_broadcast = [
+                    ("val_loss", eval_loss),
+                    ("val_loss_linear", eval_loss_linear),
+                    ("val_loss_seq2seq", eval_loss_seq2seq),
+                    ("seq_acc", eval_seq_acc),
+                    ("token_acc", eval_token_acc),
+                    ("flat_acc", eval_flat_acc),
+                    ("gating_precision", gating_summary.get("gating_precision", float("nan"))),
+                    ("gating_recall", gating_summary.get("gating_recall", float("nan"))),
+                    ("gating_f1", gating_summary.get("gating_f1", float("nan"))),
+                    ("gating_tp", gating_summary.get("gating_tp", float("nan"))),
+                    ("gating_fp", gating_summary.get("gating_fp", float("nan"))),
+                    ("gating_fn", gating_summary.get("gating_fn", float("nan"))),
+                    ("gating_tn", gating_summary.get("gating_tn", float("nan"))),
+                    ("late_phase_enabled", late_phase_metrics.get("late_phase_enabled", 0)),
+                    ("grad_accum_steps", late_phase_metrics.get("grad_accum_steps", 1)),
+                    ("effective_batch", late_phase_metrics.get("effective_batch", float("nan"))),
+                ]
+                for name, value in metrics_to_broadcast:
+                    tensor = torch.tensor(value, device=device)
+                    if debug_ddp_eval and is_main_process:
+                        print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}")
+                    dist.broadcast(tensor, src=0)
+            finally:
+                if debug_ddp_eval and is_main_process:
+                    print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}")
+                dist.barrier()
+                if debug_ddp_eval:
+                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
             if eval_error is not None:
                 raise eval_error
-
-            ddp_sync_point("pre_probe", current_step, device)
-            probe_error = None
-            if is_main_process:
-                if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank0 entering probe eval step {current_step}")
-                try:
-                    _run_pst2_eval_probe(
-                        model=model,
-                        data_loader=data_loader_eval,
-                        device=device,
-                        sample_size=200,
-                        seed=42,
-                        disallow_pad_inside_block=disallow_pad_inside_block,
-                        disallow_zero_at_block_start=disallow_zero_at_block_start,
-                    )
-                except Exception as exc:
-                    probe_error = exc
-            ddp_sync_point("post_probe", current_step, device)
             if probe_error is not None:
                 raise probe_error
 
