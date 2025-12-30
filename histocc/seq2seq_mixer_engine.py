@@ -34,14 +34,17 @@ _ddp_collective_seq = {"value": 0}
 def _ddp_debug_collective(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
-    if os.getenv("DEBUG_DDP_SYNC") != "1":
+    if os.getenv("DEBUG_DDP") != "1":
         return
     _ddp_collective_seq["value"] += 1
     seq = _ddp_collective_seq["value"]
-    if dist.get_rank() == 0:
+    rank = dist.get_rank()
+    if rank == 0:
         print(f"[DDP SYNC] step {step} seq {seq} about to {tag}")
+    print(f"[DDP SYNC] rank{rank} before all_reduce tag={tag} numel=1")
     seq_tensor = torch.tensor(seq, device=device)
     dist.all_reduce(seq_tensor, op=dist.ReduceOp.SUM)
+    print(f"[DDP SYNC] rank{rank} after all_reduce tag={tag} numel=1")
     expected = seq * dist.get_world_size()
     if seq_tensor.item() != expected:
         raise RuntimeError(
