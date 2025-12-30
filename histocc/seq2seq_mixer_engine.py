@@ -485,9 +485,9 @@ def train_one_epoch(
         if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
             if debug_ddp_eval:
-                print(f"[DDP EVAL] rank{rank} entering eval section step {current_step}")
+                print(f"[DDP EVAL] rank{rank} entering eval section step {current_step}", flush=True)
             if debug_ddp_eval and is_main_process:
-                print(f"[DDP EVAL] rank0 pre_eval barrier step {current_step}")
+                print(f"[DDP EVAL] rank0 pre_eval barrier step {current_step}", flush=True)
             ddp_sync_point("pre_eval", current_step, device)
             eval_error = None
             probe_error = None
@@ -502,7 +502,7 @@ def train_one_epoch(
             try:
                 if is_main_process:
                     if debug_ddp_eval:
-                        print(f"[DDP EVAL] rank0 entering eval step {current_step}")
+                        print(f"[DDP EVAL] rank0 entering eval step {current_step}", flush=True)
                     try:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
@@ -587,41 +587,41 @@ def train_one_epoch(
                         )
                     except Exception as exc:
                         probe_error = exc
-                metrics_to_broadcast = [
-                    ("val_loss", eval_loss),
-                    ("val_loss_linear", eval_loss_linear),
-                    ("val_loss_seq2seq", eval_loss_seq2seq),
-                    ("seq_acc", eval_seq_acc),
-                    ("token_acc", eval_token_acc),
-                    ("flat_acc", eval_flat_acc),
-                    ("gating_precision", gating_summary.get("gating_precision", float("nan"))),
-                    ("gating_recall", gating_summary.get("gating_recall", float("nan"))),
-                    ("gating_f1", gating_summary.get("gating_f1", float("nan"))),
-                    ("gating_tp", gating_summary.get("gating_tp", float("nan"))),
-                    ("gating_fp", gating_summary.get("gating_fp", float("nan"))),
-                    ("gating_fn", gating_summary.get("gating_fn", float("nan"))),
-                    ("gating_tn", gating_summary.get("gating_tn", float("nan"))),
-                    ("late_phase_enabled", late_phase_metrics.get("late_phase_enabled", 0)),
-                    ("grad_accum_steps", late_phase_metrics.get("grad_accum_steps", 1)),
-                    ("effective_batch", late_phase_metrics.get("effective_batch", float("nan"))),
-                ]
-                for name, value in metrics_to_broadcast:
-                    tensor = torch.tensor(value, device=device)
-                    if debug_ddp_eval and is_main_process:
-                        print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}")
-                    ddp_broadcast(tensor, f"metric:{name}", current_step, device)
             finally:
                 if debug_ddp_eval and is_main_process:
-                    print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}")
+                    print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}", flush=True)
                 ddp_sync_point("post_eval", current_step, device)
                 if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
+                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}", flush=True)
 
             eval_failed = torch.tensor(
                 1 if (eval_error is not None or probe_error is not None) else 0,
                 device=device,
             )
             ddp_broadcast(eval_failed, "eval_failed", current_step, device)
+            metrics_to_broadcast = [
+                ("val_loss", eval_loss),
+                ("val_loss_linear", eval_loss_linear),
+                ("val_loss_seq2seq", eval_loss_seq2seq),
+                ("seq_acc", eval_seq_acc),
+                ("token_acc", eval_token_acc),
+                ("flat_acc", eval_flat_acc),
+                ("gating_precision", gating_summary.get("gating_precision", float("nan"))),
+                ("gating_recall", gating_summary.get("gating_recall", float("nan"))),
+                ("gating_f1", gating_summary.get("gating_f1", float("nan"))),
+                ("gating_tp", gating_summary.get("gating_tp", float("nan"))),
+                ("gating_fp", gating_summary.get("gating_fp", float("nan"))),
+                ("gating_fn", gating_summary.get("gating_fn", float("nan"))),
+                ("gating_tn", gating_summary.get("gating_tn", float("nan"))),
+                ("late_phase_enabled", late_phase_metrics.get("late_phase_enabled", 0)),
+                ("grad_accum_steps", late_phase_metrics.get("grad_accum_steps", 1)),
+                ("effective_batch", late_phase_metrics.get("effective_batch", float("nan"))),
+            ]
+            for name, value in metrics_to_broadcast:
+                tensor = torch.tensor(value, device=device)
+                if debug_ddp_eval and is_main_process:
+                    print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}", flush=True)
+                ddp_broadcast(tensor, f"metric:{name}", current_step, device)
             if eval_failed.item() == 1:
                 if eval_error is not None:
                     raise eval_error
