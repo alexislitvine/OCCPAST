@@ -425,7 +425,16 @@ def train_one_epoch(
                 dataset_map_code_label=data_loader.dataset.map_code_label,
             )
 
-        if eval_interval is not None and current_step % eval_interval == 0 and is_main_process:
+        is_eval_step = eval_interval is not None and current_step % eval_interval == 0
+        debug_ddp_eval = os.getenv("DEBUG_DDP_EVAL") == "1"
+        if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
+            if debug_ddp_eval and is_main_process:
+                print(f"[DDP EVAL] rank0 entering pre-eval barrier {current_step}")
+            dist.barrier()
+            if debug_ddp_eval and not is_main_process:
+                print(f"[DDP EVAL] rank{dist.get_rank()} waiting for eval step {current_step}")
+
+        if is_eval_step and is_main_process:
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
             compute_gating_metrics = late_phase_state is not None
@@ -496,13 +505,12 @@ def train_one_epoch(
                 log_wandb=log_wandb,
             )
 
-        if (
-            eval_interval is not None
-            and current_step % eval_interval == 0
-            and distributed
-            and dist.is_available()
-            and dist.is_initialized()
-        ):
+        if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
+            if debug_ddp_eval and is_main_process:
+                print(f"[DDP EVAL] rank0 entering post-eval barrier {current_step}")
+            dist.barrier()
+            if debug_ddp_eval and is_main_process:
+                print(f"[DDP EVAL] rank0 broadcasting switch flag {current_step}")
             switch_tensor = torch.tensor(
                 1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
                 device=device,
@@ -510,6 +518,8 @@ def train_one_epoch(
             dist.broadcast(switch_tensor, src=0)
             if late_phase_state is not None and switch_tensor.item() == 1:
                 late_phase_state["pending_switch"] = True
+            if debug_ddp_eval and is_main_process:
+                print(f"[DDP EVAL] rank0 finished eval sync {current_step}")
 
         end = time.time()
 
