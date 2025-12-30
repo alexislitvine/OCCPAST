@@ -2,6 +2,8 @@ import os
 import time
 import statistics
 import random
+import faulthandler
+import signal
 
 import numpy as np
 from collections import Counter
@@ -276,6 +278,9 @@ def train_one_epoch(
         late_phase_state: dict | None = None,
         ) -> int:
     model = model.train()
+    if os.getenv("HANG_DEBUG") == "1" and not hasattr(train_one_epoch, "_faulthandler_registered"):
+        faulthandler.register(signal.SIGUSR1)
+        train_one_epoch._faulthandler_registered = True
 
     last_step = len(data_loader) - 1
     losses = Averager()
@@ -608,9 +613,9 @@ def train_one_epoch(
             finally:
                 if debug_ddp_eval and is_main_process:
                     print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}")
-                ddp_sync_point("post_eval", current_step, device)
-                if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
+            ddp_sync_point("post_eval", current_step, device)
+            if debug_ddp_eval:
+                print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}")
             if eval_error is not None:
                 raise eval_error
             if probe_error is not None:
