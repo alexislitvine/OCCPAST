@@ -491,6 +491,7 @@ def train_one_epoch(
         is_eval_step = eval_interval is not None and current_step % eval_interval == 0
         debug_ddp_eval = os.getenv("DEBUG_DDP_EVAL") == "1"
         if eval_interval is not None and distributed and dist.is_available() and dist.is_initialized():
+            ddp_sync_point("pre_eval_flag", current_step, device)
             eval_tensor = torch.tensor(1 if is_eval_step and is_main_process else 0, device=device)
             ddp_broadcast(eval_tensor, "eval_flag", current_step, device)
             is_eval_step = bool(eval_tensor.item())
