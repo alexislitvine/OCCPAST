@@ -586,6 +586,7 @@ def train_one_epoch(
                             filename=os.path.join(save_dir, 'logs.csv'),
                             log_wandb=log_wandb,
                         )
+                        ddp_sync_point("post_eval_logging", current_step, device)
                     except Exception as exc:
                         eval_error = exc
                     try:
