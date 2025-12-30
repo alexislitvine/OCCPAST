@@ -15,7 +15,7 @@ from tqdm import tqdm
 from torch import nn
 from sklearn.metrics import accuracy_score
 
-from .formatter import BOS_IDX, EOS_IDX, PAD_IDX
+from .formatter import BOS_IDX, EOS_IDX, PAD_IDX, SEP_IDX
 from .utils import (
     create_mask,
     Averager,
@@ -923,6 +923,25 @@ def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: b
 def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -> str:
     seq_len = formatter.max_seq_len
     block_size = formatter.block_size
+    if hasattr(formatter, "map_idx_char"):
+        rev_mapping = formatter.map_idx_char
+        missing = [
+            int(tok) for tok in block_tokens
+            if int(tok) not in rev_mapping and int(tok) not in {PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX}
+        ]
+        if missing and not getattr(_decode_block_string, "_logged_missing", False):
+            _decode_block_string._logged_missing = True
+            rank = 0
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            if rank == 0:
+                min_tok = int(min(block_tokens))
+                max_tok = int(max(block_tokens))
+                sample_missing = sorted(set(missing))[:10]
+                print(
+                    "PST2 probe warning: tokens missing from rev_mapping "
+                    f"min_tok={min_tok} max_tok={max_tok} missing_sample={sample_missing}"
+                )
     start = 1 + block_index * block_size
     end = start + block_size
     seq = [PAD_IDX] * seq_len
@@ -933,6 +952,37 @@ def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -
 
 
 def _run_pst2_eval_probe(
+        model: nn.Module,
+        data_loader: torch.utils.data.DataLoader,
+        device: torch.device,
+        sample_size: int = 200,
+        seed: int = 42,
+        disallow_pad_inside_block: bool = False,
+        disallow_zero_at_block_start: bool = False,
+) -> None:
+    strict_probe = os.getenv("STRICT_PROBE") == "1"
+    try:
+        _run_pst2_eval_probe_inner(
+            model=model,
+            data_loader=data_loader,
+            device=device,
+            sample_size=sample_size,
+            seed=seed,
+            disallow_pad_inside_block=disallow_pad_inside_block,
+            disallow_zero_at_block_start=disallow_zero_at_block_start,
+        )
+    except Exception as exc:
+        rank = 0
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+        if rank == 0:
+            print(f'PST2 eval probe failed: {exc}')
+        if strict_probe:
+            raise
+        return
+
+
+def _run_pst2_eval_probe_inner(
         model: nn.Module,
         data_loader: torch.utils.data.DataLoader,
         device: torch.device,
@@ -1289,7 +1339,7 @@ def _run_pst2_eval_probe(
     _print_examples('A) block2_nonpad=True but norm2_in_key=False', examples_a)
     _print_examples('B) block2_nonpad=True, norm2_in_key=True but split_returns_1', examples_b)
     _print_examples('C) block2_nonpad=False', examples_c)
-    print('=' * 80 + '\n')
+        print('=' * 80 + '\n')
 
 
 def train(

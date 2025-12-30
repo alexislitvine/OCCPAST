@@ -83,10 +83,11 @@ def clean_code(
     cleaned = []
 
     for idx in formatted_code:
-        if idx in {PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX}:
+        idx_int = int(idx)
+        if idx_int in {PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX}:
             continue
 
-        cleaned.append(rev_mapping[idx])
+        cleaned.append(rev_mapping.get(idx_int, '0'))
 
     if within_block_sep is not None:
         join_char = within_block_sep
