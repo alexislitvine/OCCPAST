@@ -1339,7 +1339,7 @@ def _run_pst2_eval_probe_inner(
     _print_examples('A) block2_nonpad=True but norm2_in_key=False', examples_a)
     _print_examples('B) block2_nonpad=True, norm2_in_key=True but split_returns_1', examples_b)
     _print_examples('C) block2_nonpad=False', examples_c)
-        print('=' * 80 + '\n')
+    print('=' * 80 + '\n')
 
 
 def train(
