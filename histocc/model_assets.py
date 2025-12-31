@@ -9,7 +9,10 @@ Purpose: Defines model classes
 """
 
 
+import os
+
 import torch
+import torch.distributed as dist
 
 from torch import nn, Tensor
 
@@ -262,12 +265,32 @@ class Seq2SeqMixerOccCANINE(Seq2SeqOccCANINE):
             target_mask: Tensor,
             target_padding_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        trace_once = (
+            os.getenv("DDP_TRACE_MODEL") == "1"
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_rank() == 0
+            and not getattr(self, "_trace_logged", False)
+        )
+        if trace_once:
+            self._trace_logged = True
+            print("[DDP][rank0] model forward enter encode", flush=True)
         memory, pooled_memory = self.encode(input_ids, attention_mask)
+        if trace_once:
+            print("[DDP][rank0] model forward exit encode", flush=True)
 
+        if trace_once:
+            print("[DDP][rank0] model forward enter decode", flush=True)
         out_seq2seq = self.decode(memory, target, target_mask, target_padding_mask)
+        if trace_once:
+            print("[DDP][rank0] model forward exit decode", flush=True)
 
+        if trace_once:
+            print("[DDP][rank0] model forward enter linear", flush=True)
         out_linear = self.linear_decoder(pooled_memory)
         out_linear = self.linear_decoder_drop(out_linear)
+        if trace_once:
+            print("[DDP][rank0] model forward exit linear", flush=True)
 
         return out_seq2seq, out_linear
 
