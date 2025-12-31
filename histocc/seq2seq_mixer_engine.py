@@ -751,11 +751,11 @@ def evaluate(
         run_probe: bool = True,
         ):
     model = model.eval()
+    rank = 0
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
     if not hasattr(evaluate, "_logged_file"):
         evaluate._logged_file = True
-        rank = 0
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
         if rank == 0:
             print(f'evaluate() running from {__file__}')
 
@@ -774,14 +774,13 @@ def evaluate(
 
     for batch_idx, batch in enumerate(data_loader):
         if batch_idx == 0:
-            rank = 0
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
             if rank == 0:
                 tqdm.write(
                     "Eval batch[0] keys: "
                     f"{', '.join(sorted(batch.keys()))}"
                 )
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval batch begin", flush=True)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
@@ -805,6 +804,8 @@ def evaluate(
         target_mask, target_padding_mask = create_mask(target_seq2seq_input, PAD_IDX, device)
 
         # Forward pass
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval forward start", flush=True)
         out_seq2seq, out_linear = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -812,7 +813,11 @@ def evaluate(
             target_mask=target_mask,
             target_padding_mask=target_padding_mask,
         )
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval forward done", flush=True)
 
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval loss start", flush=True)
         loss = loss_fn(
             out_seq2seq=out_seq2seq,
             out_linear=out_linear,
@@ -822,11 +827,15 @@ def evaluate(
             )
         loss_linear = loss_fn.loss_fn_linear(out_linear, targets_linear)
         loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq, gold_num_codes=gold_num_codes)
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval loss done", flush=True)
 
         losses.update(loss.item(), out_seq2seq.size(0))
         losses_linear.update(loss_linear.item(), out_seq2seq.size(0))
         losses_seq2seq.update(loss_seq2seq.item(), out_seq2seq.size(0))
 
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval accuracy start", flush=True)
         seq_acc, token_acc = order_invariant_accuracy(
             output=out_seq2seq,
             target=targets_seq2seq[:, 1:],
@@ -836,19 +845,27 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval accuracy done", flush=True)
 
         # Linear decoder accuracy
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval flat acc start", flush=True)
         preds_linear = torch.sigmoid(out_linear) > 0.5
         preds_linear = preds_linear.float().cpu()
 
         acc_flat = accuracy_score(preds_linear, targets_linear.cpu())
         flat_accs.update(acc_flat, preds_linear.size(0))
+        if batch_idx == 0 and rank == 0:
+            print("[DDP][rank0] eval flat acc done", flush=True)
 
         if compute_gating_metrics:
             if formatter is None:
                 raise ValueError("compute_gating_metrics=True requires dataset.formatter to be present.")
             if gold_num_codes is None:
                 raise ValueError("compute_gating_metrics=True requires gold_num_codes in the batch.")
+            if batch_idx == 0 and rank == 0:
+                print("[DDP][rank0] eval gating start", flush=True)
             decode_max_num_codes = min(2, formatter.max_num_codes)
             zero_idx = formatter.map_char_idx.get('0') if hasattr(formatter, "map_char_idx") else None
             outputs = mixer_greedy_decode(
@@ -874,6 +891,8 @@ def evaluate(
             gating_fn += int((~pred_has2 & gold_has2).sum())
             gating_fp += int((pred_has2 & ~gold_has2).sum())
             gating_tn += int((~pred_has2 & ~gold_has2).sum())
+            if batch_idx == 0 and rank == 0:
+                print("[DDP][rank0] eval gating done", flush=True)
 
         if batch_idx % log_interval == 0:
             tqdm.write(f'  Eval Batch {batch_idx + 1}/{len(data_loader)} | '
