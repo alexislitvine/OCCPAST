@@ -268,11 +268,6 @@ def train_one_epoch(
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
 
     for batch_idx, batch in enumerate(iterator):
-        if is_main_process and dist.is_available() and dist.is_initialized():
-            debug_detail = os.getenv("TORCH_DISTRIBUTED_DEBUG")
-            if debug_detail and not hasattr(train_one_epoch, "_logged_ddp_debug"):
-                train_one_epoch._logged_ddp_debug = True
-                print(f"[DDP] TORCH_DISTRIBUTED_DEBUG={debug_detail}", flush=True)
         # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
             _apply_late_phase_switch(
