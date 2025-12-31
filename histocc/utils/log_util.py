@@ -56,6 +56,9 @@ def wandb_init(
     if not os.path.exists(_dir):
         os.makedirs(_dir)
 
+    init_timeout = int(os.getenv("WANDB_INIT_TIMEOUT", "120"))
+    settings = wandb.Settings(init_timeout=init_timeout)
+
     wandb.init(
         project=project,
         name=name,
@@ -63,4 +66,5 @@ def wandb_init(
         resume=resume,
         config=config,
         mode=mode,
+        settings=settings,
         )
