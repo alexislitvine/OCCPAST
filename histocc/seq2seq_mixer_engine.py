@@ -331,6 +331,28 @@ def train_one_epoch(
         targets_linear = batch['targets_linear'].to(device, non_blocking=True)
         gold_num_codes = batch['gold_num_codes'].to(device, non_blocking=True)
 
+        if os.getenv("DEBUG_BLOCK2") == "1" and is_main_process:
+            block_size = loss_fn.loss_fn_seq2seq.block_size
+            block2_start = 1 + block_size
+            block2_end = block2_start + block_size
+            block2_targets = targets_seq2seq[:, block2_start:block2_end]
+            gold_has2 = gold_num_codes >= 2
+            block2_all_pad = (block2_targets == PAD_IDX).all(dim=1)
+            doubles_ratio = float(gold_has2.float().mean().item())
+            if gold_has2.any():
+                block2_all_pad_doubles = float(block2_all_pad[gold_has2].float().mean().item())
+            else:
+                block2_all_pad_doubles = float("nan")
+            block2_all_pad_overall = float(block2_all_pad.float().mean().item())
+            if current_step <= min_double_steps or current_step % log_interval == 0:
+                tqdm.write(
+                    "DEBUG_BLOCK2 "
+                    f"step={current_step} "
+                    f"doubles_ratio={doubles_ratio:.3f} "
+                    f"block2_all_pad_overall={block2_all_pad_overall:.3f} "
+                    f"block2_all_pad_doubles={block2_all_pad_doubles:.3f}"
+                )
+
         batch_time_data.update(time.time() - end)
 
         # Prepare target as input for seq2seq model
