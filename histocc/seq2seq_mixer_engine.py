@@ -732,6 +732,15 @@ def evaluate(
     formatter = getattr(data_loader.dataset, "formatter", None)
 
     for batch_idx, batch in enumerate(data_loader):
+        if batch_idx == 0:
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank == 0:
+                tqdm.write(
+                    "Eval batch[0] keys: "
+                    f"{', '.join(sorted(batch.keys()))}"
+                )
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
@@ -740,6 +749,14 @@ def evaluate(
         if gold_num_codes is not None:
             gold_num_codes = gold_num_codes.to(device, non_blocking=True)
         elif require_gold_num_codes:
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank == 0:
+                tqdm.write(
+                    "Eval batch missing gold_num_codes. "
+                    f"Keys: {', '.join(sorted(batch.keys()))}"
+                )
             raise ValueError("gold_num_codes is required for evaluate(), but was not found in the batch.")
 
         # Prepare target as input for seq2seq model
