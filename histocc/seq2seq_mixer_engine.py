@@ -2,8 +2,6 @@ import os
 import time
 import statistics
 import random
-import faulthandler
-import signal
 
 import numpy as np
 from collections import Counter
@@ -30,44 +28,16 @@ from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
 
 
-_ddp_collective_seq = {"value": 0}
-
-
-def _ddp_debug_collective(tag: str, step: int) -> None:
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    if os.getenv("DEBUG_DDP") != "1":
-        return
-    _ddp_collective_seq["value"] += 1
-    seq = _ddp_collective_seq["value"]
-    rank = dist.get_rank()
-    print(f"[DDP SYNC] rank{rank} entering {tag} step={step} seq={seq}", flush=True)
-
-
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
-    _ddp_debug_collective(f"barrier:{tag}", step)
-    if os.getenv("DEBUG_DDP") == "1":
-        rank = dist.get_rank()
-        print(f"[rank{rank}] entering barrier: {tag}", flush=True)
     dist.barrier()
-    if os.getenv("DEBUG_DDP") == "1":
-        rank = dist.get_rank()
-        print(f"[rank{rank}] leaving barrier: {tag}", flush=True)
 
 
 def ddp_broadcast(tensor: torch.Tensor, tag: str, step: int, device: torch.device) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
         return tensor
-    _ddp_debug_collective(f"broadcast:{tag}", step)
-    if os.getenv("DEBUG_DDP") == "1":
-        rank = dist.get_rank()
-        print(f"[rank{rank}] entering broadcast: {tag}", flush=True)
     dist.broadcast(tensor, src=0)
-    if os.getenv("DEBUG_DDP") == "1":
-        rank = dist.get_rank()
-        print(f"[rank{rank}] leaving broadcast: {tag}", flush=True)
     return tensor
 
 
@@ -278,9 +248,6 @@ def train_one_epoch(
         late_phase_state: dict | None = None,
         ) -> int:
     model = model.train()
-    if os.getenv("HANG_DEBUG") == "1" and not hasattr(train_one_epoch, "_faulthandler_registered"):
-        faulthandler.register(signal.SIGUSR1)
-        train_one_epoch._faulthandler_registered = True
 
     last_step = len(data_loader) - 1
     losses = Averager()
@@ -489,18 +456,11 @@ def train_one_epoch(
             )
 
         is_eval_step = eval_interval is not None and current_step % eval_interval == 0
-        debug_ddp_eval = os.getenv("DEBUG_DDP_EVAL") == "1"
         if eval_interval is not None and distributed and dist.is_available() and dist.is_initialized():
-            ddp_sync_point("pre_eval_flag", current_step, device)
             eval_tensor = torch.tensor(1 if is_eval_step and is_main_process else 0, device=device)
             ddp_broadcast(eval_tensor, "eval_flag", current_step, device)
             is_eval_step = bool(eval_tensor.item())
         if is_eval_step and distributed and dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            if debug_ddp_eval:
-                print(f"[DDP EVAL] rank{rank} entering eval section step {current_step}", flush=True)
-            if debug_ddp_eval and is_main_process:
-                print(f"[DDP EVAL] rank0 pre_eval barrier step {current_step}", flush=True)
             ddp_sync_point("pre_eval", current_step, device)
             eval_error = None
             probe_error = None
@@ -514,8 +474,6 @@ def train_one_epoch(
             late_phase_metrics = {}
             try:
                 if is_main_process:
-                    if debug_ddp_eval:
-                        print(f"[DDP EVAL] rank0 entering eval step {current_step}", flush=True)
                     try:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
@@ -601,14 +559,8 @@ def train_one_epoch(
                             )
                         except Exception as exc:
                             probe_error = exc
-                    elif debug_ddp_eval:
-                        print("[DDP EVAL] skipping probe in distributed mode", flush=True)
             finally:
-                if debug_ddp_eval and is_main_process:
-                    print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}", flush=True)
                 ddp_sync_point("post_eval", current_step, device)
-                if debug_ddp_eval:
-                    print(f"[DDP EVAL] rank{rank} exiting eval section step {current_step}", flush=True)
 
             eval_failed = torch.tensor(
                 1 if (eval_error is not None or probe_error is not None) else 0,
@@ -635,10 +587,7 @@ def train_one_epoch(
             ]
             for name, value in metrics_to_broadcast:
                 tensor = torch.tensor(value, device=device)
-                if debug_ddp_eval and is_main_process:
-                    print(f"[DDP EVAL] rank0 broadcasting {name} step {current_step}", flush=True)
                 ddp_broadcast(tensor, f"metric:{name}", current_step, device)
-            ddp_sync_point("post_eval_broadcasts", current_step, device)
             if eval_failed.item() == 1:
                 if eval_error is not None:
                     raise eval_error
