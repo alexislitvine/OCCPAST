@@ -473,6 +473,12 @@ def train_one_epoch(
             eval_flat_acc = float("nan")
             gating_summary = {}
             late_phase_metrics = {}
+            rank = dist.get_rank()
+            print(
+                f"[DDP][rank{rank}] enter eval block step={current_step} "
+                f"is_main_process={is_main_process}",
+                flush=True,
+            )
             try:
                 if is_main_process:
                     try:
@@ -562,6 +568,11 @@ def train_one_epoch(
                         except Exception as exc:
                             probe_error = exc
             finally:
+                print(
+                    f"[DDP][rank{rank}] exit eval block step={current_step} "
+                    f"is_main_process={is_main_process}",
+                    flush=True,
+                )
                 ddp_sync_point("post_eval", current_step, device)
 
             eval_failed = torch.tensor(
