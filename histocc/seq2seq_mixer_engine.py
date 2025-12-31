@@ -525,25 +525,26 @@ def train_one_epoch(
                                 ):
                                     late_phase_state["pending_switch"] = True
 
-                        update_summary(
-                            current_step,
-                            metrics={
-                                'batch_time': batch_time.avg,
-                                'batch_time_data': batch_time_data.avg,
-                                'train_loss': losses.avg,
-                                'val_loss': eval_loss,
-                                'val_loss_linear': eval_loss_linear,
-                                'val_loss_seq2seq': eval_loss_seq2seq,
-                                'seq_acc': eval_seq_acc,
-                                'token_acc': eval_token_acc,
-                                'flat_acc': eval_flat_acc,
-                                'lr': optimizer.param_groups[0]['lr'],
-                                **gating_summary,
-                                **late_phase_metrics,
-                            },
-                            filename=os.path.join(save_dir, 'logs.csv'),
-                            log_wandb=log_wandb,
-                        )
+                        if os.getenv("DISABLE_EVAL_SUMMARY") != "1":
+                            update_summary(
+                                current_step,
+                                metrics={
+                                    'batch_time': batch_time.avg,
+                                    'batch_time_data': batch_time_data.avg,
+                                    'train_loss': losses.avg,
+                                    'val_loss': eval_loss,
+                                    'val_loss_linear': eval_loss_linear,
+                                    'val_loss_seq2seq': eval_loss_seq2seq,
+                                    'seq_acc': eval_seq_acc,
+                                    'token_acc': eval_token_acc,
+                                    'flat_acc': eval_flat_acc,
+                                    'lr': optimizer.param_groups[0]['lr'],
+                                    **gating_summary,
+                                    **late_phase_metrics,
+                                },
+                                filename=os.path.join(save_dir, 'logs.csv'),
+                                log_wandb=log_wandb,
+                            )
                     except Exception as exc:
                         eval_error = exc
                     if not distributed or os.getenv("DDP_RUN_PROBE") == "1":
