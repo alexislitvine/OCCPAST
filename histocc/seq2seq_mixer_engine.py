@@ -588,18 +588,21 @@ def train_one_epoch(
                         )
                     except Exception as exc:
                         eval_error = exc
-                    try:
-                        _run_pst2_eval_probe(
-                            model=model,
-                            data_loader=data_loader_eval,
-                            device=device,
-                            sample_size=200,
-                            seed=42,
-                            disallow_pad_inside_block=disallow_pad_inside_block,
-                            disallow_zero_at_block_start=disallow_zero_at_block_start,
-                        )
-                    except Exception as exc:
-                        probe_error = exc
+                    if not distributed or os.getenv("DDP_RUN_PROBE") == "1":
+                        try:
+                            _run_pst2_eval_probe(
+                                model=model,
+                                data_loader=data_loader_eval,
+                                device=device,
+                                sample_size=200,
+                                seed=42,
+                                disallow_pad_inside_block=disallow_pad_inside_block,
+                                disallow_zero_at_block_start=disallow_zero_at_block_start,
+                            )
+                        except Exception as exc:
+                            probe_error = exc
+                    elif debug_ddp_eval:
+                        print("[DDP EVAL] skipping probe in distributed mode", flush=True)
             finally:
                 if debug_ddp_eval and is_main_process:
                     print(f"[DDP EVAL] rank0 post_eval barrier step {current_step}", flush=True)
