@@ -31,19 +31,13 @@ from .utils.decoder import mixer_greedy_decode
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
-    rank = dist.get_rank()
-    print(f"[DDP][rank{rank}] enter barrier tag={tag} step={step}", flush=True)
     dist.barrier()
-    print(f"[DDP][rank{rank}] exit barrier tag={tag} step={step}", flush=True)
 
 
 def ddp_broadcast(tensor: torch.Tensor, tag: str, step: int, device: torch.device) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
         return tensor
-    rank = dist.get_rank()
-    print(f"[DDP][rank{rank}] enter broadcast tag={tag} step={step}", flush=True)
     dist.broadcast(tensor, src=0)
-    print(f"[DDP][rank{rank}] exit broadcast tag={tag} step={step}", flush=True)
     return tensor
 
 
@@ -473,22 +467,12 @@ def train_one_epoch(
             eval_flat_acc = float("nan")
             gating_summary = {}
             late_phase_metrics = {}
-            rank = dist.get_rank()
-            print(
-                f"[DDP][rank{rank}] enter eval block step={current_step} "
-                f"is_main_process={is_main_process}",
-                flush=True,
-            )
             try:
                 try:
                     if is_main_process:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
                     compute_gating_metrics = late_phase_state is not None and is_main_process
-                    print(
-                        f"[DDP][rank{rank}] enter evaluate step={current_step}",
-                        flush=True,
-                    )
                     eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
                         model=model,
                         data_loader=data_loader_eval,
@@ -500,10 +484,6 @@ def train_one_epoch(
                         require_gold_num_codes=compute_gating_metrics,
                         run_probe=False,
                         log_interval=log_interval if is_main_process else max(log_interval, 1_000_000),
-                    )
-                    print(
-                        f"[DDP][rank{rank}] exit evaluate step={current_step}",
-                        flush=True,
                     )
                     model.train()
 
@@ -542,42 +522,29 @@ def train_one_epoch(
                                 ):
                                     late_phase_state["pending_switch"] = True
 
-                        if os.getenv("DISABLE_EVAL_SUMMARY") != "1":
-                            print(
-                                f"[DDP][rank{rank}] enter update_summary step={current_step}",
-                                flush=True,
-                            )
-                            update_summary(
-                                current_step,
-                                metrics={
-                                    'batch_time': batch_time.avg,
-                                    'batch_time_data': batch_time_data.avg,
-                                    'train_loss': losses.avg,
-                                    'val_loss': eval_loss,
-                                    'val_loss_linear': eval_loss_linear,
-                                    'val_loss_seq2seq': eval_loss_seq2seq,
-                                    'seq_acc': eval_seq_acc,
-                                    'token_acc': eval_token_acc,
-                                    'flat_acc': eval_flat_acc,
-                                    'lr': optimizer.param_groups[0]['lr'],
-                                    **gating_summary,
-                                    **late_phase_metrics,
-                                },
-                                filename=os.path.join(save_dir, 'logs.csv'),
-                                log_wandb=log_wandb,
-                            )
-                            print(
-                                f"[DDP][rank{rank}] exit update_summary step={current_step}",
-                                flush=True,
-                            )
+                        update_summary(
+                            current_step,
+                            metrics={
+                                'batch_time': batch_time.avg,
+                                'batch_time_data': batch_time_data.avg,
+                                'train_loss': losses.avg,
+                                'val_loss': eval_loss,
+                                'val_loss_linear': eval_loss_linear,
+                                'val_loss_seq2seq': eval_loss_seq2seq,
+                                'seq_acc': eval_seq_acc,
+                                'token_acc': eval_token_acc,
+                                'flat_acc': eval_flat_acc,
+                                'lr': optimizer.param_groups[0]['lr'],
+                                **gating_summary,
+                                **late_phase_metrics,
+                            },
+                            filename=os.path.join(save_dir, 'logs.csv'),
+                            log_wandb=log_wandb,
+                        )
                 except Exception as exc:
                     eval_error = exc
-                if is_main_process and (not distributed or os.getenv("DDP_RUN_PROBE") == "1"):
+                if is_main_process:
                     try:
-                        print(
-                            f"[DDP][rank{rank}] enter eval probe step={current_step}",
-                            flush=True,
-                        )
                         _run_pst2_eval_probe(
                             model=model,
                             data_loader=data_loader_eval,
@@ -587,18 +554,9 @@ def train_one_epoch(
                             disallow_pad_inside_block=disallow_pad_inside_block,
                             disallow_zero_at_block_start=disallow_zero_at_block_start,
                         )
-                        print(
-                            f"[DDP][rank{rank}] exit eval probe step={current_step}",
-                            flush=True,
-                        )
                     except Exception as exc:
                         probe_error = exc
             finally:
-                print(
-                    f"[DDP][rank{rank}] exit eval block step={current_step} "
-                    f"is_main_process={is_main_process}",
-                    flush=True,
-                )
                 ddp_sync_point("post_eval", current_step, device)
 
             eval_failed = torch.tensor(
@@ -752,20 +710,8 @@ def evaluate(
         require_gold_num_codes: bool = False,
         compute_gating_metrics: bool = False,
         run_probe: bool = True,
-        ):
+    ):
     model = model.eval()
-    rank = 0
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-    if os.getenv("DDP_TRACE_MODEL") == "eval":
-        trace_target = getattr(model, "module", model)
-        if hasattr(trace_target, "_trace_logged"):
-            trace_target._trace_logged = False
-    if not hasattr(evaluate, "_logged_file"):
-        evaluate._logged_file = True
-        if rank == 0:
-            print(f'evaluate() running from {__file__}')
-
     losses = Averager()
     losses_linear = Averager()
     losses_seq2seq = Averager()
@@ -780,14 +726,6 @@ def evaluate(
     formatter = getattr(data_loader.dataset, "formatter", None)
 
     for batch_idx, batch in enumerate(data_loader):
-        if batch_idx == 0:
-            if rank == 0:
-                tqdm.write(
-                    "Eval batch[0] keys: "
-                    f"{', '.join(sorted(batch.keys()))}"
-                )
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval batch begin", flush=True)
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
         targets_seq2seq = batch['targets_seq2seq'].to(device, non_blocking=True)
@@ -796,14 +734,6 @@ def evaluate(
         if gold_num_codes is not None:
             gold_num_codes = gold_num_codes.to(device, non_blocking=True)
         elif require_gold_num_codes:
-            rank = 0
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-            if rank == 0:
-                tqdm.write(
-                    "Eval batch missing gold_num_codes. "
-                    f"Keys: {', '.join(sorted(batch.keys()))}"
-                )
             raise ValueError("gold_num_codes is required for evaluate(), but was not found in the batch.")
 
         # Prepare target as input for seq2seq model
@@ -811,8 +741,6 @@ def evaluate(
         target_mask, target_padding_mask = create_mask(target_seq2seq_input, PAD_IDX, device)
 
         # Forward pass
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval forward start", flush=True)
         out_seq2seq, out_linear = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -820,11 +748,7 @@ def evaluate(
             target_mask=target_mask,
             target_padding_mask=target_padding_mask,
         )
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval forward done", flush=True)
 
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval loss start", flush=True)
         loss = loss_fn(
             out_seq2seq=out_seq2seq,
             out_linear=out_linear,
@@ -834,15 +758,11 @@ def evaluate(
             )
         loss_linear = loss_fn.loss_fn_linear(out_linear, targets_linear)
         loss_seq2seq = loss_fn.loss_fn_seq2seq(out_seq2seq, targets_seq2seq, gold_num_codes=gold_num_codes)
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval loss done", flush=True)
 
         losses.update(loss.item(), out_seq2seq.size(0))
         losses_linear.update(loss_linear.item(), out_seq2seq.size(0))
         losses_seq2seq.update(loss_seq2seq.item(), out_seq2seq.size(0))
 
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval accuracy start", flush=True)
         seq_acc, token_acc = order_invariant_accuracy(
             output=out_seq2seq,
             target=targets_seq2seq[:, 1:],
@@ -852,27 +772,19 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval accuracy done", flush=True)
 
         # Linear decoder accuracy
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval flat acc start", flush=True)
         preds_linear = torch.sigmoid(out_linear) > 0.5
         preds_linear = preds_linear.float().cpu()
 
         acc_flat = accuracy_score(preds_linear, targets_linear.cpu())
         flat_accs.update(acc_flat, preds_linear.size(0))
-        if batch_idx == 0 and rank == 0:
-            print("[DDP][rank0] eval flat acc done", flush=True)
 
         if compute_gating_metrics:
             if formatter is None:
                 raise ValueError("compute_gating_metrics=True requires dataset.formatter to be present.")
             if gold_num_codes is None:
                 raise ValueError("compute_gating_metrics=True requires gold_num_codes in the batch.")
-            if batch_idx == 0 and rank == 0:
-                print("[DDP][rank0] eval gating start", flush=True)
             decode_max_num_codes = min(2, formatter.max_num_codes)
             zero_idx = formatter.map_char_idx.get('0') if hasattr(formatter, "map_char_idx") else None
             outputs = mixer_greedy_decode(
@@ -898,8 +810,6 @@ def evaluate(
             gating_fn += int((~pred_has2 & gold_has2).sum())
             gating_fp += int((pred_has2 & ~gold_has2).sum())
             gating_tn += int((~pred_has2 & ~gold_has2).sum())
-            if batch_idx == 0 and rank == 0:
-                print("[DDP][rank0] eval gating done", flush=True)
 
         if batch_idx % log_interval == 0:
             tqdm.write(f'  Eval Batch {batch_idx + 1}/{len(data_loader)} | '
