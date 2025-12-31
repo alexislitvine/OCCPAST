@@ -533,6 +533,10 @@ def train_one_epoch(
                                     late_phase_state["pending_switch"] = True
 
                         if os.getenv("DISABLE_EVAL_SUMMARY") != "1":
+                            print(
+                                f"[DDP][rank{rank}] enter update_summary step={current_step}",
+                                flush=True,
+                            )
                             update_summary(
                                 current_step,
                                 metrics={
@@ -551,6 +555,10 @@ def train_one_epoch(
                                 },
                                 filename=os.path.join(save_dir, 'logs.csv'),
                                 log_wandb=log_wandb,
+                            )
+                            print(
+                                f"[DDP][rank{rank}] exit update_summary step={current_step}",
+                                flush=True,
                             )
                     except Exception as exc:
                         eval_error = exc
