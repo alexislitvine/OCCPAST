@@ -31,13 +31,19 @@ from .utils.decoder import mixer_greedy_decode
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
+    rank = dist.get_rank()
+    print(f"[DDP][rank{rank}] enter barrier tag={tag} step={step}", flush=True)
     dist.barrier()
+    print(f"[DDP][rank{rank}] exit barrier tag={tag} step={step}", flush=True)
 
 
 def ddp_broadcast(tensor: torch.Tensor, tag: str, step: int, device: torch.device) -> torch.Tensor:
     if not (dist.is_available() and dist.is_initialized()):
         return tensor
+    rank = dist.get_rank()
+    print(f"[DDP][rank{rank}] enter broadcast tag={tag} step={step}", flush=True)
     dist.broadcast(tensor, src=0)
+    print(f"[DDP][rank{rank}] exit broadcast tag={tag} step={step}", flush=True)
     return tensor
 
 
