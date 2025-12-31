@@ -485,6 +485,10 @@ def train_one_epoch(
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
                         compute_gating_metrics = late_phase_state is not None
+                        print(
+                            f"[DDP][rank{rank}] enter evaluate step={current_step}",
+                            flush=True,
+                        )
                         eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
                             model=model,
                             data_loader=data_loader_eval,
@@ -495,6 +499,10 @@ def train_one_epoch(
                             compute_gating_metrics=compute_gating_metrics,
                             require_gold_num_codes=compute_gating_metrics,
                             run_probe=False,
+                        )
+                        print(
+                            f"[DDP][rank{rank}] exit evaluate step={current_step}",
+                            flush=True,
                         )
                         model.train()
                         
@@ -564,6 +572,10 @@ def train_one_epoch(
                         eval_error = exc
                     if not distributed or os.getenv("DDP_RUN_PROBE") == "1":
                         try:
+                            print(
+                                f"[DDP][rank{rank}] enter eval probe step={current_step}",
+                                flush=True,
+                            )
                             _run_pst2_eval_probe(
                                 model=model,
                                 data_loader=data_loader_eval,
@@ -572,6 +584,10 @@ def train_one_epoch(
                                 seed=42,
                                 disallow_pad_inside_block=disallow_pad_inside_block,
                                 disallow_zero_at_block_start=disallow_zero_at_block_start,
+                            )
+                            print(
+                                f"[DDP][rank{rank}] exit eval probe step={current_step}",
+                                flush=True,
                             )
                         except Exception as exc:
                             probe_error = exc
