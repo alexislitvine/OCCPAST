@@ -480,32 +480,34 @@ def train_one_epoch(
                 flush=True,
             )
             try:
-                if is_main_process:
-                    try:
+                try:
+                    if is_main_process:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
-                        compute_gating_metrics = late_phase_state is not None
-                        print(
-                            f"[DDP][rank{rank}] enter evaluate step={current_step}",
-                            flush=True,
-                        )
-                        eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
-                            model=model,
-                            data_loader=data_loader_eval,
-                            loss_fn=loss_fn,
-                            device=device,
-                            disallow_pad_inside_block=disallow_pad_inside_block,
-                            disallow_zero_at_block_start=disallow_zero_at_block_start,
-                            compute_gating_metrics=compute_gating_metrics,
-                            require_gold_num_codes=compute_gating_metrics,
-                            run_probe=False,
-                        )
-                        print(
-                            f"[DDP][rank{rank}] exit evaluate step={current_step}",
-                            flush=True,
-                        )
-                        model.train()
-                        
+                    compute_gating_metrics = late_phase_state is not None and is_main_process
+                    print(
+                        f"[DDP][rank{rank}] enter evaluate step={current_step}",
+                        flush=True,
+                    )
+                    eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
+                        model=model,
+                        data_loader=data_loader_eval,
+                        loss_fn=loss_fn,
+                        device=device,
+                        disallow_pad_inside_block=disallow_pad_inside_block,
+                        disallow_zero_at_block_start=disallow_zero_at_block_start,
+                        compute_gating_metrics=compute_gating_metrics,
+                        require_gold_num_codes=compute_gating_metrics,
+                        run_probe=False,
+                        log_interval=log_interval if is_main_process else max(log_interval, 1_000_000),
+                    )
+                    print(
+                        f"[DDP][rank{rank}] exit evaluate step={current_step}",
+                        flush=True,
+                    )
+                    model.train()
+
+                    if is_main_process:
                         # Print evaluation summary
                         tqdm.write('='*80)
                         tqdm.write(f'EVALUATION RESULTS (Step {current_step})')
@@ -568,29 +570,29 @@ def train_one_epoch(
                                 f"[DDP][rank{rank}] exit update_summary step={current_step}",
                                 flush=True,
                             )
+                except Exception as exc:
+                    eval_error = exc
+                if is_main_process and (not distributed or os.getenv("DDP_RUN_PROBE") == "1"):
+                    try:
+                        print(
+                            f"[DDP][rank{rank}] enter eval probe step={current_step}",
+                            flush=True,
+                        )
+                        _run_pst2_eval_probe(
+                            model=model,
+                            data_loader=data_loader_eval,
+                            device=device,
+                            sample_size=200,
+                            seed=42,
+                            disallow_pad_inside_block=disallow_pad_inside_block,
+                            disallow_zero_at_block_start=disallow_zero_at_block_start,
+                        )
+                        print(
+                            f"[DDP][rank{rank}] exit eval probe step={current_step}",
+                            flush=True,
+                        )
                     except Exception as exc:
-                        eval_error = exc
-                    if not distributed or os.getenv("DDP_RUN_PROBE") == "1":
-                        try:
-                            print(
-                                f"[DDP][rank{rank}] enter eval probe step={current_step}",
-                                flush=True,
-                            )
-                            _run_pst2_eval_probe(
-                                model=model,
-                                data_loader=data_loader_eval,
-                                device=device,
-                                sample_size=200,
-                                seed=42,
-                                disallow_pad_inside_block=disallow_pad_inside_block,
-                                disallow_zero_at_block_start=disallow_zero_at_block_start,
-                            )
-                            print(
-                                f"[DDP][rank{rank}] exit eval probe step={current_step}",
-                                flush=True,
-                            )
-                        except Exception as exc:
-                            probe_error = exc
+                        probe_error = exc
             finally:
                 print(
                     f"[DDP][rank{rank}] exit eval block step={current_step} "
