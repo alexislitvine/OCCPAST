@@ -604,6 +604,7 @@ def train_one_epoch(
             eval_failed = torch.tensor(
                 1 if (eval_error is not None or probe_error is not None) else 0,
                 device=device,
+                dtype=torch.float32,
             )
             ddp_broadcast(eval_failed, "eval_failed", current_step, device)
             metrics_to_broadcast = [
@@ -625,7 +626,7 @@ def train_one_epoch(
                 ("effective_batch", late_phase_metrics.get("effective_batch", float("nan"))),
             ]
             for name, value in metrics_to_broadcast:
-                tensor = torch.tensor(value, device=device)
+                tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
                 ddp_broadcast(tensor, f"metric:{name}", current_step, device)
             if eval_failed.item() == 1:
                 if eval_error is not None:
