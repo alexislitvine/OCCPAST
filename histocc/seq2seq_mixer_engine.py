@@ -754,6 +754,10 @@ def evaluate(
     rank = 0
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = torch.distributed.get_rank()
+    if os.getenv("DDP_TRACE_MODEL") == "eval":
+        trace_target = getattr(model, "module", model)
+        if hasattr(trace_target, "_trace_logged"):
+            trace_target._trace_logged = False
     if not hasattr(evaluate, "_logged_file"):
         evaluate._logged_file = True
         if rank == 0:
