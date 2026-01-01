@@ -97,7 +97,7 @@ def main():
     parser.add_argument(
         "--model-root",
         type=str,
-        default="/home/alexis/PST_PREDICT/models/",
+        default="/rds/user/adl38/hpc-work/OCCPAST/Data/models/",
         help="Root directory containing PST models in subfolders. Each model folder should contain a last.bin file."
     )
     args = parser.parse_args()
