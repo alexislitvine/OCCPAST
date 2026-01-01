@@ -158,7 +158,7 @@ def _is_present_pst2(value: str | None) -> bool:
     if isinstance(value, float):
         return False
     value = str(value)
-    return value not in {'', ' ', '?'}
+    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
 
 
 def print_pst2_sample_diagnostics(
@@ -257,6 +257,9 @@ def prepare_target_cols(
     for i, target_col in enumerate(formatter.target_cols):
         # Some NaN values instead coded as spaces
         data[target_col] = data[target_col].replace(' ', None)
+        data[target_col] = data[target_col].replace(
+            {'nan': None, 'NaN': None, 'NAN': None, 'none': None, 'None': None, 'null': None, 'NULL': None}
+        )
 
     # First colummn should not contain any NaN -> use the '?' token instead
     assert '?' in formatter.map_char_idx
