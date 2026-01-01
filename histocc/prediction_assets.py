@@ -846,7 +846,11 @@ class OccCANINE:
             outputs_s2s = outputs[0].cpu().numpy()
             probs_s2s = outputs[1].cpu().numpy()
             formatter = data_loader.dataset.formatter
-            key_lookup = getattr(data_loader.dataset, "map_code_label", None) or self.key
+            # Get key_lookup in the correct format: {code_str: idx_int}
+            # If map_code_label is None, invert self.key to get the right format
+            key_lookup = getattr(data_loader.dataset, "map_code_label", None)
+            if key_lookup is None:
+                key_lookup = {v: k for k, v in self.key.items()}
 
             for row_idx, raw_seq in enumerate(outputs_s2s):
                 block2_start = 1 + formatter.block_size
