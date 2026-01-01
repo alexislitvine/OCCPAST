@@ -47,6 +47,7 @@ from .formatter import (
     hisco_blocky5,
     BOS_IDX,
     PAD_IDX,
+    EOS_IDX,
     construct_general_purpose_formatter,
 )
 from .utils import (
