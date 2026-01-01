@@ -8,6 +8,18 @@ from ..formatter.hisco import BlockyHISCOFormatter
 from .trie import TrieNode, build_trie # For full search
 
 
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def _require_encode(model: nn.Module) -> None:
+    if not hasattr(model, "encode"):
+        raise AttributeError(
+            "Expected model to implement encode(); unwrap DDP with model.module "
+            "or pass a Seq2Seq model with encode()."
+        )
+
+
 def greedy_decode(
         model: Seq2SeqOccCANINE,
         descr: Tensor,
@@ -22,7 +34,9 @@ def greedy_decode(
         disallow_zero_at_block_start: bool = False,
         zero_idx: int | None = None,
         ) -> tuple[Tensor, Tensor]:
-    memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    memory = core.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
 
     # Initialize sequence by placing BoS symbol.
@@ -36,7 +50,7 @@ def greedy_decode(
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
 
-        out = model.decode(
+        out = core.decode(
             memory=memory,
             target=seq,
             target_mask=target_mask,
@@ -93,12 +107,14 @@ def mixer_greedy_decode(
         disallow_zero_at_block_start: bool = False,
         zero_idx: int | None = None,
         ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    memory, pooled_memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    memory, pooled_memory = core.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
 
     # Linear output
-    out_linear = model.linear_decoder(pooled_memory)
-    out_linear = model.linear_decoder_drop(out_linear)
+    out_linear = core.linear_decoder(pooled_memory)
+    out_linear = core.linear_decoder_drop(out_linear)
     prob_linear_topk, linear_topk = torch.sigmoid(out_linear).topk(linear_topk, axis=1)
     prob_linear_topk, linear_topk = prob_linear_topk.detach(), linear_topk.detach()
 
@@ -114,7 +130,7 @@ def mixer_greedy_decode(
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
 
-        out = model.decode(
+        out = core.decode(
             memory=memory,
             target=seq,
             target_mask=target_mask,
@@ -180,10 +196,12 @@ def flat_decode_mixer(
     Minimal decoder used for fast 'flat' decoding of mixed output models.
 
     """
-    _, pooled_memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    _, pooled_memory = core.encode(descr, input_attention_mask)
 
     # Linear output
-    logits = model.linear_decoder(pooled_memory)
+    logits = core.linear_decoder(pooled_memory)
 
     return logits
 
@@ -196,7 +214,9 @@ def greedy_decode_for_training(
         max_len: int,
         start_symbol: int,
         ) -> tuple[Tensor, Tensor]:
-    memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    memory = core.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
 
     # Initialize sequence by placing BoS symbol.
@@ -206,7 +226,7 @@ def greedy_decode_for_training(
     for _ in range(max_len): # we loop all the way to fill in some value at EOS pos
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
 
-        out = model.decode(
+        out = core.decode(
             memory=memory,
             target=seq,
             target_mask=target_mask,
@@ -232,8 +252,9 @@ def full_search_decoder_seq2seq_optimized(
         codes_list: list[list[int]],
         start_symbol: int,
         ) -> dict:
-
-    memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    memory = core.encode(descr, input_attention_mask)
     batch_size = descr.size(0)
 
     # Step 1: Build Trie
@@ -263,7 +284,7 @@ def full_search_decoder_seq2seq_optimized(
         for number, child_node in node.children.items():
             which_output = torch.ones(batch_size, 1).fill_(number).type(torch.long).to(device)
             target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool)
-            out = model.decode(
+            out = core.decode(
                 memory=memory,
                 target=seq,
                 target_mask=target_mask,
@@ -287,7 +308,9 @@ def full_search_decoder_mixer_optimized(
         codes_list: list[list[int]],
         start_symbol: int,
         ) -> dict:
-    memory = model.encode(descr, input_attention_mask)
+    core = unwrap_model(model)
+    _require_encode(core)
+    memory = core.encode(descr, input_attention_mask)
     
     # Ensure memory is a tensor
     if isinstance(memory, tuple):
@@ -322,7 +345,7 @@ def full_search_decoder_mixer_optimized(
         for number, child_node in node.children.items():
             which_output = torch.ones(batch_size, 1).fill_(number).type(torch.long).to(device)
             target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool)
-            out = model.decode(
+            out = core.decode(
                 memory=memory,
                 target=seq,
                 target_mask=target_mask,

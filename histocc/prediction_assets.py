@@ -637,7 +637,11 @@ class OccCANINE:
         if prediction_type == 'flat':
             out, out_type, inputs = self._predict_flat(data_loader, what)
         elif prediction_type == 'greedy':
-            out, out_type, inputs = self._predict_greedy(data_loader, order_invariant_conf=order_invariant_conf)
+            out, out_type, inputs = self._predict_greedy(
+                data_loader,
+                order_invariant_conf=order_invariant_conf,
+                max_num_codes=max_num_codes,
+            )
         elif prediction_type == 'full':
             out, out_type, inputs = self._predict_full(data_loader)
         elif prediction_type == 'embeddings':
@@ -787,7 +791,7 @@ class OccCANINE:
         return results, out_type, inputs
 
     @torch.no_grad()
-    def _predict_greedy(self, data_loader, order_invariant_conf):
+    def _predict_greedy(self, data_loader, order_invariant_conf, max_num_codes: int | None = None):
         model = self.model.eval()
 
         inputs = []
