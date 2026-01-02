@@ -894,7 +894,7 @@ def _pst2_value_present(value: str | None) -> bool:
     if isinstance(value, float):
         return False
     value = str(value)
-    return value not in {'', ' ', '?'}
+    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
 
 
 def _split_str_s2s(pred: str, sep_value: str) -> list[str] | str:
