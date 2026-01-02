@@ -718,10 +718,17 @@ class OccDatasetV2InMemMultipleFiles(OccDatasetV2):
                 f,
                 usecols=['occ1', 'lang', *target_cols],
                 dtype={'lang': str, **{x: str for x in target_cols}},
-                converters={'occ1': lambda x: x}, # ensure to do not read the str 'nan' as NaN
+                converters={'occ1': lambda x: x},  # ensure to do not read the str 'nan' as NaN
+                keep_default_na=False,
+                na_values=['', 'nan', 'NaN', 'NAN', 'none', 'None', 'null', 'NULL'],
             ) for f in fnames_data
         ]
         self.frame = pd.concat(frames)
+        for col in target_cols:
+            if col in self.frame.columns:
+                self.frame[col] = self.frame[col].replace(
+                    {'nan': None, 'NaN': None, 'NAN': None, 'none': None, 'None': None, 'null': None, 'NULL': None}
+                )
 
         super().__init__(
             fname_data=fnames_data[0], # we define self.colnames in parent class by reading 1 row
