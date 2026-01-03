@@ -222,6 +222,140 @@ def _apply_late_warmup_step(
     )
 
 
+def _normalize_batch_schedule(
+        batch_sizes: list[int] | None,
+        batch_steps: list[int] | None,
+        start_step: int | None,
+        lr_mults: list[float] | None,
+        current_global_batch: int,
+        world_size: int,
+        is_main_process: bool,
+        ) -> dict | None:
+    if batch_sizes is None and batch_steps is None and start_step is None:
+        return None
+    if batch_sizes is None:
+        raise ValueError("late_phase_batch_sizes must be set when enabling batch scaling.")
+
+    batch_sizes = [int(size) for size in batch_sizes]
+    if batch_sizes[0] != current_global_batch:
+        if is_main_process:
+            print(
+                "Late-phase batch scaling: prepending current global batch size "
+                f"{current_global_batch} to schedule {batch_sizes}."
+            )
+        batch_sizes = [current_global_batch] + batch_sizes
+
+    if any(size % world_size != 0 for size in batch_sizes):
+        raise ValueError(
+            "All late_phase_batch_sizes must be divisible by world_size "
+            f"(world_size={world_size}, batch_sizes={batch_sizes})."
+        )
+
+    if batch_steps is None:
+        if start_step is None:
+            raise ValueError("late_phase_start_step is required when batch steps are not provided.")
+        if len(batch_sizes) != 2:
+            raise ValueError(
+                "late_phase_batch_steps must be provided for multi-step batch schedules."
+            )
+        batch_steps = [int(start_step)]
+    else:
+        batch_steps = [int(step) for step in batch_steps]
+        if len(batch_steps) != len(batch_sizes) - 1:
+            raise ValueError(
+                "late_phase_batch_steps must have length len(late_phase_batch_sizes) - 1."
+            )
+    if any(step <= 0 for step in batch_steps):
+        raise ValueError("late_phase_batch_steps must be positive integers.")
+    if any(next_step <= prev_step for prev_step, next_step in zip(batch_steps, batch_steps[1:])):
+        raise ValueError("late_phase_batch_steps must be strictly increasing.")
+
+    if lr_mults is None:
+        lr_mults = [0.7] * (len(batch_sizes) - 1)
+    else:
+        lr_mults = [float(mult) for mult in lr_mults]
+        if len(lr_mults) != len(batch_sizes) - 1:
+            raise ValueError(
+                "late_phase_lr_mults must have length len(late_phase_batch_sizes) - 1."
+            )
+
+    return {
+        "batch_sizes": batch_sizes,
+        "batch_steps": batch_steps,
+        "lr_mults": lr_mults,
+        "next_index": 1,
+    }
+
+
+def _apply_batch_transition(
+        late_phase_state: dict,
+        data_loader: torch.utils.data.DataLoader,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler,
+        current_step: int,
+        save_dir: str | None,
+        log_wandb: bool,
+        is_main_process: bool,
+        ) -> None:
+    schedule = late_phase_state["batch_schedule"]
+    transition_idx = schedule["next_index"]
+    if transition_idx >= len(schedule["batch_sizes"]):
+        return
+
+    old_global_batch = schedule["batch_sizes"][transition_idx - 1]
+    new_global_batch = schedule["batch_sizes"][transition_idx]
+    lr_mult = schedule["lr_mults"][transition_idx - 1]
+
+    old_lr = optimizer.param_groups[0]["lr"]
+    target_lrs = [group["lr"] * lr_mult for group in optimizer.param_groups]
+    for group, target_lr in zip(optimizer.param_groups, target_lrs):
+        group["lr"] = target_lr
+    scheduler.base_lrs = list(target_lrs)
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = list(target_lrs)
+
+    per_rank_batch = new_global_batch // late_phase_state["world_size"]
+    data_loader.batch_size = per_rank_batch
+    if hasattr(data_loader, "batch_sampler") and hasattr(data_loader.batch_sampler, "batch_size"):
+        data_loader.batch_sampler.batch_size = per_rank_batch
+
+    late_phase_state["batch_size"] = per_rank_batch
+    schedule["next_index"] += 1
+
+    effective_batch = (
+        per_rank_batch
+        * late_phase_state["world_size"]
+        * late_phase_state["grad_accum_steps"]
+    )
+    if is_main_process:
+        tqdm.write(
+            "Late-phase batch scaling transition "
+            f"step={current_step} "
+            f"global_batch={old_global_batch}->{new_global_batch} "
+            f"per_rank_batch={per_rank_batch} "
+            f"grad_accum={late_phase_state['grad_accum_steps']} "
+            f"lr={old_lr:.2e}->{optimizer.param_groups[0]['lr']:.2e} "
+            f"effective_batch={effective_batch}"
+        )
+
+    if save_dir is None:
+        return
+
+    update_summary(
+        current_step,
+        metrics={
+            "batch_scale_old_global": old_global_batch,
+            "batch_scale_new_global": new_global_batch,
+            "batch_scale_per_rank": per_rank_batch,
+            "grad_accum_steps": late_phase_state["grad_accum_steps"],
+            "effective_batch": effective_batch,
+            "batch_scale_lr": optimizer.param_groups[0]["lr"],
+        },
+        filename=os.path.join(save_dir, 'logs.csv'),
+        log_wandb=log_wandb,
+    )
+
+
 def train_one_epoch(
         model: Seq2SeqMixerOccCANINE,
         data_loader: torch.utils.data.DataLoader,
@@ -424,6 +558,34 @@ def train_one_epoch(
                 )
             else:
                 scheduler.step()
+
+            if late_phase_state is not None and late_phase_state.get("batch_schedule"):
+                schedule = late_phase_state["batch_schedule"]
+                if schedule["next_index"] < len(schedule["batch_sizes"]):
+                    next_step = schedule["batch_steps"][schedule["next_index"] - 1]
+                    should_transition = current_step >= next_step
+                    if distributed and dist.is_available() and dist.is_initialized():
+                        transition_tensor = torch.tensor(
+                            1 if (should_transition and is_main_process) else 0,
+                            device=device,
+                        )
+                        ddp_broadcast(transition_tensor, "batch_scale", current_step, device)
+                        should_transition = bool(transition_tensor.item())
+                    if should_transition:
+                        _apply_batch_transition(
+                            late_phase_state=late_phase_state,
+                            data_loader=data_loader,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            current_step=current_step,
+                            save_dir=save_dir,
+                            log_wandb=log_wandb,
+                            is_main_process=is_main_process,
+                        )
+                        last_step = len(data_loader) - 1
+                        if is_main_process:
+                            iterator.total = len(data_loader)
+                            iterator.refresh()
 
         elapsed = time.time() - end
         batch_time.update(elapsed)
@@ -716,6 +878,29 @@ def train_one_epoch(
             )
         else:
             scheduler.step()
+        if late_phase_state is not None and late_phase_state.get("batch_schedule"):
+            schedule = late_phase_state["batch_schedule"]
+            if schedule["next_index"] < len(schedule["batch_sizes"]):
+                next_step = schedule["batch_steps"][schedule["next_index"] - 1]
+                should_transition = current_step >= next_step
+                if distributed and dist.is_available() and dist.is_initialized():
+                    transition_tensor = torch.tensor(
+                        1 if (should_transition and is_main_process) else 0,
+                        device=device,
+                    )
+                    ddp_broadcast(transition_tensor, "batch_scale", current_step, device)
+                    should_transition = bool(transition_tensor.item())
+                if should_transition:
+                    _apply_batch_transition(
+                        late_phase_state=late_phase_state,
+                        data_loader=data_loader,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        current_step=current_step,
+                        save_dir=save_dir,
+                        log_wandb=log_wandb,
+                        is_main_process=is_main_process,
+                    )
 
     return current_step
 
@@ -1371,6 +1556,10 @@ def train(
         late_warmup_steps: int = 0,
         late_switch_once: bool = True,
         batch_size: int | None = None,
+        late_phase_start_step: int | None = None,
+        late_phase_batch_sizes: list[int] | None = None,
+        late_phase_batch_steps: list[int] | None = None,
+        late_phase_lr_mults: list[float] | None = None,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -1382,11 +1571,22 @@ def train(
         world_size = getattr(data_loaders["data_loader_train"].sampler, "num_replicas", 1)
     if batch_size is None:
         batch_size = data_loaders["data_loader_train"].batch_size
+    current_global_batch = batch_size * world_size
+    batch_schedule = _normalize_batch_schedule(
+        batch_sizes=late_phase_batch_sizes,
+        batch_steps=late_phase_batch_steps,
+        start_step=late_phase_start_step,
+        lr_mults=late_phase_lr_mults,
+        current_global_batch=current_global_batch,
+        world_size=world_size,
+        is_main_process=is_main_process,
+    )
 
     enable_late_phase = (
         late_grad_accum > 1
         or late_lr_mult != 1.0
         or late_warmup_steps > 0
+        or batch_schedule is not None
     )
     late_phase_state = None
     if enable_late_phase:
@@ -1409,7 +1609,15 @@ def train(
             "late_switch_once": late_switch_once,
             "batch_size": batch_size,
             "world_size": world_size,
+            "batch_schedule": batch_schedule,
         }
+        if batch_schedule is not None and is_main_process:
+            tqdm.write(
+                "Late-phase batch scaling schedule "
+                f"global_batches={batch_schedule['batch_sizes']} "
+                f"steps={batch_schedule['batch_steps']} "
+                f"lr_mults={batch_schedule['lr_mults']}"
+            )
     
     epoch = 0
     while current_step < total_steps:

@@ -125,10 +125,14 @@ def parse_args():
     parser.add_argument('--gate-stabilize-window', type=int, default=5, help='Number of eval points to check for gating stabilization.')
     parser.add_argument('--gate-stabilize-delta', type=float, default=0.02, help='Maximum allowed metric range within stabilization window.')
     parser.add_argument('--gate-stabilize-min', type=float, default=0.90, help='Minimum metric value required within stabilization window.')
-    parser.add_argument('--late-grad-accum', type=int, default=2, help='Gradient accumulation steps after gating stabilization.')
-    parser.add_argument('--late-lr-mult', type=float, default=0.4, help='Multiplier applied to LR when switching to late phase.')
-    parser.add_argument('--late-warmup-steps', type=int, default=1000, help='Warmup steps after switching to late phase.')
+    parser.add_argument('--late-grad-accum', type=int, default=1, help='Gradient accumulation steps after gating stabilization.')
+    parser.add_argument('--late-lr-mult', type=float, default=1.0, help='Multiplier applied to LR when switching to late phase.')
+    parser.add_argument('--late-warmup-steps', type=int, default=0, help='Warmup steps after switching to late phase.')
     parser.add_argument('--late-switch-once', action=argparse.BooleanOptionalAction, default=True, help='Only switch to late phase once when stabilization is detected.')
+    parser.add_argument('--late-phase-start-step', type=int, default=None, help='Step to begin late-phase true batch scaling (global batch sizes).')
+    parser.add_argument('--late-phase-batch-sizes', type=int, nargs='+', default=None, help='Global batch sizes for late-phase scaling (e.g., 512 1024 2048).')
+    parser.add_argument('--late-phase-batch-steps', type=int, nargs='+', default=None, help='Absolute steps for each batch-size transition (length = len(batch_sizes)-1).')
+    parser.add_argument('--late-phase-lr-mults', type=float, nargs='+', default=None, help='LR multipliers per batch-size transition (default: 0.7 per transition).')
 
     args = parser.parse_args()
 
@@ -742,6 +746,10 @@ def main():
         late_warmup_steps=args.late_warmup_steps,
         late_switch_once=args.late_switch_once,
         batch_size=args.batch_size,
+        late_phase_start_step=args.late_phase_start_step,
+        late_phase_batch_sizes=args.late_phase_batch_sizes,
+        late_phase_batch_steps=args.late_phase_batch_steps,
+        late_phase_lr_mults=args.late_phase_lr_mults,
     )
     
     # Cleanup distributed training
