@@ -657,7 +657,7 @@ def train_one_epoch(
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
                     compute_gating_metrics = late_phase_state is not None and is_main_process
-                    eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
+                    eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                         model=model,
                         data_loader=data_loader_eval,
                         loss_fn=loss_fn,
@@ -682,6 +682,19 @@ def train_one_epoch(
                         tqdm.write(f'Token Accuracy      : {eval_token_acc:.2f}%')
                         tqdm.write(f'Flat Accuracy       : {eval_flat_acc:.2f}%')
                         tqdm.write(f'Learning Rate       : {optimizer.param_groups[0]["lr"]:.2e}')
+                        
+                        # Print language-specific metrics
+                        if lang_metrics:
+                            tqdm.write('-'*80)
+                            tqdm.write('LANGUAGE-SPECIFIC METRICS:')
+                            langs = sorted(set(k.split('_')[-1] for k in lang_metrics.keys() if k.startswith('seq_acc_')))
+                            for lang in langs:
+                                seq_key = f'seq_acc_{lang}'
+                                token_key = f'token_acc_{lang}'
+                                count_key = f'count_{lang}'
+                                if seq_key in lang_metrics and token_key in lang_metrics:
+                                    tqdm.write(f'  {lang:>6s}: Seq Acc: {lang_metrics[seq_key]:.2f}% | Token Acc: {lang_metrics[token_key]:.2f}% | Count: {lang_metrics.get(count_key, 0)}')
+                        
                         tqdm.write('='*80 + '\n')
 
                         if late_phase_state is not None:
@@ -721,6 +734,7 @@ def train_one_epoch(
                                 'lr': optimizer.param_groups[0]['lr'],
                                 **gating_summary,
                                 **late_phase_metrics,
+                                **lang_metrics,
                             },
                             filename=os.path.join(save_dir, 'logs.csv'),
                             log_wandb=log_wandb,
@@ -770,6 +784,12 @@ def train_one_epoch(
             for name, value in metrics_to_broadcast:
                 tensor = torch.tensor(float(value), device=device, dtype=torch.float32)
                 ddp_broadcast(tensor, f"metric:{name}", current_step, device)
+            
+            # Broadcast language-specific metrics
+            for lang_key, lang_value in lang_metrics.items():
+                tensor = torch.tensor(float(lang_value), device=device, dtype=torch.float32)
+                ddp_broadcast(tensor, f"metric:{lang_key}", current_step, device)
+            
             if eval_failed.item() == 1:
                 if eval_error is not None:
                     raise eval_error
@@ -788,7 +808,7 @@ def train_one_epoch(
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
             compute_gating_metrics = late_phase_state is not None
-            eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics = evaluate(
+            eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                 model=model,
                 data_loader=data_loader_eval,
                 loss_fn=loss_fn,
@@ -811,6 +831,19 @@ def train_one_epoch(
             tqdm.write(f'Token Accuracy      : {eval_token_acc:.2f}%')
             tqdm.write(f'Flat Accuracy       : {eval_flat_acc:.2f}%')
             tqdm.write(f'Learning Rate       : {optimizer.param_groups[0]["lr"]:.2e}')
+            
+            # Print language-specific metrics
+            if lang_metrics:
+                tqdm.write('-'*80)
+                tqdm.write('LANGUAGE-SPECIFIC METRICS:')
+                langs = sorted(set(k.split('_')[-1] for k in lang_metrics.keys() if k.startswith('seq_acc_')))
+                for lang in langs:
+                    seq_key = f'seq_acc_{lang}'
+                    token_key = f'token_acc_{lang}'
+                    count_key = f'count_{lang}'
+                    if seq_key in lang_metrics and token_key in lang_metrics:
+                        tqdm.write(f'  {lang:>6s}: Seq Acc: {lang_metrics[seq_key]:.2f}% | Token Acc: {lang_metrics[token_key]:.2f}% | Count: {lang_metrics.get(count_key, 0)}')
+            
             tqdm.write('='*80 + '\n')
 
             late_phase_metrics = {}
@@ -851,6 +884,7 @@ def train_one_epoch(
                     'lr': optimizer.param_groups[0]['lr'],
                     **gating_summary,
                     **late_phase_metrics,
+                    **lang_metrics,
                 },
                 filename=os.path.join(save_dir, 'logs.csv'),
                 log_wandb=log_wandb,
@@ -931,6 +965,11 @@ def evaluate(
     gating_fn = 0
     gating_tn = 0
     formatter = getattr(data_loader.dataset, "formatter", None)
+    
+    # Language-specific metrics tracking
+    lang_token_accs = {}
+    lang_seq_accs = {}
+    lang_counts = {}
 
     for batch_idx, batch in enumerate(data_loader):
         input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -979,6 +1018,28 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
+        
+        # Track language-specific accuracies
+        langs = batch.get('lang', None)
+        if langs is not None:
+            # If langs is a list of strings (not batched into a tensor)
+            for i, lang in enumerate(langs):
+                if lang not in lang_token_accs:
+                    lang_token_accs[lang] = Averager()
+                    lang_seq_accs[lang] = Averager()
+                    lang_counts[lang] = 0
+                
+                # Compute per-sample accuracy
+                sample_seq_acc, sample_token_acc = order_invariant_accuracy(
+                    output=out_seq2seq[i:i+1],
+                    target=targets_seq2seq[i:i+1, 1:],
+                    pad_idx=PAD_IDX,
+                    nb_blocks=loss_fn.loss_fn_seq2seq.nb_blocks,
+                    block_size=loss_fn.loss_fn_seq2seq.block_size,
+                )
+                lang_token_accs[lang].update(sample_token_acc.item(), 1)
+                lang_seq_accs[lang].update(sample_seq_acc.item(), 1)
+                lang_counts[lang] += 1
 
         # Linear decoder accuracy
         preds_linear = torch.sigmoid(out_linear) > 0.5
@@ -1048,8 +1109,15 @@ def evaluate(
         "gating_fn": gating_fn,
         "gating_tn": gating_tn,
     } if compute_gating_metrics else None
+    
+    # Build language-specific metrics dictionary
+    lang_metrics = {}
+    for lang in sorted(lang_token_accs.keys()):
+        lang_metrics[f'seq_acc_{lang}'] = lang_seq_accs[lang].avg
+        lang_metrics[f'token_acc_{lang}'] = lang_token_accs[lang].avg
+        lang_metrics[f'count_{lang}'] = lang_counts[lang]
 
-    return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg, gating_metrics
+    return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg, gating_metrics, lang_metrics
 
 
 @dataclass
