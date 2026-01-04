@@ -1047,6 +1047,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             'targets_seq2seq': torch.tensor(targets_seq2seq, dtype=torch.long),
             'targets_linear': torch.tensor(target_linear, dtype=torch.float),
             'gold_num_codes': torch.tensor(gold_num_codes, dtype=torch.long),
+            'lang': lang,
         }
 
         return batch_data

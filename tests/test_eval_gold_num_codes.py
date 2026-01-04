@@ -37,6 +37,7 @@ def test_evaluate_handles_gold_num_codes():
             "targets_seq2seq": torch.full((target_len,), PAD_IDX, dtype=torch.long),
             "targets_linear": torch.zeros(3, dtype=torch.float),
             "gold_num_codes": torch.tensor(1, dtype=torch.long),
+            "lang": "en",
         }
         for _ in range(batch_size)
     ]
@@ -54,13 +55,21 @@ def test_evaluate_handles_gold_num_codes():
         seq2seq_weight=0.5,
     )
 
-    evaluate(
+    loss_avg, loss_linear_avg, loss_seq2seq_avg, seq_acc_avg, token_acc_avg, flat_acc_avg, gating_metrics, lang_metrics = evaluate(
         model=model,
         data_loader=data_loader,
         loss_fn=loss_fn,
         device=torch.device("cpu"),
         log_interval=1,
     )
+    
+    # Verify language metrics are returned
+    assert lang_metrics is not None
+    assert isinstance(lang_metrics, dict)
+    assert 'seq_acc_en' in lang_metrics
+    assert 'token_acc_en' in lang_metrics
+    assert 'count_en' in lang_metrics
+    assert lang_metrics['count_en'] == batch_size
 
 
 def test_stack_sampled_items_handles_strings_and_tensors():
