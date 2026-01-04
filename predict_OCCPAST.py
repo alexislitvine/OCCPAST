@@ -4,7 +4,6 @@ import argparse
 import pandas as pd
 import datetime
 from tqdm import tqdm
-from histocc import OccCANINE
 import unicodedata
 import re  # NEW
 import os
@@ -190,6 +189,8 @@ def main():
         raise ValueError("Non unique ids after preprocessing!")
 
     # --- run predictions on df (same as before) ---
+    # Import here to avoid slow startup before prompting the user.
+    from histocc.prediction_assets import OccCANINE
     mod_hisco = OccCANINE(
         verbose=True,
         disallow_pad_inside_block=args.disallow_pad_inside_block,
