@@ -85,8 +85,8 @@ def main():
     parser.add_argument(
         "--lookup",
         type=str,
-        default="predictions/occpast/updatedPST2CodeDict.json",
-        help="Path to updatedPST2CodeDict.json."
+        default="Data/predictions/occpast/PST2CodeDict.json",
+        help="Path to PST2CodeDict.json."
     )
     parser.add_argument(
         "--output-dir",
@@ -276,8 +276,8 @@ def main():
 
     # 4) path to PST2 lookup json
     #    prompt so you can point to the exact file you want
-    default_lookup = Path("predictions/occpast/updatedPST2CodeDict.json")
-    user_lookup = input(f"Path to updatedPST2CodeDict.json [{default_lookup}]: ").strip()
+    default_lookup = Path("Data/predictions/occpast/PST2CodeDict.json")
+    user_lookup = input(f"Path to PST2CodeDict.json [{default_lookup}]: ").strip()
     lookup_path = Path(args.lookup) if args.lookup else default_lookup
     if not lookup_path.exists():
         raise FileNotFoundError(f"Lookup not found: {lookup_path}")
