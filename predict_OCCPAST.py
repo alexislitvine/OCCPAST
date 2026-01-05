@@ -78,7 +78,7 @@ def main():
     parser.add_argument(
         "--input-dir",
         type=str,
-        default="predictions/to_predict",
+        default="Data/predictions/to_predict",
         help="Directory containing CSV files to choose from when --input is not provided."
     )
     parser.add_argument(
