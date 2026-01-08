@@ -237,6 +237,7 @@ def _normalize_batch_schedule(
         raise ValueError("late_phase_batch_sizes must be set when enabling batch scaling.")
 
     batch_sizes = [int(size) for size in batch_sizes]
+    prepended_current_batch = False
     if batch_sizes[0] != current_global_batch:
         if is_main_process:
             print(
@@ -244,6 +245,7 @@ def _normalize_batch_schedule(
                 f"{current_global_batch} to schedule {batch_sizes}."
             )
         batch_sizes = [current_global_batch] + batch_sizes
+        prepended_current_batch = True
 
     if any(size % world_size != 0 for size in batch_sizes):
         raise ValueError(
@@ -261,6 +263,11 @@ def _normalize_batch_schedule(
         batch_steps = [int(start_step)]
     else:
         batch_steps = [int(step) for step in batch_steps]
+        # If we prepended the current batch size, we need to prepend start_step to batch_steps
+        if prepended_current_batch:
+            if start_step is None:
+                raise ValueError("late_phase_start_step is required when batch schedule is adjusted.")
+            batch_steps = [int(start_step)] + batch_steps
         if len(batch_steps) != len(batch_sizes) - 1:
             raise ValueError(
                 "late_phase_batch_steps must have length len(late_phase_batch_sizes) - 1."
