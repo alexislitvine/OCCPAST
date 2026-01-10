@@ -136,6 +136,34 @@ class TestNormalizeBatchSchedule(unittest.TestCase):
         
         self.assertEqual(result['lr_mults'], [0.5, 0.8])
 
+    def test_prepend_with_custom_lr_mults(self):
+        """Test that when current batch is prepended and custom lr_mults are provided,
+        a default lr_mult (0.7) is prepended to lr_mults as well.
+        
+        This is the bug scenario from the issue:
+        - batch_sizes=[1024, 1096, 2048] with 2 lr_mults
+        - current_global_batch=2048, so prepending occurs
+        - After prepending: batch_sizes=[2048, 1024, 1096, 2048] (4 elements)
+        - lr_mults should also be adjusted: [0.7, <user_val1>, <user_val2>] (3 elements)
+        """
+        result = _normalize_batch_schedule(
+            batch_sizes=[1024, 1096, 2048],
+            batch_steps=[1000, 2000],
+            start_step=500,
+            lr_mults=[0.5, 0.8],  # User provided 2 lr_mults for original 3 batch sizes
+            current_global_batch=2048,
+            world_size=4,
+            is_main_process=False,
+        )
+        
+        # After prepending, batch_sizes should be [2048, 1024, 1096, 2048]
+        self.assertEqual(result['batch_sizes'], [2048, 1024, 1096, 2048])
+        # batch_steps should also have start_step prepended: [500, 1000, 2000]
+        self.assertEqual(result['batch_steps'], [500, 1000, 2000])
+        # lr_mults should have 0.7 prepended: [0.7, 0.5, 0.8]
+        self.assertEqual(result['lr_mults'], [0.7, 0.5, 0.8])
+        self.assertEqual(result['next_index'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

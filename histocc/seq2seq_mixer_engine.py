@@ -281,6 +281,9 @@ def _normalize_batch_schedule(
         lr_mults = [0.7] * (len(batch_sizes) - 1)
     else:
         lr_mults = [float(mult) for mult in lr_mults]
+        # If we prepended the current batch size, we need to prepend a default lr_mult as well
+        if prepended_current_batch:
+            lr_mults = [0.7] + lr_mults
         if len(lr_mults) != len(batch_sizes) - 1:
             raise ValueError(
                 "late_phase_lr_mults must have length len(late_phase_batch_sizes) - 1."
