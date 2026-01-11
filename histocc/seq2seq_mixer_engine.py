@@ -325,7 +325,8 @@ def _apply_batch_transition(
         scheduler._last_lr = list(target_lrs)
 
     per_rank_batch = new_global_batch // late_phase_state["world_size"]
-    data_loader.batch_size = per_rank_batch
+    # Note: Cannot set data_loader.batch_size directly after initialization in PyTorch
+    # Instead, we modify the batch_sampler's batch_size if available
     if hasattr(data_loader, "batch_sampler") and hasattr(data_loader.batch_sampler, "batch_size"):
         data_loader.batch_sampler.batch_size = per_rank_batch
 
