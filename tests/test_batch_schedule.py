@@ -237,6 +237,22 @@ class TestNormalizeBatchSchedule(unittest.TestCase):
         # No correction should occur
         self.assertEqual(result['batch_sizes'], [4096, 1024, 2048])
 
+    def test_error_when_batch_size_too_small_for_world_size(self):
+        """Test that an error is raised when batch size is too small for world_size."""
+        # Batch size 4 with world_size 8 would round down to 0
+        with self.assertRaises(ValueError) as context:
+            _normalize_batch_schedule(
+                batch_sizes=[512, 4],
+                batch_steps=[500],
+                start_step=None,
+                lr_mults=None,
+                current_global_batch=512,
+                world_size=8,
+                is_main_process=False,
+            )
+        self.assertIn("too small for world_size", str(context.exception))
+        self.assertIn("Minimum batch size should be at least 8", str(context.exception))
+
 
 if __name__ == '__main__':
     unittest.main()

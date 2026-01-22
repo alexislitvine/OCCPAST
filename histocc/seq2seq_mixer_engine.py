@@ -252,6 +252,12 @@ def _normalize_batch_schedule(
     for size in batch_sizes:
         if size % world_size != 0:
             corrected_size = (size // world_size) * world_size
+            if corrected_size <= 0:
+                raise ValueError(
+                    f"Batch size {size} is too small for world_size {world_size}. "
+                    f"After rounding down, batch size would be {corrected_size}. "
+                    f"Minimum batch size should be at least {world_size}."
+                )
             if is_main_process:
                 print(
                     f"Warning: Batch size {size} is not divisible by world_size {world_size}. "
