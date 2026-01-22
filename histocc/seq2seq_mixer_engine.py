@@ -247,11 +247,20 @@ def _normalize_batch_schedule(
         batch_sizes = [current_global_batch] + batch_sizes
         prepended_current_batch = True
 
-    if any(size % world_size != 0 for size in batch_sizes):
-        raise ValueError(
-            "All late_phase_batch_sizes must be divisible by world_size "
-            f"(world_size={world_size}, batch_sizes={batch_sizes})."
-        )
+    # Auto-correct non-divisible batch sizes by rounding down
+    corrected_batch_sizes = []
+    for size in batch_sizes:
+        if size % world_size != 0:
+            corrected_size = (size // world_size) * world_size
+            if is_main_process:
+                print(
+                    f"Warning: Batch size {size} is not divisible by world_size {world_size}. "
+                    f"Rounding down to {corrected_size}."
+                )
+            corrected_batch_sizes.append(corrected_size)
+        else:
+            corrected_batch_sizes.append(size)
+    batch_sizes = corrected_batch_sizes
 
     if batch_steps is None:
         if start_step is None:
