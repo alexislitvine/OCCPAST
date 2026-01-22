@@ -164,6 +164,95 @@ class TestNormalizeBatchSchedule(unittest.TestCase):
         self.assertEqual(result['lr_mults'], [0.7, 0.5, 0.8])
         self.assertEqual(result['next_index'], 1)
 
+    def test_auto_correct_non_divisible_batch_size(self):
+        """Test that non-divisible batch sizes are auto-corrected by rounding down."""
+        # Scenario from the bug report: batch_size 2020 with world_size 8
+        # 2020 % 8 = 4, so it should be rounded down to 2016 (252 * 8)
+        result = _normalize_batch_schedule(
+            batch_sizes=[4096, 1024, 1096, 2020],
+            batch_steps=[500, 1000, 1500],
+            start_step=None,
+            lr_mults=None,
+            current_global_batch=4096,
+            world_size=8,
+            is_main_process=False,
+        )
+        
+        # Batch sizes should be auto-corrected
+        # 4096 % 8 = 0 (no change)
+        # 1024 % 8 = 0 (no change)
+        # 1096 % 8 = 0 (no change)
+        # 2020 % 8 = 4, so 2020 -> 2016 (2020 // 8 * 8 = 252 * 8 = 2016)
+        self.assertEqual(result['batch_sizes'], [4096, 1024, 1096, 2016])
+        self.assertEqual(result['batch_steps'], [500, 1000, 1500])
+        self.assertEqual(len(result['lr_mults']), 3)
+
+    def test_auto_correct_multiple_non_divisible_batch_sizes(self):
+        """Test that multiple non-divisible batch sizes are all auto-corrected."""
+        result = _normalize_batch_schedule(
+            batch_sizes=[4100, 1025, 1099],  # All not divisible by 8
+            batch_steps=[500, 1000],
+            start_step=None,
+            lr_mults=None,
+            current_global_batch=4100,
+            world_size=8,
+            is_main_process=False,
+        )
+        
+        # All should be rounded down:
+        # 4100 -> 4096 (512 * 8)
+        # 1025 -> 1024 (128 * 8)
+        # 1099 -> 1096 (137 * 8)
+        self.assertEqual(result['batch_sizes'], [4096, 1024, 1096])
+
+    def test_auto_correct_with_prepend(self):
+        """Test auto-correction works correctly when prepending current batch."""
+        result = _normalize_batch_schedule(
+            batch_sizes=[1025, 2020],  # Both not divisible by 8
+            batch_steps=[1000],
+            start_step=500,
+            lr_mults=None,
+            current_global_batch=2048,  # Divisible, will be prepended
+            world_size=8,
+            is_main_process=False,
+        )
+        
+        # After prepending: [2048, 1025, 2020]
+        # After correction: [2048, 1024, 2016]
+        self.assertEqual(result['batch_sizes'], [2048, 1024, 2016])
+        self.assertEqual(result['batch_steps'], [500, 1000])
+
+    def test_no_correction_when_all_divisible(self):
+        """Test that no correction occurs when all batch sizes are divisible."""
+        result = _normalize_batch_schedule(
+            batch_sizes=[4096, 1024, 2048],
+            batch_steps=[500, 1000],
+            start_step=None,
+            lr_mults=None,
+            current_global_batch=4096,
+            world_size=8,
+            is_main_process=False,
+        )
+        
+        # No correction should occur
+        self.assertEqual(result['batch_sizes'], [4096, 1024, 2048])
+
+    def test_error_when_batch_size_too_small_for_world_size(self):
+        """Test that an error is raised when batch size is too small for world_size."""
+        # Batch size 4 with world_size 8 would round down to 0
+        with self.assertRaises(ValueError) as context:
+            _normalize_batch_schedule(
+                batch_sizes=[512, 4],
+                batch_steps=[500],
+                start_step=None,
+                lr_mults=None,
+                current_global_batch=512,
+                world_size=8,
+                is_main_process=False,
+            )
+        self.assertIn("too small for world_size", str(context.exception))
+        self.assertIn("Minimum batch size should be at least 8", str(context.exception))
+
 
 if __name__ == '__main__':
     unittest.main()
