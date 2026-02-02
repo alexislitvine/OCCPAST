@@ -34,6 +34,7 @@ from histocc.formatter import (
     construct_general_purpose_formatter,
 )
 from histocc.utils import wandb_init, load_states
+from histocc.utils.distributed import configure_slurm_env
 
 try:
     # want to do import to set has_wandb even if not used directly
@@ -173,6 +174,8 @@ def setup_formatter(args: argparse.Namespace) -> BlockyFormatter | BlockyHISCOFo
 
 def main():
     args = parse_args()
+
+    configure_slurm_env()
     
     # Enable TF32 for improved performance on Ampere GPUs
     if torch.cuda.is_available():

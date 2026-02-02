@@ -59,6 +59,24 @@ View all options:
 python train_mixer.py --help
 ```
 
+### Distributed training (Slurm/srun)
+If you see errors like:
+```
+srun: error: mpi/pmi2: invalid kvs seq from node 0((null)) ignored, expect 1 got 0
+```
+it usually means the job was launched with conflicting launchers (for example, `srun` + `torchrun` together) or an incompatible PMI setting. Use **one** launcher and stick to `pmix` when possible:
+
+```bash
+# Option A: use torchrun directly (no srun)
+torchrun --nproc_per_node=4 finetune.py --dataset /path/to/data.csv --target-cols pst2_1 pst2_2
+
+# Option B: use srun only (no torchrun) and let SLURM set ranks
+srun --mpi=pmix_v3 --ntasks=4 --gpus-per-task=1 \
+  python finetune.py --dataset /path/to/data.csv --target-cols pst2_1 pst2_2
+```
+
+For `train_mixer.py`, add `--distributed` when running multi-GPU with `srun`. If your cluster does not support `pmix_v3`, use the PMI version recommended by your admins (e.g., `--mpi=pmix` or `--mpi=pmi2`).
+
 ### Finetune an existing model
 ```bash
 python finetune.py --checkpoint path/to/checkpoint.pt --epochs 1
@@ -380,4 +398,3 @@ Note: This repository is not currently set up for Python packaging or distributi
 *   **formatter/**: Code formatters for different output formats (HISCO, OCC1950, general purpose)
 *   **loss/**: Loss functions including order-invariant loss
 *   **utils/**: Utility functions for data conversion, metrics, masking, etc.
-
