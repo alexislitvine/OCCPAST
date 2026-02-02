@@ -1010,6 +1010,11 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
 
         occ_descr: str = record.occ1
         lang: str = record.lang
+        raw_occ_descr: str = record.occ1
+        raw_lang: str = record.lang
+        raw_target_1 = record[self.target_cols[0]] if self.target_cols else None
+        raw_target_2 = record[self.target_cols[1]] if len(self.target_cols) > 1 else None
+        serialized_target = self.formatter.sanitize(record)
         targets_seq2seq = self.formatter.transform_label(record)
         target_linear = self._get_target_linear(record)
         gold_num_codes = self._get_gold_num_codes(record)
@@ -1049,6 +1054,18 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             'gold_num_codes': torch.tensor(gold_num_codes, dtype=torch.long),
             'lang': lang,
         }
+
+        if getattr(self, "debug_double_audit", False):
+            batch_data.update(
+                {
+                    'raw_occ1': raw_occ_descr,
+                    'raw_lang': raw_lang,
+                    'raw_pst2_1': raw_target_1,
+                    'raw_pst2_2': raw_target_2,
+                    'serialized_target': serialized_target,
+                    'record_idx': item,
+                }
+            )
 
         return batch_data
 

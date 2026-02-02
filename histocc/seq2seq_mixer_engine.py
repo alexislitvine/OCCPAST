@@ -405,6 +405,11 @@ def train_one_epoch(
         disallow_zero_at_block_start: bool = False,
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
+        debug_double_audit: bool = False,
+        debug_double_audit_every: int = 200,
+        debug_double_audit_samples: int = 5,
+        debug_double_assert_min_ratio: float | None = None,
+        debug_double_audit_info: dict | None = None,
         late_phase_state: dict | None = None,
         ) -> int:
     model = model.train()
@@ -416,6 +421,8 @@ def train_one_epoch(
     samples_per_sec = Averager()
     grad_accum_steps = 1 if late_phase_state is None else late_phase_state["grad_accum_steps"]
     accum_counter = 0
+    optimizer_step_count = 0
+    startup_audit_logged = False
     
     # Check GPU availability once
     has_cuda = torch.cuda.is_available()
@@ -441,6 +448,10 @@ def train_one_epoch(
             grad_accum_steps = late_phase_state["grad_accum_steps"]
 
         current_step += 1
+
+        if debug_double_audit and is_main_process and not startup_audit_logged:
+            _print_debug_double_startup(debug_double_audit_info)
+            startup_audit_logged = True
 
         if min_double_steps and current_step <= min_double_steps and min_double_ratio > 0:
             dataset = data_loader.dataset
@@ -484,6 +495,28 @@ def train_one_epoch(
                             else:
                                 for idx, row_idx in enumerate(replace_idx):
                                     batch[key][row_idx] = stacked[idx]
+
+        will_step = (accum_counter + 1) == grad_accum_steps
+        next_optimizer_step = optimizer_step_count + 1 if will_step else optimizer_step_count
+        do_debug_audit = (
+            debug_double_audit
+            and is_main_process
+            and will_step
+            and debug_double_audit_every > 0
+            and (next_optimizer_step % debug_double_audit_every == 0)
+        )
+        if do_debug_audit:
+            _debug_double_audit_batch(
+                batch=batch,
+                dataset=data_loader.dataset,
+                step=current_step,
+                optimizer_step=next_optimizer_step,
+                min_double_ratio=min_double_ratio,
+                min_double_steps=min_double_steps,
+                debug_samples=debug_double_audit_samples,
+                debug_assert_min_ratio=debug_double_assert_min_ratio,
+            )
+            # TODO: Thread order_invariant_loss/push_to_pad_loss/gate_loss components for singles vs doubles.
 
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
@@ -573,6 +606,7 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             accum_counter = 0
+            optimizer_step_count += 1
 
             if late_phase_state is not None and late_phase_state["late_warmup_remaining"] > 0:
                 _apply_late_warmup_step(
@@ -1176,6 +1210,182 @@ def _pst2_value_present(value: str | None) -> bool:
     return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
 
 
+def _truncate_text(value: str | None, limit: int = 120) -> str:
+    if value is None:
+        return "None"
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _print_debug_double_startup(info: dict | None) -> None:
+    details = info or {}
+    drop_bad_labels = details.get("drop_bad_labels", False)
+    use_within_block_sep = details.get("use_within_block_sep", False)
+    print(
+        "DEBUG_DBL_AUDIT_STARTUP "
+        "pst2_2_missing_detection=(_pst2_value_present: None/float->missing; "
+        "strings lower() vs {'', ' ', '?', 'nan', 'none', 'null'}). "
+        "prepare_target_cols replaces {' ', 'nan', 'NaN', 'NAN', 'none', 'None', 'null', 'NULL'} with None; "
+        "first target col fills missing with '?'. "
+        "_get_gold_num_codes strips() and treats '', ' ', '?' as missing. "
+        f"use_within_block_sep={use_within_block_sep} "
+        f"drop_bad_labels={drop_bad_labels} (drops entire rows failing formatter; does not surgically remove block2)."
+    )
+
+
+def _debug_double_audit_batch(
+        batch: dict,
+        dataset,
+        *,
+        step: int,
+        optimizer_step: int,
+        min_double_ratio: float,
+        min_double_steps: int,
+        debug_samples: int,
+        debug_assert_min_ratio: float | None,
+        ) -> None:
+    raw_pst2_2 = batch.get("raw_pst2_2")
+    serialized_targets = batch.get("serialized_target")
+    if raw_pst2_2 is None or serialized_targets is None:
+        logged = getattr(_debug_double_audit_batch, "_logged_missing", False)
+        if not logged:
+            print(
+                "DEBUG_DBL_AUDIT_MISSING "
+                "raw_pst2_2/serialized_target not found in batch; "
+                "enable dataset.debug_double_audit to include raw fields."
+            )
+            _debug_double_audit_batch._logged_missing = True
+        return
+
+    raw_pst2_1 = batch.get("raw_pst2_1")
+    raw_occ1 = batch.get("raw_occ1", batch.get("occ1"))
+    langs = batch.get("lang", batch.get("raw_lang"))
+
+    sep_value = getattr(getattr(dataset, "formatter", None), "sep_value", "&")
+    max_num_codes = getattr(getattr(dataset, "formatter", None), "max_num_codes", None)
+    if max_num_codes is None:
+        max_num_codes = len(getattr(dataset, "target_cols", []) or [])
+
+    gold_num_codes = batch.get("gold_num_codes")
+    if gold_num_codes is not None and torch.is_tensor(gold_num_codes):
+        gold_num_codes_list = gold_num_codes.cpu().tolist()
+    else:
+        gold_num_codes_list = None
+
+    batch_size = len(serialized_targets)
+    has2_raw = []
+    has2_serial = []
+    gold_ge2 = []
+    gold_num_codes_est = []
+
+    for idx in range(batch_size):
+        raw_val = raw_pst2_2[idx]
+        has2_raw_val = _pst2_value_present(raw_val)
+        has2_raw.append(has2_raw_val)
+
+        serialized = serialized_targets[idx]
+        if serialized is None or sep_value == "":
+            sep_count = 0
+        else:
+            sep_count = str(serialized).count(sep_value)
+        has2_serial_val = sep_count >= 1
+        has2_serial.append(has2_serial_val)
+        if serialized is None:
+            gold_num_codes_est.append(0)
+        else:
+            gold_num_codes_est.append(min(1 + sep_count, max_num_codes))
+
+        if gold_num_codes_list is not None:
+            gold_ge2.append(gold_num_codes_list[idx] >= 2)
+
+    if gold_num_codes_list is None:
+        gold_num_codes_list = gold_num_codes_est
+        gold_ge2 = [val >= 2 for val in gold_num_codes_list]
+
+    raw_count = sum(has2_raw)
+    serial_count = sum(has2_serial)
+    gold_count = sum(gold_ge2)
+
+    observed_raw_ratio = raw_count / max(1, batch_size)
+    observed_serial_ratio = serial_count / max(1, batch_size)
+    observed_gold_ratio = gold_count / max(1, batch_size)
+
+    lang_counts = Counter(langs) if langs is not None else {}
+    print(
+        "DEBUG_DBL_AUDIT "
+        f"step={step} opt_step={optimizer_step} "
+        f"has2_raw={observed_raw_ratio:.3f} "
+        f"has2_ser={observed_serial_ratio:.3f} "
+        f"gold2={observed_gold_ratio:.3f} "
+        f"min_double_ratio={min_double_ratio:.3f} "
+        f"lang_counts={dict(lang_counts)} "
+        f"counts=raw:{raw_count} ser:{serial_count} gold2:{gold_count} total:{batch_size} "
+        f"sep={sep_value!r}"
+    )
+
+    if debug_assert_min_ratio is not None and step <= min_double_steps:
+        if observed_raw_ratio < debug_assert_min_ratio:
+            raise RuntimeError(
+                "DEBUG_DBL_ASSERT "
+                f"step={step} opt_step={optimizer_step} "
+                f"observed_has2_raw={observed_raw_ratio:.3f} "
+                f"required_min={debug_assert_min_ratio:.3f} "
+                f"min_double_steps={min_double_steps}"
+            )
+
+    mismatch_rows = []
+    for idx in range(batch_size):
+        raw_flag = has2_raw[idx]
+        serial_flag = has2_serial[idx]
+        gold_flag = gold_ge2[idx]
+        if raw_flag and not gold_flag:
+            reason = "raw_has2_but_gold_lt2"
+        elif serial_flag and not raw_flag:
+            reason = "serial_has2_but_raw_no"
+        elif gold_flag and not serial_flag:
+            reason = "gold_ge2_but_serial_no_sep"
+        else:
+            continue
+        mismatch_rows.append((idx, reason))
+
+    if mismatch_rows:
+        for idx, reason in mismatch_rows[:debug_samples]:
+            if isinstance(raw_occ1, (list, tuple)):
+                occ1_val = raw_occ1[idx]
+            else:
+                occ1_val = raw_occ1
+            if isinstance(langs, (list, tuple)):
+                lang_val = langs[idx]
+            else:
+                lang_val = langs
+            pst2_1_val = raw_pst2_1[idx] if raw_pst2_1 is not None else None
+            pst2_2_val = raw_pst2_2[idx]
+            serialized_val = serialized_targets[idx]
+            gold_val = gold_num_codes_list[idx]
+            token_len = None
+            if "targets_seq2seq" in batch and torch.is_tensor(batch["targets_seq2seq"]):
+                token_len = int((batch["targets_seq2seq"][idx] != PAD_IDX).sum().item())
+            input_len = None
+            if "input_ids" in batch and torch.is_tensor(batch["input_ids"]):
+                input_len = int(batch["input_ids"][idx].numel())
+
+            print(
+                "DEBUG_DBL_AUDIT_SAMPLE "
+                f"reason={reason} "
+                f"lang={lang_val!r} "
+                f"occ1={_truncate_text(occ1_val)!r} "
+                f"pst2_1={pst2_1_val!r} "
+                f"pst2_2={pst2_2_val!r} "
+                f"serialized={serialized_val!r} "
+                f"gold_num_codes={gold_val} "
+                f"gold_num_codes_est={gold_num_codes_est[idx]} "
+                f"seq2seq_len={token_len} "
+                f"input_len={input_len}"
+            )
+
+
 def _split_str_s2s(pred: str, sep_value: str) -> list[str] | str:
     if sep_value and sep_value in pred:
         return pred.split(sep_value)
@@ -1641,6 +1851,11 @@ def train(
         disallow_zero_at_block_start: bool = False,
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
+        debug_double_audit: bool = False,
+        debug_double_audit_every: int = 200,
+        debug_double_audit_samples: int = 5,
+        debug_double_assert_min_ratio: float | None = None,
+        debug_double_audit_info: dict | None = None,
         gate_stabilize_metric: str = "gating_f1",
         gate_stabilize_window: int = 5,
         gate_stabilize_delta: float = 0.02,
@@ -1747,6 +1962,11 @@ def train(
             disallow_zero_at_block_start=disallow_zero_at_block_start,
             min_double_steps=min_double_steps,
             min_double_ratio=min_double_ratio,
+            debug_double_audit=debug_double_audit,
+            debug_double_audit_every=debug_double_audit_every,
+            debug_double_audit_samples=debug_double_audit_samples,
+            debug_double_assert_min_ratio=debug_double_assert_min_ratio,
+            debug_double_audit_info=debug_double_audit_info,
             late_phase_state=late_phase_state,
         )
         
