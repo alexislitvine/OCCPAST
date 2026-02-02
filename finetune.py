@@ -32,6 +32,7 @@ from histocc.formatter import (
     EOS_IDX,
 )
 from histocc.utils import wandb_init
+from histocc.utils.distributed import configure_slurm_env
 
 try:
     # want to do import to set has_wandb even if not used directly
@@ -489,6 +490,8 @@ def setup_datasets(
 def main():
     # Arguments
     args = parse_args()
+
+    configure_slurm_env()
     
     # Distributed init & device selection
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
