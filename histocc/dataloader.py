@@ -1013,7 +1013,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         raw_occ_descr: str = record.occ1
         raw_lang: str = record.lang
         raw_target_1 = record[self.target_cols[0]] if self.target_cols else None
-        raw_target_2 = record[self.target_cols[1]] if len(self.target_cols) > 1 else None
+        raw_target_2 = record[self.target_cols[1]] if len(self.target_cols) > 1 else ""
         serialized_target = self.formatter.sanitize(record)
         targets_seq2seq = self.formatter.transform_label(record)
         target_linear = self._get_target_linear(record)
@@ -1056,6 +1056,10 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         }
 
         if getattr(self, "debug_double_audit", False):
+            if raw_target_2 is None:
+                raw_target_2 = ""
+            if serialized_target is None:
+                serialized_target = ""
             batch_data.update(
                 {
                     'raw_occ1': raw_occ_descr,
