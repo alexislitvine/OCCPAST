@@ -121,6 +121,10 @@ def parse_args():
     parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
     parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
     parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
+    parser.add_argument('--debug-double-audit', action='store_true', default=False, help='Enable debug auditing of double (block2) prevalence during training.')
+    parser.add_argument('--debug-double-audit-every', type=int, default=200, help='Optimizer step interval for debug double audits.')
+    parser.add_argument('--debug-double-audit-samples', type=int, default=5, help='Number of mismatch samples to print during debug double audits.')
+    parser.add_argument('--debug-double-assert-min-ratio', type=float, default=None, help='If set, raise RuntimeError when observed double ratio < this value during steps < min-double-steps.')
     parser.add_argument('--gate-stabilize-metric', type=str, default='gating_f1', help='Metric name to monitor for gating stabilization.')
     parser.add_argument('--gate-stabilize-window', type=int, default=5, help='Number of eval points to check for gating stabilization.')
     parser.add_argument('--gate-stabilize-delta', type=float, default=0.02, help='Maximum allowed metric range within stabilization window.')
@@ -603,6 +607,7 @@ def main():
         descriptions_text_col=args.descriptions_text_col,
         descriptions_lang_col=args.descriptions_lang_col,
     )
+    dataset_train.debug_double_audit = args.debug_double_audit
 
     # Data loaders with distributed samplers if needed
     # Build DataLoader kwargs
@@ -737,6 +742,14 @@ def main():
         disallow_zero_at_block_start=args.disallow_zero_at_block_start,
         min_double_steps=args.min_double_steps,
         min_double_ratio=args.min_double_ratio,
+        debug_double_audit=args.debug_double_audit,
+        debug_double_audit_every=args.debug_double_audit_every,
+        debug_double_audit_samples=args.debug_double_audit_samples,
+        debug_double_assert_min_ratio=args.debug_double_assert_min_ratio,
+        debug_double_audit_info={
+            "drop_bad_labels": args.drop_bad_labels,
+            "use_within_block_sep": args.use_within_block_sep,
+        },
         gate_stabilize_metric=args.gate_stabilize_metric,
         gate_stabilize_window=args.gate_stabilize_window,
         gate_stabilize_delta=args.gate_stabilize_delta,
