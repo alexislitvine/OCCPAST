@@ -548,12 +548,17 @@ class BlockOrderInvariantLoss(nn.Module):
             weights[pos_mask] = self.gate_weight * pos_weight
             weights[neg_mask] = self.gate_weight
             per_sample_gate = gate_ce * weights
+            if not torch.isfinite(per_sample_gate).all():
+                per_sample_gate = torch.nan_to_num(per_sample_gate, nan=0.0, posinf=0.0, neginf=0.0)
             gate_loss = per_sample_gate.mean()
 
         coverage_loss = 0.0
         per_sample_coverage = None
         if gold_num_codes is not None and self.coverage_penalty_weight > 0:
             coverage_loss, per_sample_coverage = self._coverage_penalty(yhat, gold_num_codes)
+            if per_sample_coverage is not None and not torch.isfinite(per_sample_coverage).all():
+                per_sample_coverage = torch.nan_to_num(per_sample_coverage, nan=0.0, posinf=0.0, neginf=0.0)
+                coverage_loss = per_sample_coverage.mean()
 
         loss = (
             order_invariant_loss

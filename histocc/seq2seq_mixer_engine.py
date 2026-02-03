@@ -138,7 +138,18 @@ def _log_loss_debug(
             return float("nan")
         if not mask.any():
             return float("nan")
-        return float(values[mask].mean().item())
+        masked = values[mask]
+        if masked.numel() == 0:
+            return 0.0
+        return float(masked.mean().item())
+
+    def _masked_pctl(values: torch.Tensor | None, mask: torch.Tensor, q: float) -> float:
+        if values is None or not mask.any():
+            return float("nan")
+        masked = values[mask]
+        if masked.numel() == 0:
+            return 0.0
+        return float(torch.quantile(masked, q).item())
 
     gold_num_codes = gold_num_codes.detach().cpu()
     singles = gold_num_codes == 1
@@ -167,6 +178,12 @@ def _log_loss_debug(
         f"gate_mean_d={_masked_mean(gate_per_sample, doubles):.4f} "
         f"coverage_mean_s={_masked_mean(coverage_per_sample, singles):.4f} "
         f"coverage_mean_d={_masked_mean(coverage_per_sample, doubles):.4f}"
+    )
+    msg += (
+        f" order_p90_s={_masked_pctl(order_per_sample, singles, 0.9):.4f} "
+        f"order_p90_d={_masked_pctl(order_per_sample, doubles, 0.9):.4f} "
+        f"gate_p90_d={_masked_pctl(gate_per_sample, doubles, 0.9):.4f} "
+        f"coverage_p90_d={_masked_pctl(coverage_per_sample, doubles, 0.9):.4f}"
     )
 
     best_idx = debug_info.get("matching_best_idx")
@@ -313,6 +330,60 @@ def _run_loss_controlled_experiment(
     report_text = "\n".join(report) + "\n"
     with open(output_path, "w", encoding="utf-8") as handle:
         handle.write(report_text)
+
+
+def _run_loss_nan_audit(
+        *,
+        debug_info: dict | None,
+        gold_num_codes: torch.Tensor,
+        step: int,
+        prefix: str = "LOSS_NAN_AUDIT",
+        ) -> None:
+    if debug_info is None:
+        return
+    gold_num_codes = gold_num_codes.detach().cpu()
+    singles = gold_num_codes == 1
+    doubles = gold_num_codes >= 2
+
+    def _count(mask: torch.Tensor) -> int:
+        return int(mask.sum().item())
+
+    def _finite_stats(values: torch.Tensor | None) -> tuple[int, int]:
+        if values is None:
+            return 0, 0
+        values = values.detach()
+        return int(values.numel()), int(torch.isfinite(values).sum().item())
+
+    gate_per_sample = debug_info.get("gate_loss_per_sample")
+    coverage_per_sample = debug_info.get("coverage_loss_per_sample")
+
+    gate_numel, gate_finite = _finite_stats(gate_per_sample)
+    cov_numel, cov_finite = _finite_stats(coverage_per_sample)
+    gate_pos_count = _count(doubles)
+    gate_neg_count = _count(singles)
+    gate_nonfinite_s = 0
+    gate_nonfinite_d = 0
+    cov_nonfinite_s = 0
+    cov_nonfinite_d = 0
+    if gate_per_sample is not None:
+        gate_vals = gate_per_sample.detach().cpu()
+        gate_nonfinite_s = int((~torch.isfinite(gate_vals[singles])).sum().item()) if singles.any() else 0
+        gate_nonfinite_d = int((~torch.isfinite(gate_vals[doubles])).sum().item()) if doubles.any() else 0
+    if coverage_per_sample is not None:
+        cov_vals = coverage_per_sample.detach().cpu()
+        cov_nonfinite_s = int((~torch.isfinite(cov_vals[singles])).sum().item()) if singles.any() else 0
+        cov_nonfinite_d = int((~torch.isfinite(cov_vals[doubles])).sum().item()) if doubles.any() else 0
+
+    msg = (
+        f"{prefix} step={step} "
+        f"gold_counts_s={_count(singles)} gold_counts_d={_count(doubles)} "
+        f"gate_pos_count={gate_pos_count} gate_neg_count={gate_neg_count} "
+        f"gate_numel={gate_numel} gate_finite={gate_finite} "
+        f"gate_nonfinite_s={gate_nonfinite_s} gate_nonfinite_d={gate_nonfinite_d} "
+        f"coverage_numel={cov_numel} coverage_finite={cov_finite} "
+        f"coverage_nonfinite_s={cov_nonfinite_s} coverage_nonfinite_d={cov_nonfinite_d}"
+    )
+    tqdm.write(msg)
 
 
 def _is_gate_stable(late_phase_state: dict) -> bool:
@@ -785,8 +856,14 @@ def train_one_epoch(
                 )
         losses.update(loss.item(), out_seq2seq.size(0))
         if loss_debug_every > 0 and is_main_process and current_step % loss_debug_every == 0:
+            debug_info = loss_fn.loss_fn_seq2seq.last_debug
             _log_loss_debug(
-                debug_info=loss_fn.loss_fn_seq2seq.last_debug,
+                debug_info=debug_info,
+                gold_num_codes=gold_num_codes,
+                step=current_step,
+            )
+            _run_loss_nan_audit(
+                debug_info=debug_info,
                 gold_num_codes=gold_num_codes,
                 step=current_step,
             )
