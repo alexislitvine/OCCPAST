@@ -24,6 +24,7 @@ from histocc import (
     BlockOrderInvariantLoss,
     LossMixer,
 )
+from histocc.dataloader import debug_collate
 from histocc.seq2seq_mixer_engine import train
 from histocc.formatter import (
     BlockyFormatter,
@@ -487,6 +488,40 @@ def setup_datasets(
     return dataset_train, dataset_val
 
 
+def debug_dataloader_schema(data_loader: DataLoader, *, name: str, max_batches: int = 2) -> None:
+    print(f"DEBUG_DATALOADER_SCHEMA start name={name} max_batches={max_batches}")
+    for batch_idx, batch in enumerate(data_loader):
+        if batch_idx >= max_batches:
+            break
+        if isinstance(batch, dict):
+            for key, value in batch.items():
+                if torch.is_tensor(value):
+                    print(
+                        "DEBUG_DATALOADER_SCHEMA "
+                        f"name={name} batch={batch_idx} key={key} "
+                        f"tensor dtype={value.dtype} shape={tuple(value.shape)}"
+                    )
+                elif isinstance(value, list):
+                    elem_type = type(value[0]).__name__ if value else "empty"
+                    print(
+                        "DEBUG_DATALOADER_SCHEMA "
+                        f"name={name} batch={batch_idx} key={key} "
+                        f"list len={len(value)} elem_type={elem_type}"
+                    )
+                else:
+                    print(
+                        "DEBUG_DATALOADER_SCHEMA "
+                        f"name={name} batch={batch_idx} key={key} "
+                        f"type={type(value).__name__}"
+                    )
+        else:
+            print(
+                "DEBUG_DATALOADER_SCHEMA "
+                f"name={name} batch={batch_idx} type={type(batch).__name__}"
+            )
+    print(f"DEBUG_DATALOADER_SCHEMA done name={name}")
+
+
 def main():
     # Arguments
     args = parse_args()
@@ -620,6 +655,8 @@ def main():
         'persistent_workers': True if args.num_workers > 0 else False,
         'prefetch_factor': 4 if args.num_workers > 0 else None,
     }
+    if os.getenv("DEBUG_DATALOADER") == "1":
+        dataloader_kwargs['collate_fn'] = debug_collate
     
     if distributed:
         train_sampler = DistributedSampler(
@@ -659,6 +696,10 @@ def main():
             shuffle=False,
             **dataloader_kwargs,
         )
+
+    if os.getenv("DEBUG_DATALOADER") == "1":
+        debug_dataloader_schema(data_loader_train, name="train")
+        debug_dataloader_schema(data_loader_val, name="val")
 
     # Setup model, optimizer, scheduler
     model = Seq2SeqMixerOccCANINE(
