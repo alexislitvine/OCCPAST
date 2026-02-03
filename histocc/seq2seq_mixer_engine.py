@@ -606,6 +606,7 @@ def train_one_epoch(
         debug_double_assert_min_ratio: float | None = None,
         debug_double_audit_info: dict | None = None,
         late_phase_state: dict | None = None,
+        use_gold_num_codes_loss: bool = False,
         ) -> int:
     model = model.train()
 
@@ -2246,6 +2247,7 @@ def train(
             debug_double_assert_min_ratio=debug_double_assert_min_ratio,
             debug_double_audit_info=debug_double_audit_info,
             late_phase_state=late_phase_state,
+            use_gold_num_codes_loss=use_gold_num_codes_loss,
         )
         
         # Save at the end of each epoch if the flag is set
