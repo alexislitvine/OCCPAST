@@ -256,6 +256,9 @@ class BlockOrderInvariantLoss(nn.Module):
             push_to_pad_label_smoothing: float = 0.0,
             gate_weight: float = 2.0,
             gate_pos_weight_max: float = 20.0,
+            coverage_penalty_weight: float = 0.0,
+            coverage_penalty_eps: float = 1e-6,
+            debug: bool = False,
     ):
         super().__init__()
 
@@ -265,6 +268,10 @@ class BlockOrderInvariantLoss(nn.Module):
         self.push_to_pad_scale_factor = push_to_pad_scale_factor
         self.gate_weight = gate_weight
         self.gate_pos_weight_max = gate_pos_weight_max
+        self.coverage_penalty_weight = coverage_penalty_weight
+        self.coverage_penalty_eps = coverage_penalty_eps
+        self.debug = debug
+        self.last_debug: dict | None = None
 
         # Loss to push towards occupations, and where loss is
         # invariant towards the order of predicted "blocks"
@@ -293,6 +300,7 @@ class BlockOrderInvariantLoss(nn.Module):
             yhat: Tensor, # [BATCH_SIZE, VOCAB, BLOCK_SIZE * NB_BLOCKS]
             target_mask: Tensor,
             gold_num_codes: Tensor | None = None,
+            return_per_sample: bool = False,
     ) -> Tensor:
         padding_loss = self.padding_cross_entropy(
             yhat,
@@ -307,7 +315,8 @@ class BlockOrderInvariantLoss(nn.Module):
             # to not push towards padding where predictions should occur
             padding_loss[~target_mask] = 0
 
-            return padding_loss.mean()
+            per_sample = padding_loss.mean(dim=1)
+            return (per_sample.mean(), per_sample) if return_per_sample else per_sample.mean()
 
         seq_len = self.nb_blocks * self.block_size
         positions = torch.arange(seq_len, device=padding_loss.device).unsqueeze(0)
@@ -318,7 +327,80 @@ class BlockOrderInvariantLoss(nn.Module):
 
         denom = weight_mask.sum(dim=1).clamp(min=1)
         weighted_loss = (padding_loss * weight_mask).sum(dim=1) / denom
-        return weighted_loss.mean()
+        return (weighted_loss.mean(), weighted_loss) if return_per_sample else weighted_loss.mean()
+
+    def _coverage_penalty(
+            self,
+            yhat: Tensor, # [BATCH_SIZE, VOCAB, BLOCK_SIZE * NB_BLOCKS]
+            gold_num_codes: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        block_ids = torch.arange(self.nb_blocks, device=yhat.device).unsqueeze(0)
+        required_mask = (block_ids >= 1) & (block_ids < gold_num_codes.unsqueeze(1))
+        if required_mask.sum() == 0:
+            zeros = torch.zeros(yhat.size(0), device=yhat.device, dtype=yhat.dtype)
+            return zeros.mean(), zeros
+
+        log_probs = torch.log_softmax(yhat, dim=1)
+        pad_log_probs = log_probs[:, self.pad_idx, :]
+        pad_probs = pad_log_probs.exp()
+        start_positions = (block_ids * self.block_size).clamp(max=pad_probs.size(1) - 1)
+        pad_probs_starts = pad_probs.gather(1, start_positions.expand(yhat.size(0), -1))
+        safe_nonpad = (1.0 - pad_probs_starts).clamp(min=self.coverage_penalty_eps)
+        penalty = -torch.log(safe_nonpad) * required_mask.to(yhat.dtype)
+        denom = required_mask.sum(dim=1).clamp(min=1)
+        per_sample = penalty.sum(dim=1) / denom
+        return per_sample.mean(), per_sample
+
+    def _order_invariant_loss_debug(
+            self,
+            yhat: Tensor, # [BATCH_SIZE, BLOCK_SIZE * NB_BLOCKS, VOCAB]
+            target: Tensor, # [BATCH_SIZE, BLOCK_SIZE * NB_BLOCKS]
+            target_mask: Tensor,
+            gold_num_codes: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        losses = []
+        if gold_num_codes is None:
+            gold_num_codes = (~target_mask).sum(dim=1)
+
+        batch_size = yhat.size(0)
+        per_sample_loss = torch.zeros(batch_size, device=yhat.device, dtype=yhat.dtype)
+        per_sample_count = torch.zeros(batch_size, device=yhat.device, dtype=yhat.dtype)
+        best_idx = torch.full((batch_size, self.nb_blocks), -1, device=yhat.device, dtype=torch.long)
+        best_loss = torch.zeros((batch_size, self.nb_blocks), device=yhat.device, dtype=yhat.dtype)
+        valid_blocks = torch.zeros((batch_size, self.nb_blocks), device=yhat.device, dtype=torch.bool)
+
+        for target_block in range(self.nb_blocks):
+            start_idx = target_block * self.block_size
+            end_idx = start_idx + self.block_size
+            valid_mask = gold_num_codes > target_block
+            if not valid_mask.any():
+                continue
+
+            block_losses = []
+            for candidate_block in range(self.nb_blocks):
+                candidate_start_idx = candidate_block * self.block_size
+                candidate_end_idx = candidate_start_idx + self.block_size
+
+                block_loss = self.cross_entropy(
+                    yhat[:, :, candidate_start_idx:candidate_end_idx],
+                    target[:, start_idx:end_idx],
+                ).mean(dim=1, keepdim=True)
+                block_losses.append(block_loss)
+
+            block_losses = torch.cat(block_losses, dim=1)
+            block_losses[target_mask] = torch.inf
+
+            block_loss, block_idx = block_losses.min(dim=1)
+            best_idx[:, target_block] = block_idx
+            best_loss[:, target_block] = block_loss
+            valid_blocks[:, target_block] = valid_mask
+
+            per_sample_loss[valid_mask] += block_loss[valid_mask]
+            per_sample_count[valid_mask] += 1
+            losses.append(block_loss[valid_mask].mean())
+
+        per_sample_loss = per_sample_loss / per_sample_count.clamp(min=1)
+        return sum(losses) / len(losses), per_sample_loss, best_idx, best_loss, valid_blocks
 
     def _order_invariant_loss(
             self,
@@ -433,10 +515,25 @@ class BlockOrderInvariantLoss(nn.Module):
         # other towards padding
         target_mask = self._get_target_mask(target) if gold_num_codes is None else self._get_target_mask_from_gold(gold_num_codes)
 
-        order_invariant_loss = self._order_invariant_loss(yhat, target, target_mask, gold_num_codes=gold_num_codes)
-        push_to_pad_loss = self._push_to_pad(yhat, target_mask, gold_num_codes=gold_num_codes)
+        if self.debug:
+            order_invariant_loss, per_sample_order, best_idx, best_loss, valid_blocks = self._order_invariant_loss_debug(
+                yhat,
+                target,
+                target_mask,
+                gold_num_codes=gold_num_codes,
+            )
+            push_to_pad_loss, per_sample_push = self._push_to_pad(
+                yhat,
+                target_mask,
+                gold_num_codes=gold_num_codes,
+                return_per_sample=True,
+            )
+        else:
+            order_invariant_loss = self._order_invariant_loss(yhat, target, target_mask, gold_num_codes=gold_num_codes)
+            push_to_pad_loss = self._push_to_pad(yhat, target_mask, gold_num_codes=gold_num_codes)
 
         gate_loss = 0.0
+        per_sample_gate = None
         if gold_num_codes is not None:
             gate_pos = self.block_size
             gate_logits = yhat[:, :, gate_pos]
@@ -450,8 +547,34 @@ class BlockOrderInvariantLoss(nn.Module):
             weights = torch.ones_like(gate_ce)
             weights[pos_mask] = self.gate_weight * pos_weight
             weights[neg_mask] = self.gate_weight
-            gate_loss = (gate_ce * weights).mean()
+            per_sample_gate = gate_ce * weights
+            gate_loss = per_sample_gate.mean()
 
-        loss = order_invariant_loss + self.push_to_pad_scale_factor * push_to_pad_loss + gate_loss
+        coverage_loss = 0.0
+        per_sample_coverage = None
+        if gold_num_codes is not None and self.coverage_penalty_weight > 0:
+            coverage_loss, per_sample_coverage = self._coverage_penalty(yhat, gold_num_codes)
+
+        loss = (
+            order_invariant_loss
+            + self.push_to_pad_scale_factor * push_to_pad_loss
+            + gate_loss
+            + self.coverage_penalty_weight * coverage_loss
+        )
+
+        if self.debug:
+            self.last_debug = {
+                "order_invariant_loss": order_invariant_loss.detach(),
+                "order_invariant_per_sample": per_sample_order.detach(),
+                "push_to_pad_loss": push_to_pad_loss.detach(),
+                "push_to_pad_per_sample": per_sample_push.detach(),
+                "gate_loss": torch.tensor(gate_loss).detach() if isinstance(gate_loss, float) else gate_loss.detach(),
+                "gate_loss_per_sample": None if per_sample_gate is None else per_sample_gate.detach(),
+                "coverage_loss": torch.tensor(coverage_loss).detach() if isinstance(coverage_loss, float) else coverage_loss.detach(),
+                "coverage_loss_per_sample": None if per_sample_coverage is None else per_sample_coverage.detach(),
+                "matching_best_idx": best_idx.detach(),
+                "matching_best_loss": best_loss.detach(),
+                "matching_valid_blocks": valid_blocks.detach(),
+            }
 
         return loss

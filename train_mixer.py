@@ -100,6 +100,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--decoder-dim-feedforward', type=int, default=None, help='Defaults to endoder hidden dim if not specified.')
     parser.add_argument('--seq2seq-weight', type=float, default=0.5)
     parser.add_argument('--formatter', type=str, default='hisco', choices=MAP_FORMATTER.keys(), help='Target-side tokenization')
+    parser.add_argument('--use-gold-num-codes-loss', action='store_true', default=False, help='Pass gold_num_codes into the seq2seq loss during training.')
+    parser.add_argument('--coverage-penalty-weight', type=float, default=0.0, help='Extra penalty (feature flag) for PAD at required block starts when gold_num_codes>=2.')
 
     # Augmentation
     parser.add_argument('--num-transformations', type=int, default=3)
@@ -303,6 +305,7 @@ def main():
         pad_idx=PAD_IDX,
         nb_blocks=formatter.max_num_codes,
         block_size=formatter.block_size,
+        coverage_penalty_weight=args.coverage_penalty_weight,
     )
     loss_fn_linear = torch.nn.BCEWithLogitsLoss()
     loss_fn = LossMixer(
@@ -350,6 +353,7 @@ def main():
         log_wandb=args.log_wandb and is_main_process,
         distributed=distributed,
         is_main_process=is_main_process,
+        use_gold_num_codes_loss=args.use_gold_num_codes_loss,
     )
     
     # Cleanup distributed training

@@ -89,6 +89,8 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=2e-05)
     parser.add_argument('--seq2seq-weight', type=float, default=0.1)
     parser.add_argument('--warmup-pct', type=float, default=0.05, help='Warmup steps as percentage of total steps (default: 0.05 = 5%%)')
+    parser.add_argument('--use-gold-num-codes-loss', action='store_true', default=False, help='Pass gold_num_codes into the seq2seq loss during training.')
+    parser.add_argument('--coverage-penalty-weight', type=float, default=0.0, help='Extra penalty (feature flag) for PAD at required block starts when gold_num_codes>=2.')
 
     # Model initialization
     parser.add_argument('--initial-checkpoint', type=str, default=None, help='Model weights to use for initialization. Discarded if resume state exists at --save-path')
@@ -735,6 +737,7 @@ def main():
         pad_idx=PAD_IDX,
         nb_blocks=formatter.max_num_codes,
         block_size=formatter.block_size,
+        coverage_penalty_weight=args.coverage_penalty_weight,
     )
     loss_fn_linear = torch.nn.BCEWithLogitsLoss()
     loss_fn = LossMixer(
@@ -807,6 +810,7 @@ def main():
         late_phase_batch_sizes=args.late_phase_batch_sizes,
         late_phase_batch_steps=args.late_phase_batch_steps,
         late_phase_lr_mults=args.late_phase_lr_mults,
+        use_gold_num_codes_loss=args.use_gold_num_codes_loss,
     )
     
     # Cleanup distributed training

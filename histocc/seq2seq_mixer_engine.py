@@ -28,6 +28,9 @@ from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
 
 
+_LOSS_DIAGNOSTICS_RAN = False
+
+
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
     if not (dist.is_available() and dist.is_initialized()):
         return
@@ -118,6 +121,196 @@ def collate_sampled_items(
             continue
         stacked_batch[key] = values
     return stacked_batch
+
+
+def _log_loss_debug(
+        *,
+        debug_info: dict | None,
+        gold_num_codes: torch.Tensor,
+        step: int,
+        prefix: str = "LOSS_DEBUG",
+        ) -> None:
+    if debug_info is None:
+        return
+
+    def _masked_mean(values: torch.Tensor | None, mask: torch.Tensor) -> float:
+        if values is None:
+            return float("nan")
+        if not mask.any():
+            return float("nan")
+        return float(values[mask].mean().item())
+
+    gold_num_codes = gold_num_codes.detach().cpu()
+    singles = gold_num_codes == 1
+    doubles = gold_num_codes >= 2
+
+    order_per_sample = debug_info.get("order_invariant_per_sample")
+    push_per_sample = debug_info.get("push_to_pad_per_sample")
+    gate_per_sample = debug_info.get("gate_loss_per_sample")
+    coverage_per_sample = debug_info.get("coverage_loss_per_sample")
+    if order_per_sample is not None:
+        order_per_sample = order_per_sample.detach().cpu()
+    if push_per_sample is not None:
+        push_per_sample = push_per_sample.detach().cpu()
+    if gate_per_sample is not None:
+        gate_per_sample = gate_per_sample.detach().cpu()
+    if coverage_per_sample is not None:
+        coverage_per_sample = coverage_per_sample.detach().cpu()
+
+    msg = (
+        f"{prefix} step={step} "
+        f"order_mean_s={_masked_mean(order_per_sample, singles):.4f} "
+        f"order_mean_d={_masked_mean(order_per_sample, doubles):.4f} "
+        f"push_mean_s={_masked_mean(push_per_sample, singles):.4f} "
+        f"push_mean_d={_masked_mean(push_per_sample, doubles):.4f} "
+        f"gate_mean_s={_masked_mean(gate_per_sample, singles):.4f} "
+        f"gate_mean_d={_masked_mean(gate_per_sample, doubles):.4f} "
+        f"coverage_mean_s={_masked_mean(coverage_per_sample, singles):.4f} "
+        f"coverage_mean_d={_masked_mean(coverage_per_sample, doubles):.4f}"
+    )
+
+    best_idx = debug_info.get("matching_best_idx")
+    best_loss = debug_info.get("matching_best_loss")
+    valid_blocks = debug_info.get("matching_valid_blocks")
+    if best_idx is not None and valid_blocks is not None:
+        best_idx = best_idx.detach().cpu()
+        valid_blocks = valid_blocks.detach().cpu()
+        if best_loss is not None:
+            best_loss = best_loss.detach().cpu()
+
+        block2_valid = doubles & valid_blocks[:, 1]
+        if block2_valid.any():
+            block2_assign = best_idx[block2_valid, 1]
+            block2_to_block1 = float((block2_assign == 0).float().mean().item())
+            block2_to_block2 = float((block2_assign == 1).float().mean().item())
+            block2_best_loss = float(best_loss[block2_valid, 1].mean().item()) if best_loss is not None else float("nan")
+            msg += (
+                f" block2_assign_to1={block2_to_block1:.3f}"
+                f" block2_assign_to2={block2_to_block2:.3f}"
+                f" block2_best_loss={block2_best_loss:.4f}"
+            )
+
+    tqdm.write(msg)
+
+
+def _run_loss_controlled_experiment(
+        *,
+        loss_fn_seq2seq: nn.Module,
+        out_seq2seq: torch.Tensor,
+        targets_seq2seq: torch.Tensor,
+        gold_num_codes: torch.Tensor,
+        output_path: str,
+        ) -> None:
+    global _LOSS_DIAGNOSTICS_RAN
+    if _LOSS_DIAGNOSTICS_RAN:
+        return
+    _LOSS_DIAGNOSTICS_RAN = True
+
+    device = out_seq2seq.device
+    batch_size = out_seq2seq.size(0)
+    vocab_size = out_seq2seq.size(-1)
+    seq_len = out_seq2seq.size(1)
+    block_size = loss_fn_seq2seq.block_size
+    block2_start = block_size
+    block2_end = block2_start + block_size
+
+    def _one_hot_logits(tokens: torch.Tensor, high: float = 30.0, low: float = -30.0) -> torch.Tensor:
+        logits = torch.full((tokens.size(0), tokens.size(1), vocab_size), low, device=device)
+        logits.scatter_(2, tokens.unsqueeze(-1), high)
+        return logits
+
+    tokens = targets_seq2seq[:, 1:-1]
+    tokens_only_block1 = tokens.clone()
+    tokens_only_block1[:, block2_start:block2_end] = PAD_IDX
+
+    fixed_logits = out_seq2seq.detach()
+    logits_full = _one_hot_logits(tokens)
+    logits_block1_only = _one_hot_logits(tokens_only_block1)
+
+    prev_debug = getattr(loss_fn_seq2seq, "debug", False)
+    loss_fn_seq2seq.debug = True
+
+    loss_fixed_with_gold = loss_fn_seq2seq(fixed_logits, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_fixed_with_gold = loss_fn_seq2seq.last_debug
+    loss_fixed_without_gold = loss_fn_seq2seq(fixed_logits, targets_seq2seq, gold_num_codes=None)
+    debug_fixed_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_full_with_gold = loss_fn_seq2seq(logits_full, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_full_with_gold = loss_fn_seq2seq.last_debug
+    loss_full_without_gold = loss_fn_seq2seq(logits_full, targets_seq2seq, gold_num_codes=None)
+    debug_full_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_block1_with_gold = loss_fn_seq2seq(logits_block1_only, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_block1_with_gold = loss_fn_seq2seq.last_debug
+    loss_block1_without_gold = loss_fn_seq2seq(logits_block1_only, targets_seq2seq, gold_num_codes=None)
+    debug_block1_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_fn_seq2seq.debug = prev_debug
+
+    def _fmt_loss(value: torch.Tensor) -> str:
+        return f"{value.item():.6f}"
+
+    def _debug_summary(debug: dict | None) -> dict:
+        if debug is None:
+            return {}
+        return {
+            "order_invariant": float(debug["order_invariant_loss"].item()),
+            "push_to_pad": float(debug["push_to_pad_loss"].item()),
+            "gate": float(debug["gate_loss"].item()) if debug.get("gate_loss") is not None else 0.0,
+            "coverage": float(debug["coverage_loss"].item()) if debug.get("coverage_loss") is not None else 0.0,
+        }
+
+    report = [
+        "# Loss Controlled Experiment",
+        "",
+        f"- Batch size: {batch_size}",
+        f"- Seq len (no BOS/EOS): {seq_len}",
+        f"- Gold num codes distribution: {gold_num_codes.detach().cpu().tolist()}",
+        "",
+        "## Fixed model outputs (detached logits)",
+        "",
+        "| Setting | Total loss | Order-invariant | Push-to-pad | Gate | Coverage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    for label, loss_value, debug in [
+        ("gold_num_codes", loss_fixed_with_gold, debug_fixed_with_gold),
+        ("no_gold_num_codes", loss_fixed_without_gold, debug_fixed_without_gold),
+    ]:
+        summary = _debug_summary(debug)
+        report.append(
+            f"| {label} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
+            f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
+            f"{summary.get('coverage', float('nan')):.6f} |"
+        )
+
+    report.extend(
+        [
+            "",
+            "## Crafted predictions",
+            "",
+            "| Prediction | gold_num_codes | Total loss | Order-invariant | Push-to-pad | Gate | Coverage |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+
+    crafted_rows = [
+        ("both_blocks_correct", "gold_num_codes", loss_full_with_gold, debug_full_with_gold),
+        ("both_blocks_correct", "no_gold_num_codes", loss_full_without_gold, debug_full_without_gold),
+        ("block1_only_pad_block2", "gold_num_codes", loss_block1_with_gold, debug_block1_with_gold),
+        ("block1_only_pad_block2", "no_gold_num_codes", loss_block1_without_gold, debug_block1_without_gold),
+    ]
+    for label, setting, loss_value, debug in crafted_rows:
+        summary = _debug_summary(debug)
+        report.append(
+            f"| {label} | {setting} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
+            f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
+            f"{summary.get('coverage', float('nan')):.6f} |"
+        )
+
+    report_text = "\n".join(report) + "\n"
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write(report_text)
 
 
 def _is_gate_stable(late_phase_state: dict) -> bool:
@@ -568,6 +761,7 @@ def train_one_epoch(
                     out_linear=out_linear,
                     target_seq2seq=targets_seq2seq,
                     target_linear=targets_linear,
+                    gold_num_codes=gold_num_codes if use_gold_num_codes_loss else None,
                     )
         else:
             out_seq2seq, out_linear = model(
@@ -583,8 +777,15 @@ def train_one_epoch(
                 out_linear=out_linear,
                 target_seq2seq=targets_seq2seq,
                 target_linear=targets_linear,
+                gold_num_codes=gold_num_codes if use_gold_num_codes_loss else None,
                 )
         losses.update(loss.item(), out_seq2seq.size(0))
+        if loss_debug_every > 0 and is_main_process and current_step % loss_debug_every == 0:
+            _log_loss_debug(
+                debug_info=loss_fn.loss_fn_seq2seq.last_debug,
+                gold_num_codes=gold_num_codes,
+                step=current_step,
+            )
 
         # Backward pass & step with optional AMP
         if accum_counter == 0:
@@ -1024,6 +1225,13 @@ def evaluate(
     gating_fp = 0
     gating_fn = 0
     gating_tn = 0
+    gate_lang_confusion: dict[str, dict[str, int]] = {}
+    gate_gold1_fp = 0
+    gate_gold1_total = 0
+    gate_gold2_tp = 0
+    gate_gold2_total = 0
+    block2_nonpad_rate = Averager()
+    block2_pad_start_rate = Averager()
     formatter = getattr(data_loader.dataset, "formatter", None)
     
     # Language-specific metrics tracking
@@ -1078,6 +1286,23 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
+
+        if gold_num_codes is not None:
+            pred_tokens = out_seq2seq.argmax(dim=-1)
+            block2_start = loss_fn.loss_fn_seq2seq.block_size
+            block2_end = block2_start + loss_fn.loss_fn_seq2seq.block_size
+            pred_block2_tokens = pred_tokens[:, block2_start:block2_end]
+            pred_block2_nonpad = (pred_block2_tokens != PAD_IDX).any(dim=1)
+            gold_has2 = gold_num_codes >= 2
+            if gold_has2.any():
+                block2_nonpad_rate.update(pred_block2_nonpad[gold_has2].float().mean().item(), gold_has2.sum().item())
+                block2_pad_start = pred_tokens[:, block2_start] == PAD_IDX
+                block2_pad_start_rate.update(block2_pad_start[gold_has2].float().mean().item(), gold_has2.sum().item())
+
+            gate_gold1_total += int((gold_num_codes == 1).sum().item())
+            gate_gold1_fp += int((pred_block2_nonpad & (gold_num_codes == 1)).sum().item())
+            gate_gold2_total += int((gold_has2).sum().item())
+            gate_gold2_tp += int((pred_block2_nonpad & gold_has2).sum().item())
         
         # Track language-specific accuracies
         langs = batch.get('lang', None)
@@ -1100,6 +1325,21 @@ def evaluate(
                 lang_token_accs[lang].update(sample_token_acc.item(), 1)
                 lang_seq_accs[lang].update(sample_seq_acc.item(), 1)
                 lang_counts[lang] += 1
+
+            if gold_num_codes is not None:
+                for i, lang in enumerate(langs):
+                    if lang not in gate_lang_confusion:
+                        gate_lang_confusion[lang] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+                    gold_has2_lang = bool(gold_num_codes[i].item() >= 2)
+                    pred_has2_lang = bool(pred_block2_nonpad[i].item())
+                    if pred_has2_lang and gold_has2_lang:
+                        gate_lang_confusion[lang]["tp"] += 1
+                    elif pred_has2_lang and not gold_has2_lang:
+                        gate_lang_confusion[lang]["fp"] += 1
+                    elif (not pred_has2_lang) and gold_has2_lang:
+                        gate_lang_confusion[lang]["fn"] += 1
+                    else:
+                        gate_lang_confusion[lang]["tn"] += 1
 
         # Linear decoder accuracy
         preds_linear = torch.sigmoid(out_linear) > 0.5
@@ -1139,6 +1379,18 @@ def evaluate(
             gating_fp += int((pred_has2 & ~gold_has2).sum())
             gating_tn += int((~pred_has2 & ~gold_has2).sum())
 
+        if os.getenv("LOSS_DIAGNOSTICS") == "1" and gold_num_codes is not None:
+            is_main = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+            if is_main:
+                output_path = os.getenv("LOSS_DIAGNOSTICS_PATH", "loss_debug_report.md")
+                _run_loss_controlled_experiment(
+                    loss_fn_seq2seq=loss_fn.loss_fn_seq2seq,
+                    out_seq2seq=out_seq2seq,
+                    targets_seq2seq=targets_seq2seq,
+                    gold_num_codes=gold_num_codes,
+                    output_path=output_path,
+                )
+
         if batch_idx % log_interval == 0:
             tqdm.write(f'  Eval Batch {batch_idx + 1}/{len(data_loader)} | '
                        f'Seq Acc: {seq_accs.avg:.2f}% | '
@@ -1176,6 +1428,26 @@ def evaluate(
         lang_metrics[f'seq_acc_{lang}'] = lang_seq_accs[lang].avg
         lang_metrics[f'token_acc_{lang}'] = lang_token_accs[lang].avg
         lang_metrics[f'count_{lang}'] = lang_counts[lang]
+
+    if block2_nonpad_rate.count > 0:
+        lang_metrics["block2_nonpad_rate_gold2"] = block2_nonpad_rate.avg
+    if block2_pad_start_rate.count > 0:
+        lang_metrics["block2_pad_start_rate_gold2"] = block2_pad_start_rate.avg
+    if gate_gold1_total > 0:
+        lang_metrics["gate_fp_rate_gold1"] = gate_gold1_fp / gate_gold1_total
+    if gate_gold2_total > 0:
+        lang_metrics["gate_recall_gold2"] = gate_gold2_tp / gate_gold2_total
+
+    for lang, conf in sorted(gate_lang_confusion.items()):
+        tp = conf["tp"]
+        fp = conf["fp"]
+        fn = conf["fn"]
+        precision_lang = tp / (tp + fp) if (tp + fp) else 0.0
+        recall_lang = tp / (tp + fn) if (tp + fn) else 0.0
+        f1_lang = 2 * precision_lang * recall_lang / (precision_lang + recall_lang) if (precision_lang + recall_lang) else 0.0
+        lang_metrics[f"gate_precision_{lang}"] = precision_lang
+        lang_metrics[f"gate_recall_{lang}"] = recall_lang
+        lang_metrics[f"gate_f1_{lang}"] = f1_lang
 
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg, gating_metrics, lang_metrics
 
@@ -1869,9 +2141,13 @@ def train(
         late_phase_batch_sizes: list[int] | None = None,
         late_phase_batch_steps: list[int] | None = None,
         late_phase_lr_mults: list[float] | None = None,
+        use_gold_num_codes_loss: bool = False,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
+    loss_debug_every = int(os.getenv("LOSS_DEBUG_EVERY", "0"))
+    if loss_debug_every > 0 and loss_fn is not None:
+        loss_fn.loss_fn_seq2seq.debug = True
 
     world_size = 1
     if distributed and dist.is_available() and dist.is_initialized():
