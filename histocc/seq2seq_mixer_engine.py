@@ -217,7 +217,9 @@ def _run_loss_controlled_experiment(
     def _one_hot_logits(tokens: torch.Tensor, high: float = 30.0, low: float = -30.0) -> torch.Tensor:
         logits = torch.full((tokens.size(0), tokens.size(1), vocab_size), low, device=device)
         logits.scatter_(2, tokens.unsqueeze(-1), high)
-        return logits
+        pad_logits = torch.full((tokens.size(0), 1, vocab_size), low, device=device)
+        pad_logits[:, 0, PAD_IDX] = high
+        return torch.cat([logits, pad_logits], dim=1)
 
     tokens = targets_seq2seq[:, 1:-1]
     tokens_only_block1 = tokens.clone()
