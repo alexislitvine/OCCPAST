@@ -144,11 +144,19 @@ def _log_loss_debug(
         return float(masked.mean().item())
 
     def _masked_pctl(values: torch.Tensor | None, mask: torch.Tensor, q: float) -> float:
-        if values is None or not mask.any():
+        if values is None:
+            return float("nan")
+        if mask.dtype is not torch.bool:
+            mask = mask.bool()
+        if not mask.any():
             return float("nan")
         masked = values[mask]
         if masked.numel() == 0:
-            return 0.0
+            return float("nan")
+        masked = masked.float()
+        masked = masked[torch.isfinite(masked)]
+        if masked.numel() == 0:
+            return float("nan")
         return float(torch.quantile(masked, q).item())
 
     gold_num_codes = gold_num_codes.detach().cpu()
