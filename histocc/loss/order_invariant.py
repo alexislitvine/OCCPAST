@@ -258,6 +258,8 @@ class BlockOrderInvariantLoss(nn.Module):
             gate_pos_weight_max: float = 20.0,
             coverage_penalty_weight: float = 0.0,
             coverage_penalty_eps: float = 1e-6,
+            enforce_double_coverage_weight: float = 0.0,
+            enforce_double_coverage_eps: float = 1e-6,
             debug: bool = False,
     ):
         super().__init__()
@@ -270,6 +272,8 @@ class BlockOrderInvariantLoss(nn.Module):
         self.gate_pos_weight_max = gate_pos_weight_max
         self.coverage_penalty_weight = coverage_penalty_weight
         self.coverage_penalty_eps = coverage_penalty_eps
+        self.enforce_double_coverage_weight = enforce_double_coverage_weight
+        self.enforce_double_coverage_eps = enforce_double_coverage_eps
         self.debug = debug
         self.last_debug: dict | None = None
 
@@ -560,11 +564,33 @@ class BlockOrderInvariantLoss(nn.Module):
                 per_sample_coverage = torch.nan_to_num(per_sample_coverage, nan=0.0, posinf=0.0, neginf=0.0)
                 coverage_loss = per_sample_coverage.mean()
 
+        double_coverage_loss = 0.0
+        per_sample_double_coverage = None
+        if gold_num_codes is not None and self.enforce_double_coverage_weight > 0:
+            block2_start = self.block_size
+            log_probs = torch.log_softmax(yhat, dim=1)
+            pad_log_prob = log_probs[:, self.pad_idx, block2_start]
+            pad_prob = pad_log_prob.exp()
+            penalty = -torch.log((1.0 - pad_prob).clamp(min=self.enforce_double_coverage_eps))
+            doubles = gold_num_codes >= 2
+            per_sample_double_coverage = torch.zeros_like(penalty)
+            per_sample_double_coverage[doubles] = penalty[doubles]
+            if not torch.isfinite(per_sample_double_coverage).all():
+                per_sample_double_coverage = torch.nan_to_num(
+                    per_sample_double_coverage,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            denom = doubles.sum().clamp(min=1)
+            double_coverage_loss = per_sample_double_coverage.sum() / denom
+
         loss = (
             order_invariant_loss
             + self.push_to_pad_scale_factor * push_to_pad_loss
             + gate_loss
             + self.coverage_penalty_weight * coverage_loss
+            + self.enforce_double_coverage_weight * double_coverage_loss
         )
 
         if self.debug:
@@ -577,6 +603,8 @@ class BlockOrderInvariantLoss(nn.Module):
                 "gate_loss_per_sample": None if per_sample_gate is None else per_sample_gate.detach(),
                 "coverage_loss": torch.tensor(coverage_loss).detach() if isinstance(coverage_loss, float) else coverage_loss.detach(),
                 "coverage_loss_per_sample": None if per_sample_coverage is None else per_sample_coverage.detach(),
+                "double_coverage_loss": torch.tensor(double_coverage_loss).detach() if isinstance(double_coverage_loss, float) else double_coverage_loss.detach(),
+                "double_coverage_loss_per_sample": None if per_sample_double_coverage is None else per_sample_double_coverage.detach(),
                 "matching_best_idx": best_idx.detach(),
                 "matching_best_loss": best_loss.detach(),
                 "matching_valid_blocks": valid_blocks.detach(),

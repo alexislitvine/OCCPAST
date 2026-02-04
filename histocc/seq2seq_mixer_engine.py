@@ -129,6 +129,7 @@ def _log_loss_debug(
         gold_num_codes: torch.Tensor,
         step: int,
         prefix: str = "LOSS_DEBUG",
+        extra_metrics: dict | None = None,
         ) -> None:
     if debug_info is None:
         return
@@ -167,6 +168,7 @@ def _log_loss_debug(
     push_per_sample = debug_info.get("push_to_pad_per_sample")
     gate_per_sample = debug_info.get("gate_loss_per_sample")
     coverage_per_sample = debug_info.get("coverage_loss_per_sample")
+    double_coverage_per_sample = debug_info.get("double_coverage_loss_per_sample")
     if order_per_sample is not None:
         order_per_sample = order_per_sample.detach().cpu()
     if push_per_sample is not None:
@@ -175,6 +177,14 @@ def _log_loss_debug(
         gate_per_sample = gate_per_sample.detach().cpu()
     if coverage_per_sample is not None:
         coverage_per_sample = coverage_per_sample.detach().cpu()
+    if double_coverage_per_sample is not None:
+        double_coverage_per_sample = double_coverage_per_sample.detach().cpu()
+
+    if gate_per_sample is not None and gate_per_sample.shape[0] != gold_num_codes.shape[0]:
+        tqdm.write(
+            f"{prefix} step={step} gate_loss_per_sample_shape_mismatch "
+            f"gate_shape={tuple(gate_per_sample.shape)} gold_shape={tuple(gold_num_codes.shape)}"
+        )
 
     msg = (
         f"{prefix} step={step} "
@@ -185,13 +195,15 @@ def _log_loss_debug(
         f"gate_mean_s={_masked_mean(gate_per_sample, singles):.4f} "
         f"gate_mean_d={_masked_mean(gate_per_sample, doubles):.4f} "
         f"coverage_mean_s={_masked_mean(coverage_per_sample, singles):.4f} "
-        f"coverage_mean_d={_masked_mean(coverage_per_sample, doubles):.4f}"
+        f"coverage_mean_d={_masked_mean(coverage_per_sample, doubles):.4f} "
+        f"double_cov_mean_d={_masked_mean(double_coverage_per_sample, doubles):.4f}"
     )
     msg += (
         f" order_p90_s={_masked_pctl(order_per_sample, singles, 0.9):.4f} "
         f"order_p90_d={_masked_pctl(order_per_sample, doubles, 0.9):.4f} "
         f"gate_p90_d={_masked_pctl(gate_per_sample, doubles, 0.9):.4f} "
-        f"coverage_p90_d={_masked_pctl(coverage_per_sample, doubles, 0.9):.4f}"
+        f"coverage_p90_d={_masked_pctl(coverage_per_sample, doubles, 0.9):.4f} "
+        f"double_cov_p90_d={_masked_pctl(double_coverage_per_sample, doubles, 0.9):.4f}"
     )
 
     best_idx = debug_info.get("matching_best_idx")
@@ -214,6 +226,10 @@ def _log_loss_debug(
                 f" block2_assign_to2={block2_to_block2:.3f}"
                 f" block2_best_loss={block2_best_loss:.4f}"
             )
+
+    if extra_metrics:
+        extra_str = " ".join(f"{key}={value}" for key, value in extra_metrics.items())
+        msg += f" {extra_str}"
 
     tqdm.write(msg)
 
@@ -285,6 +301,7 @@ def _run_loss_controlled_experiment(
             "push_to_pad": float(debug["push_to_pad_loss"].item()),
             "gate": float(debug["gate_loss"].item()) if debug.get("gate_loss") is not None else 0.0,
             "coverage": float(debug["coverage_loss"].item()) if debug.get("coverage_loss") is not None else 0.0,
+            "double_coverage": float(debug["double_coverage_loss"].item()) if debug.get("double_coverage_loss") is not None else 0.0,
         }
 
     report = [
@@ -296,8 +313,8 @@ def _run_loss_controlled_experiment(
         "",
         "## Fixed model outputs (detached logits)",
         "",
-        "| Setting | Total loss | Order-invariant | Push-to-pad | Gate | Coverage |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        "| Setting | Total loss | Order-invariant | Push-to-pad | Gate | Coverage | Double-coverage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 
     for label, loss_value, debug in [
@@ -308,7 +325,7 @@ def _run_loss_controlled_experiment(
         report.append(
             f"| {label} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
             f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
-            f"{summary.get('coverage', float('nan')):.6f} |"
+            f"{summary.get('coverage', float('nan')):.6f} | {summary.get('double_coverage', float('nan')):.6f} |"
         )
 
     report.extend(
@@ -316,8 +333,8 @@ def _run_loss_controlled_experiment(
             "",
             "## Crafted predictions",
             "",
-            "| Prediction | gold_num_codes | Total loss | Order-invariant | Push-to-pad | Gate | Coverage |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| Prediction | gold_num_codes | Total loss | Order-invariant | Push-to-pad | Gate | Coverage | Double-coverage |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
 
@@ -332,7 +349,7 @@ def _run_loss_controlled_experiment(
         report.append(
             f"| {label} | {setting} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
             f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
-            f"{summary.get('coverage', float('nan')):.6f} |"
+            f"{summary.get('coverage', float('nan')):.6f} | {summary.get('double_coverage', float('nan')):.6f} |"
         )
 
     report_text = "\n".join(report) + "\n"
@@ -865,10 +882,33 @@ def train_one_epoch(
         losses.update(loss.item(), out_seq2seq.size(0))
         if loss_debug_every > 0 and is_main_process and current_step % loss_debug_every == 0:
             debug_info = loss_fn.loss_fn_seq2seq.last_debug
+            block2_start = loss_fn.loss_fn_seq2seq.block_size
+            doubles_mask = gold_num_codes >= 2
+            if doubles_mask.any():
+                pred_tokens = out_seq2seq.argmax(dim=-1)
+                block2_tokens = pred_tokens[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size]
+                block2_nonpad_rate = float((block2_tokens != PAD_IDX).any(dim=1)[doubles_mask].float().mean().item())
+                pad_probs = torch.softmax(out_seq2seq[:, block2_start, :], dim=-1)[:, PAD_IDX]
+                pad_start_prob = float(pad_probs[doubles_mask].mean().item())
+            else:
+                block2_nonpad_rate = float("nan")
+                pad_start_prob = float("nan")
+
+            gate_target_pos = 1 + block2_start
+            gate_target = targets_seq2seq[:, gate_target_pos]
+            gate_target_pad_d = int(((gate_target == PAD_IDX) & doubles_mask).sum().item())
+            gate_target_nonpad_d = int(((gate_target != PAD_IDX) & doubles_mask).sum().item())
+
             _log_loss_debug(
                 debug_info=debug_info,
                 gold_num_codes=gold_num_codes,
                 step=current_step,
+                extra_metrics={
+                    "block2_nonpad_rate_d": f"{block2_nonpad_rate:.3f}",
+                    "p_pad_block2_start_d": f"{pad_start_prob:.3f}",
+                    "gate_target_pad_d": gate_target_pad_d,
+                    "gate_target_nonpad_d": gate_target_nonpad_d,
+                },
             )
             _run_loss_nan_audit(
                 debug_info=debug_info,
