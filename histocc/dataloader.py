@@ -26,6 +26,7 @@ from transformers import CanineTokenizer
 
 import numpy as np
 import pandas as pd
+from .target_cleaning import get_gold_num_codes_from_values
 import seaborn as sns
 
 import matplotlib.pyplot as plt
@@ -1049,25 +1050,7 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
         return target
 
     def _get_gold_num_codes(self, record: pd.Series) -> int:
-        num_codes = 0
-        for target_col in self.target_cols:
-            code = record[target_col]
-
-            if isinstance(code, float):
-                if math.isnan(code):
-                    break
-                code = int(code)
-
-            if code is None:
-                break
-
-            code_str = str(code).strip()
-            if code_str in {'', ' ', '?'}:
-                break
-
-            num_codes += 1
-
-        return num_codes
+        return get_gold_num_codes_from_values([record[col] for col in self.target_cols])
 
     def __len__(self) -> int:
         return len(self.frame)
