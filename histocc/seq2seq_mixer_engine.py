@@ -1059,7 +1059,11 @@ def train_one_epoch(
                     if is_main_process:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
-                    compute_gating_metrics = late_phase_state is not None and is_main_process
+                    compute_gating_metrics = (
+                        late_phase_state is not None
+                        and late_phase_state.get("gate_switch_enabled", False)
+                        and is_main_process
+                    )
                     eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                         model=model,
                         data_loader=data_loader_eval,
@@ -1111,7 +1115,11 @@ def train_one_epoch(
                             )
 
                         gating_summary = gating_metrics or {}
-                        if late_phase_state is not None and gating_summary:
+                        if (
+                            late_phase_state is not None
+                            and late_phase_state.get("gate_switch_enabled", False)
+                            and gating_summary
+                        ):
                             gate_metric = late_phase_state["gate_stabilize_metric"]
                             if gate_metric in gating_summary:
                                 history = late_phase_state["gate_metric_history"]
@@ -1201,7 +1209,13 @@ def train_one_epoch(
                 raise RuntimeError("Eval/probe failed on rank0; aborting on all ranks.")
 
             switch_tensor = torch.tensor(
-                1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
+                1
+                if (
+                    late_phase_state is not None
+                    and late_phase_state.get("gate_switch_enabled", False)
+                    and late_phase_state["pending_switch"]
+                )
+                else 0,
                 device=device,
             )
             ddp_broadcast(switch_tensor, "switch_flag", current_step, device)
@@ -1210,7 +1224,10 @@ def train_one_epoch(
         elif is_eval_step and is_main_process:
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
-            compute_gating_metrics = late_phase_state is not None
+            compute_gating_metrics = (
+                late_phase_state is not None
+                and late_phase_state.get("gate_switch_enabled", False)
+            )
             eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                 model=model,
                 data_loader=data_loader_eval,
@@ -1261,7 +1278,11 @@ def train_one_epoch(
                 )
 
             gating_summary = gating_metrics or {}
-            if late_phase_state is not None and gating_summary:
+            if (
+                late_phase_state is not None
+                and late_phase_state.get("gate_switch_enabled", False)
+                and gating_summary
+            ):
                 gate_metric = late_phase_state["gate_stabilize_metric"]
                 if gate_metric in gating_summary:
                     history = late_phase_state["gate_metric_history"]
@@ -2415,12 +2436,12 @@ def train(
         is_main_process=is_main_process,
     )
 
-    enable_late_phase = (
+    gate_switch_enabled = (
         late_grad_accum > 1
         or late_lr_mult != 1.0
         or late_warmup_steps > 0
-        or batch_schedule is not None
     )
+    enable_late_phase = gate_switch_enabled or batch_schedule is not None
     late_phase_state = None
     if enable_late_phase:
         late_phase_state = {
@@ -2440,6 +2461,7 @@ def train(
             "gate_stabilize_delta": gate_stabilize_delta,
             "gate_stabilize_min": gate_stabilize_min,
             "late_switch_once": late_switch_once,
+            "gate_switch_enabled": gate_switch_enabled,
             "batch_size": batch_size,
             "world_size": world_size,
             "batch_schedule": batch_schedule,

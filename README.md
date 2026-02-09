@@ -219,6 +219,10 @@ Late phase training is enabled when **any** of the following parameters are set:
 - `--late-warmup-steps > 0`: Warmup steps after switching to late phase
 - `--late-phase-batch-sizes`: Batch size scaling schedule (requires `--late-phase-start-step`)
 
+Note: providing only batch-scaling flags no longer enables gating-based late-phase switching by itself.
+The gate-triggered switch is enabled only when at least one of `--late-grad-accum > 1`,
+`--late-lr-mult != 1.0`, or `--late-warmup-steps > 0` is set.
+
 ### Automatic Triggering
 
 Late phase training is automatically triggered when the model's gating performance stabilizes. Stabilization is detected by monitoring a specific metric over a window of evaluation steps:
@@ -229,7 +233,23 @@ Late phase training is automatically triggered when the model's gating performan
 - **Maximum variation**: The metric must vary by less than `--gate-stabilize-delta` (default: 0.02) within the window
 - **Minimum value**: The metric must be at least `--gate-stabilize-min` (default: 0.90) within the window
 
-Once these criteria are met, the late phase training automatically activates.
+Once these criteria are met, the late phase switch training automatically activates.
+
+### Important Distinction: Late-Phase Switch vs Batch Scaling
+
+There are two related but separate mechanisms:
+
+1. **Late-phase switch (gating-stability based)**
+   - Triggered by gating metric stabilization.
+   - Applies `--late-lr-mult`, `--late-grad-accum`, and `--late-warmup-steps`.
+2. **Late-phase batch scaling (step-scheduled)**
+   - Triggered by absolute training step thresholds from `--late-phase-batch-steps`
+     (or `--late-phase-start-step` for a single transition).
+   - Does **not** wait for gating stabilization.
+   - Applies `--late-phase-lr-mults` at each batch-size transition.
+
+In other words, batch scaling can happen even when `late_phase_enabled` is still false,
+because it is governed by the batch schedule rather than the gating-stability switch.
 
 ### Late Phase Training Parameters
 
