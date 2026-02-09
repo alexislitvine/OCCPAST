@@ -33,6 +33,7 @@ from histocc.formatter import (
     EOS_IDX,
 )
 from histocc.utils import wandb_init
+from histocc.target_cleaning import clean_target_value
 from histocc.utils.distributed import configure_slurm_env
 
 try:
@@ -93,6 +94,8 @@ def parse_args():
     parser.add_argument('--coverage-penalty-weight', type=float, default=0.0, help='Extra penalty (feature flag) for PAD at required block starts when gold_num_codes>=2.')
     parser.add_argument('--enforce-double-coverage', action='store_true', default=False, help='Penalize PAD at block2 start for gold doubles (uses decoder logits).')
     parser.add_argument('--enforce-double-coverage-weight', type=float, default=0.0, help='Weight for enforce-double-coverage penalty (default 0; set to 1.0 when --enforce-double-coverage is set).')
+    parser.add_argument('--enforce-no-pad-inside-block', action='store_true', default=False, help='Penalize PAD probability across all block2 positions for gold doubles.')
+    parser.add_argument('--enforce-no-pad-inside-block-weight', type=float, default=0.0, help='Weight for --enforce-no-pad-inside-block penalty.')
 
     # Model initialization
     parser.add_argument('--initial-checkpoint', type=str, default=None, help='Model weights to use for initialization. Discarded if resume state exists at --save-path')
@@ -123,7 +126,8 @@ def parse_args():
     # Debugging: PST2 sample diagnostics
     parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
     parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed (int) for selecting PST2 debug rows.')
-    parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Disallow PAD during greedy decoding inside code blocks during eval/probing.')
+    parser.add_argument('--constrain-pad-within-block', action=argparse.BooleanOptionalAction, default=True, help='Mask PAD token during decoding inside emitted code blocks (default: on).')
+    parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Deprecated alias for --constrain-pad-within-block.')
     parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
     parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
     parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
@@ -163,16 +167,16 @@ def parse_args():
             print('Warning: --include-descriptions enabled but no --descriptions-file provided. '
                   'No descriptions will be included in training.')
 
+
+    if args.disallow_pad_inside_block:
+        args.constrain_pad_within_block = True
+
     return args
 
 
 def _is_present_pst2(value: str | None) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return False
-    value = str(value)
-    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
+    normalized = clean_target_value(value)
+    return normalized not in {None, '?'}
 
 
 def print_pst2_sample_diagnostics(
@@ -267,15 +271,10 @@ def prepare_target_cols(
         drop_bad_rows: bool = False,
         allow_codes_shorter_than_block_size: bool = False,
 ) -> pd.DataFrame:
-    # All cases of space (' ') are cast to NaN
-    for i, target_col in enumerate(formatter.target_cols):
-        # Some NaN values instead coded as spaces
-        data[target_col] = data[target_col].replace(' ', None)
-        data[target_col] = data[target_col].replace(
-            {'nan': None, 'NaN': None, 'NAN': None, 'none': None, 'None': None, 'null': None, 'NULL': None}
-        )
+    for target_col in formatter.target_cols:
+        data[target_col] = data[target_col].map(clean_target_value)
 
-    # First colummn should not contain any NaN -> use the '?' token instead
+    # First column should not contain missing values -> use '?' token instead.
     assert '?' in formatter.map_char_idx
     data[formatter.target_cols[0]] = data[formatter.target_cols[0]].fillna('?')
 
@@ -736,6 +735,8 @@ def main():
 
     if args.enforce_double_coverage and args.enforce_double_coverage_weight == 0.0:
         args.enforce_double_coverage_weight = 1.0
+    if args.enforce_no_pad_inside_block and args.enforce_no_pad_inside_block_weight == 0.0:
+        args.enforce_no_pad_inside_block_weight = 1.0
 
     # Setup mixed loss
     loss_fn_seq2seq = BlockOrderInvariantLoss(
@@ -744,6 +745,7 @@ def main():
         block_size=formatter.block_size,
         coverage_penalty_weight=args.coverage_penalty_weight,
         enforce_double_coverage_weight=args.enforce_double_coverage_weight,
+        enforce_no_pad_inside_block_weight=args.enforce_no_pad_inside_block_weight,
     )
     loss_fn_linear = torch.nn.BCEWithLogitsLoss()
     loss_fn = LossMixer(
@@ -791,7 +793,7 @@ def main():
         distributed=distributed,
         is_main_process=is_main_process(),
         use_amp=args.use_amp,
-        disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_pad_inside_block=args.constrain_pad_within_block,
         disallow_zero_at_block_start=args.disallow_zero_at_block_start,
         min_double_steps=args.min_double_steps,
         min_double_ratio=args.min_double_ratio,

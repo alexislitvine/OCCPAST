@@ -26,6 +26,7 @@ from .utils.masking import generate_square_subsequent_mask
 from .model_assets import Seq2SeqMixerOccCANINE
 from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
+from .target_cleaning import clean_target_value
 
 
 _LOSS_DIAGNOSTICS_RAN = False
@@ -884,15 +885,24 @@ def train_one_epoch(
             debug_info = loss_fn.loss_fn_seq2seq.last_debug
             block2_start = loss_fn.loss_fn_seq2seq.block_size
             doubles_mask = gold_num_codes >= 2
+            pred_tokens = out_seq2seq.argmax(dim=-1)
+            block2_tokens = pred_tokens[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size]
+            pred_has2 = (block2_tokens != PAD_IDX).any(dim=1)
+            pad_inside_block_mask = (block2_tokens[:, 1:] == PAD_IDX).any(dim=1)
             if doubles_mask.any():
-                pred_tokens = out_seq2seq.argmax(dim=-1)
-                block2_tokens = pred_tokens[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size]
-                block2_nonpad_rate = float((block2_tokens != PAD_IDX).any(dim=1)[doubles_mask].float().mean().item())
+                block2_nonpad_rate = float(pred_has2[doubles_mask].float().mean().item())
                 pad_probs = torch.softmax(out_seq2seq[:, block2_start, :], dim=-1)[:, PAD_IDX]
                 pad_start_prob = float(pad_probs[doubles_mask].mean().item())
+                pad_probs_block2 = torch.softmax(out_seq2seq[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size, :], dim=-1)[..., PAD_IDX]
+                p_pad_block2_mean_d = float(pad_probs_block2[doubles_mask].mean().item())
+                pad_inside_pred_has2 = float(pad_inside_block_mask[pred_has2].float().mean().item()) if pred_has2.any() else float("nan")
+                pad_inside_gold_has2 = float(pad_inside_block_mask[doubles_mask].float().mean().item())
             else:
                 block2_nonpad_rate = float("nan")
                 pad_start_prob = float("nan")
+                p_pad_block2_mean_d = float("nan")
+                pad_inside_pred_has2 = float("nan")
+                pad_inside_gold_has2 = float("nan")
 
             gate_target_pos = 1 + block2_start
             gate_target = targets_seq2seq[:, gate_target_pos]
@@ -906,6 +916,9 @@ def train_one_epoch(
                 extra_metrics={
                     "block2_nonpad_rate_d": f"{block2_nonpad_rate:.3f}",
                     "p_pad_block2_start_d": f"{pad_start_prob:.3f}",
+                    "p_pad_block2_mean_d": f"{p_pad_block2_mean_d:.3f}",
+                    "pad_inside_block|pred_has2": f"{pad_inside_pred_has2:.3f}",
+                    "pad_inside_block|gold_has2": f"{pad_inside_gold_has2:.3f}",
                     "gate_target_pad_d": gate_target_pad_d,
                     "gate_target_nonpad_d": gate_target_nonpad_d,
                 },
@@ -1362,7 +1375,17 @@ def evaluate(
     block2_nonpad_rate = Averager()
     block2_pad_start_rate = Averager()
     formatter = getattr(data_loader.dataset, "formatter", None)
-    
+
+    if hasattr(data_loader.dataset, "frame") and "pst2_2" in data_loader.dataset.frame.columns:
+        first_batch_size = getattr(data_loader, "batch_size", 32) or 32
+        raw_vals = data_loader.dataset.frame["pst2_2"].head(first_batch_size)
+        cleaned_vals = raw_vals.map(clean_target_value)
+        raw_counts = Counter("none" if v is None else ("float_nan" if isinstance(v, float) else "str") for v in raw_vals.tolist())
+        cleaned_counts = Counter("none" if v is None else "str" for v in cleaned_vals.tolist())
+        tqdm.write(f"  Eval PST2_2 first-batch dist raw={dict(raw_counts)} cleaned={dict(cleaned_counts)}")
+        if any(isinstance(v, str) and v.lower() == "nan" for v in cleaned_vals.tolist()):
+            raise AssertionError("cleaned pst2_2 contains literal 'nan' string")
+
     # Language-specific metrics tracking
     lang_token_accs = {}
     lang_seq_accs = {}
@@ -1415,6 +1438,30 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
+
+        if os.getenv("METRIC_SANITY") == "1" and batch_idx == 0 and formatter is not None and getattr(data_loader.dataset, "map_code_label", None) is not None:
+            inv_key = data_loader.dataset.map_code_label
+            use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
+            pred_with_bos = torch.cat([
+                torch.full((out_seq2seq.size(0), 1), BOS_IDX, device=out_seq2seq.device, dtype=torch.long),
+                out_seq2seq.argmax(dim=-1),
+            ], dim=1)
+            shown = 0
+            for i in range(out_seq2seq.size(0)):
+                sacc_i, tacc_i = order_invariant_accuracy(
+                    output=out_seq2seq[i:i+1],
+                    target=targets_seq2seq[i:i+1, 1:],
+                    pad_idx=PAD_IDX,
+                    nb_blocks=loss_fn.loss_fn_seq2seq.nb_blocks,
+                    block_size=loss_fn.loss_fn_seq2seq.block_size,
+                )
+                if tacc_i.item() >= 90.0 and sacc_i.item() < 100.0:
+                    pred_blocks = _extract_normalized_blocks_from_seq(pred_with_bos[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep)
+                    gold_blocks = _extract_normalized_blocks_from_seq(targets_seq2seq[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep)
+                    tqdm.write(f"  METRIC_SANITY idx={i} token_acc={tacc_i.item():.2f} seq_acc={sacc_i.item():.2f} flat_match={Counter(pred_blocks)==Counter(gold_blocks)} pred={pred_blocks} gold={gold_blocks}")
+                    shown += 1
+                    if shown >= 5:
+                        break
 
         if gold_num_codes is not None:
             pred_tokens = out_seq2seq.argmax(dim=-1)
@@ -1470,12 +1517,30 @@ def evaluate(
                     else:
                         gate_lang_confusion[lang]["tn"] += 1
 
-        # Linear decoder accuracy
-        preds_linear = torch.sigmoid(out_linear) > 0.5
-        preds_linear = preds_linear.float().cpu()
-
-        acc_flat = accuracy_score(preds_linear, targets_linear.cpu())
-        flat_accs.update(acc_flat, preds_linear.size(0))
+        # Flat accuracy (seq2seq): first two blocks, order-invariant, normalized
+        if formatter is not None and getattr(data_loader.dataset, "map_code_label", None) is not None:
+            inv_key = data_loader.dataset.map_code_label
+            use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
+            pred_with_bos = torch.cat(
+                [
+                    torch.full((out_seq2seq.size(0), 1), BOS_IDX, device=out_seq2seq.device, dtype=torch.long),
+                    out_seq2seq.argmax(dim=-1),
+                ],
+                dim=1,
+            )
+            acc_flat = _flat_accuracy_from_seq2seq(
+                pred_with_bos,
+                targets_seq2seq,
+                formatter,
+                inv_key,
+                use_within_block_sep,
+            )
+            flat_accs.update(acc_flat, out_seq2seq.size(0))
+        else:
+            preds_linear = torch.sigmoid(out_linear) > 0.5
+            preds_linear = preds_linear.float().cpu()
+            acc_flat = accuracy_score(preds_linear, targets_linear.cpu()) * 100.0
+            flat_accs.update(acc_flat, preds_linear.size(0))
 
         if compute_gating_metrics:
             if formatter is None:
@@ -1603,12 +1668,8 @@ class _PST2ProbeRow:
 
 
 def _pst2_value_present(value: str | None) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return False
-    value = str(value)
-    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
+    normalized = clean_target_value(value)
+    return normalized not in {None, '?'}
 
 
 def _truncate_text(value: str | None, limit: int = 120) -> str:
@@ -1793,7 +1854,11 @@ def _split_str_s2s(pred: str, sep_value: str) -> list[str] | str:
     return pred
 
 
-def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: bool) -> str:
+def _normalize_code_for_lookup(code: str | None, inv_key: dict, use_within_block_sep: bool) -> str:
+    normalized = clean_target_value(code)
+    if normalized is None:
+        return ""
+    code = normalized.replace(' ', '')
     if not use_within_block_sep:
         return code
     if code in inv_key:
@@ -1801,11 +1866,56 @@ def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: b
     parts = code.split(',')
     while len(parts) > 1 and parts[-1] == '0':
         parts = parts[:-1]
-        normalized = ','.join(parts)
-        if normalized in inv_key:
-            return normalized
+        candidate = ','.join(parts)
+        if candidate in inv_key:
+            return candidate
     return code
 
+
+
+
+def _extract_normalized_blocks_from_seq(
+        seq_tokens: np.ndarray,
+        formatter,
+        inv_key: dict,
+        use_within_block_sep: bool,
+) -> list[str]:
+    formatted = formatter.clean_pred(seq_tokens)
+    split_pred = _split_str_s2s(formatted, formatter.sep_value)
+    blocks = split_pred if isinstance(split_pred, list) else [split_pred]
+    blocks = [
+        _normalize_code_for_lookup(block, inv_key, use_within_block_sep)
+        for block in blocks[:2]
+        if _normalize_code_for_lookup(block, inv_key, use_within_block_sep) != ""
+    ]
+    return blocks
+
+
+def _flat_accuracy_from_seq2seq(
+        pred_tokens: torch.Tensor,
+        gold_tokens_with_bos: torch.Tensor,
+        formatter,
+        inv_key: dict,
+        use_within_block_sep: bool,
+) -> float:
+    """Flat accuracy over first two blocks, order-invariant after normalization.
+
+    - uses formatter.clean_pred + lookup normalization
+    - ignores block order
+    - compares only first two blocks
+    """
+    correct = 0
+    total = pred_tokens.size(0)
+    for i in range(total):
+        pred_blocks = _extract_normalized_blocks_from_seq(
+            pred_tokens[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep
+        )
+        gold_blocks = _extract_normalized_blocks_from_seq(
+            gold_tokens_with_bos[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep
+        )
+        if Counter(pred_blocks) == Counter(gold_blocks):
+            correct += 1
+    return 100.0 * correct / max(1, total)
 
 def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -> str:
     seq_len = formatter.max_seq_len
@@ -1888,7 +1998,16 @@ def _run_pst2_eval_probe_inner(
         print('PST2 eval probe skipped: dataset has no map_code_label.')
         return
 
-    has_second = dataset.frame['pst2_2'].apply(_pst2_value_present).to_numpy()
+    raw_pst2_2 = dataset.frame['pst2_2'].head(sample_size)
+    raw_stats = Counter('none' if v is None else ('float_nan' if isinstance(v, float) else 'str') for v in raw_pst2_2.tolist())
+    cleaned_pst2_2 = raw_pst2_2.map(clean_target_value)
+    cleaned_stats = Counter('none' if v is None else 'str' for v in cleaned_pst2_2.tolist())
+    print(f"  debug_pst2_2_dist raw={dict(raw_stats)} cleaned={dict(cleaned_stats)}")
+    if any(isinstance(v, str) and v.lower() == 'nan' for v in cleaned_pst2_2.tolist()):
+        raise AssertionError("cleaned pst2_2 contains literal 'nan' string")
+
+    cleaned_pst2_2_full = dataset.frame['pst2_2'].map(clean_target_value)
+    has_second = cleaned_pst2_2_full.apply(_pst2_value_present).to_numpy()
     eligible_positions = [idx for idx, flag in enumerate(has_second) if flag]
     if not eligible_positions:
         print('PST2 eval probe: no rows with pst2_2 present in eval dataset.')
@@ -2039,10 +2158,10 @@ def _run_pst2_eval_probe_inner(
                 pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
                 pred_block1_in_key = pred_block1_norm in inv_key
                 pred_block2_in_key = pred_block2_norm in inv_key
-                gold2_raw = str(record['pst2_2'])
-                gold2_norm = _normalize_code_for_lookup(gold2_raw, inv_key, use_within_block_sep)
-                gold2_in_key = gold2_norm in inv_key
-                gold_has2 = _pst2_value_present(record['pst2_2'])
+                gold2_raw_clean = clean_target_value(record['pst2_2'])
+                gold2_norm = _normalize_code_for_lookup(gold2_raw_clean, inv_key, use_within_block_sep)
+                gold2_in_key = gold2_norm in inv_key if gold2_norm else False
+                gold_has2 = _pst2_value_present(gold2_raw_clean)
 
                 formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
                 split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
@@ -2119,7 +2238,7 @@ def _run_pst2_eval_probe_inner(
                     index=int(dataset_idx),
                     occ1=str(record['occ1']),
                     pst2_1=str(record['pst2_1']),
-                    pst2_2=str(record['pst2_2']),
+                    pst2_2=str(clean_target_value(record['pst2_2'])),
                     gold2_norm=gold2_norm,
                     gold2_in_key=gold2_in_key,
                     pred_block1_tokens=block1_tokens,
