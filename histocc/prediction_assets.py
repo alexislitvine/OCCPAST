@@ -165,6 +165,8 @@ class OccCANINE:
             target_cols: list[str] | None = None,
             disallow_pad_inside_block: bool = False,
             disallow_zero_at_block_start: bool = False,
+            constrain_to_valid_pst2: bool = True,
+            valid_pst2_decode_mode: str = "trie",
     ):
         """
         Initializes the OccCANINE model with specified configurations.
@@ -207,6 +209,8 @@ class OccCANINE:
         self.use_within_block_sep = use_within_block_sep
         self.disallow_pad_inside_block = disallow_pad_inside_block
         self.disallow_zero_at_block_start = disallow_zero_at_block_start
+        self.constrain_to_valid_pst2 = constrain_to_valid_pst2
+        self.valid_pst2_decode_mode = valid_pst2_decode_mode
 
         if self.system == "hisco": # TODO: Handle other model specs
             # Formatter
@@ -514,6 +518,8 @@ class OccCANINE:
             debug: bool = False,
             disallow_pad_inside_block: bool | None = None,
             disallow_zero_at_block_start: bool | None = None,
+            constrain_to_valid_pst2: bool | None = None,
+            valid_pst2_decode_mode: str | None = None,
             max_num_codes: int | None = None,
     ):
         """
@@ -559,6 +565,10 @@ class OccCANINE:
             self.disallow_pad_inside_block = disallow_pad_inside_block
         if disallow_zero_at_block_start is not None:
             self.disallow_zero_at_block_start = disallow_zero_at_block_start
+        if constrain_to_valid_pst2 is not None:
+            self.constrain_to_valid_pst2 = constrain_to_valid_pst2
+        if valid_pst2_decode_mode is not None:
+            self.valid_pst2_decode_mode = valid_pst2_decode_mode
         
         # Validate prediction arguments' compatability
         prediction_type = self._validate_and_update_prediction_parameters(behavior, prediction_type)
@@ -821,6 +831,26 @@ class OccCANINE:
         verbose = self.verbose
         total_batches = len(data_loader)
 
+        key_lookup = getattr(data_loader.dataset, "map_code_label", None)
+        if key_lookup is None:
+            key_lookup = {v: k for k, v in self.key.items()}
+        valid_block_token_ids = None
+        if self.constrain_to_valid_pst2 and self.valid_pst2_decode_mode == "trie":
+            seen = set()
+            valid_block_token_ids = []
+            for code in key_lookup.keys():
+                try:
+                    enc = data_loader.dataset.formatter.transform_label(str(code))
+                except Exception:
+                    continue
+                if enc is None:
+                    continue
+                block = tuple(int(tok) for tok in enc[1:1 + data_loader.dataset.formatter.block_size])
+                if block in seen:
+                    continue
+                seen.add(block)
+                valid_block_token_ids.append(list(block))
+
         for batch_idx, batch in enumerate(data_loader, start=1):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
@@ -841,35 +871,12 @@ class OccCANINE:
                 disallow_pad_inside_block = self.disallow_pad_inside_block,
                 disallow_zero_at_block_start = self.disallow_zero_at_block_start,
                 zero_idx = data_loader.dataset.formatter.map_char_idx.get('0'),
+                constrain_to_valid_blocks = bool(valid_block_token_ids),
+                valid_block_token_ids = valid_block_token_ids,
                 )
 
             outputs_s2s = outputs[0].cpu().numpy()
             probs_s2s = outputs[1].cpu().numpy()
-            formatter = data_loader.dataset.formatter
-            # Get key_lookup in the correct format: {code_str: idx_int}
-            # If map_code_label is None, invert self.key to get the right format
-            key_lookup = getattr(data_loader.dataset, "map_code_label", None)
-            if key_lookup is None:
-                key_lookup = {v: k for k, v in self.key.items()}
-
-            for row_idx, raw_seq in enumerate(outputs_s2s):
-                block2_start = 1 + formatter.block_size
-                block2_end = block2_start + formatter.block_size
-                block2_tokens = raw_seq[block2_start:block2_end]
-                if (block2_tokens == PAD_IDX).all():
-                    continue
-                if (block2_tokens == PAD_IDX).any():
-                    raw_seq[block2_start:block2_end] = PAD_IDX
-                    continue
-                seq_len = formatter.max_seq_len
-                seq = [PAD_IDX] * seq_len
-                seq[0] = BOS_IDX
-                seq[-1] = EOS_IDX
-                seq[block2_start:block2_end] = block2_tokens.tolist()
-                block2_raw = formatter.clean_pred(torch.tensor(seq).numpy())
-                if block2_raw not in key_lookup:
-                    raw_seq[block2_start:block2_end] = PAD_IDX
-
             # Compute order invariant confidence
             if order_invariant_conf:
                 # Location of multiple labels

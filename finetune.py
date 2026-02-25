@@ -129,6 +129,8 @@ def parse_args():
     parser.add_argument('--constrain-pad-within-block', action=argparse.BooleanOptionalAction, default=True, help='Mask PAD token during decoding inside emitted code blocks (default: on).')
     parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Deprecated alias for --constrain-pad-within-block.')
     parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
+    parser.add_argument('--constrain-to-valid-pst2', action=argparse.BooleanOptionalAction, default=True, help='Constrain greedy decoding so each emitted block is a valid code from the key/all-codes scheme (default: on).')
+    parser.add_argument('--valid-pst2-decode-mode', type=str, choices=['trie', 'score_all'], default='trie', help='Decode constraint mode for valid PST2 blocks.')
     parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
     parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
     parser.add_argument('--debug-double-audit', action='store_true', default=False, help='Enable debug auditing of double (block2) prevalence during training.')
@@ -795,6 +797,8 @@ def main():
         use_amp=args.use_amp,
         disallow_pad_inside_block=args.constrain_pad_within_block,
         disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+        constrain_to_valid_pst2=args.constrain_to_valid_pst2,
+        valid_pst2_decode_mode=args.valid_pst2_decode_mode,
         min_double_steps=args.min_double_steps,
         min_double_ratio=args.min_double_ratio,
         debug_double_audit=args.debug_double_audit,
