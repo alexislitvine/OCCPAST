@@ -25,6 +25,7 @@ from histocc import (
     LossMixer,
 )
 from histocc.dataloader import debug_collate
+from histocc.samplers import DistributedLanguageBalancedSampler
 from histocc.seq2seq_mixer_engine import train
 from histocc.formatter import (
     BlockyFormatter,
@@ -82,6 +83,8 @@ def parse_args():
     parser.add_argument('--num-epochs', type=int, default=5)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--num-workers', type=int, default=0, help='Number of workers for data loading')
+    parser.add_argument('--balanced-language-sampling', action='store_true', default=False, help='Sample training batches by first sampling language uniformly, then sampling rows uniformly within that language (DDP-aware).')
+    parser.add_argument('--balanced-language-debug-batches', type=int, default=5, help='Number of first batches per epoch (rank 0) to print language counts for when --balanced-language-sampling is enabled.')
     parser.add_argument('--prefetch-factor', type=int, default=None, help='Number of batches loaded in advance by each worker (default: None uses PyTorch default of 2)')
     parser.add_argument('--pin-memory', action='store_true', default=False, help='Pin memory for faster data transfer to GPU')
     parser.add_argument('--persistent-workers', action='store_true', default=False, help='Keep workers alive between epochs (requires num_workers > 0)')
@@ -664,11 +667,18 @@ def main():
         dataloader_kwargs['collate_fn'] = debug_collate
     
     if distributed:
-        train_sampler = DistributedSampler(
-            dataset_train,
-            shuffle=True,
-            drop_last=True,
-        )
+        if args.balanced_language_sampling:
+            train_sampler = DistributedLanguageBalancedSampler(
+                dataset_train,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            train_sampler = DistributedSampler(
+                dataset_train,
+                shuffle=True,
+                drop_last=True,
+            )
         val_sampler = DistributedSampler(
             dataset_val,
             shuffle=False,
@@ -823,6 +833,8 @@ def main():
         late_phase_batch_steps=args.late_phase_batch_steps,
         late_phase_lr_mults=args.late_phase_lr_mults,
         use_gold_num_codes_loss=args.use_gold_num_codes_loss,
+        balanced_language_sampling=args.balanced_language_sampling,
+        balanced_language_debug_batches=args.balanced_language_debug_batches,
     )
     
     # Cleanup distributed training

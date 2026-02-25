@@ -707,6 +707,8 @@ def train_one_epoch(
         late_phase_state: dict | None = None,
         use_gold_num_codes_loss: bool = False,
         loss_debug_every: int = 0,
+        balanced_language_sampling: bool = False,
+        balanced_language_debug_batches: int = 0,
         ) -> int:
     model = model.train()
 
@@ -731,6 +733,20 @@ def train_one_epoch(
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
 
     for batch_idx, batch in enumerate(iterator):
+        if (
+            balanced_language_sampling
+            and is_main_process
+            and balanced_language_debug_batches > 0
+            and batch_idx < balanced_language_debug_batches
+            and "lang" in batch
+        ):
+            lang_values = [str(x) for x in batch['lang']]
+            tqdm.write(
+                "BALANCED_LANG_DEBUG "
+                f"epoch={epoch} batch={batch_idx} "
+                f"lang_counts_in_batch={dict(Counter(lang_values))}"
+            )
+
         # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
             _apply_late_phase_switch(
@@ -2457,7 +2473,7 @@ def _run_pst2_eval_probe_inner(
 def train(
         model: Seq2SeqMixerOccCANINE,
         data_loaders: dict[str, torch.utils.data.DataLoader], # TODO split or use dataclass
-        train_sampler: torch.utils.data.distributed.DistributedSampler | None = None,
+        train_sampler: torch.utils.data.Sampler | None = None,
         loss_fn: LossMixer = None,
         optimizer: torch.optim.Optimizer = None,
         device: torch.device = None,
@@ -2498,6 +2514,8 @@ def train(
         late_phase_batch_steps: list[int] | None = None,
         late_phase_lr_mults: list[float] | None = None,
         use_gold_num_codes_loss: bool = False,
+        balanced_language_sampling: bool = False,
+        balanced_language_debug_batches: int = 0,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
@@ -2605,6 +2623,8 @@ def train(
             late_phase_state=late_phase_state,
             use_gold_num_codes_loss=use_gold_num_codes_loss,
             loss_debug_every=loss_debug_every,
+            balanced_language_sampling=balanced_language_sampling,
+            balanced_language_debug_batches=balanced_language_debug_batches,
         )
         
         # Save at the end of each epoch if the flag is set
