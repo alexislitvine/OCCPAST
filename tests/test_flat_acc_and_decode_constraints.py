@@ -103,3 +103,93 @@ def test_decode_constrain_pad_within_block():
     # position 2 corresponds to inside first block; unconstrained picks PAD, constrained cannot.
     assert int(seq_free[0, 2].item()) == PAD_IDX
     assert int(seq_constrained[0, 2].item()) != PAD_IDX
+
+
+def test_decode_constrain_to_valid_blocks_trie():
+    class _DummyTrieModel(torch.nn.Module):
+        def __init__(self, vocab_size=16):
+            super().__init__()
+            self.vocab_size = vocab_size
+
+        def encode(self, descr, input_attention_mask):
+            bsz = descr.size(0)
+            return torch.zeros(bsz, 1, 4, device=descr.device)
+
+        def decode(self, memory, target, target_mask, target_padding_mask):
+            bsz = target.size(0)
+            logits = torch.full((bsz, target.size(1), self.vocab_size), -10.0, device=target.device)
+            logits[:, -1, 7] = 10.0
+            logits[:, -1, 3] = 9.0
+            logits[:, -1, 4] = 8.0
+            return logits
+
+    model = _DummyTrieModel()
+    descr = torch.ones(1, 3, dtype=torch.long)
+    attn = torch.ones(1, 3, dtype=torch.long)
+    valid_blocks = [[3, 3, 3, 3, 3, 3, 3, 3], [4, 4, 4, 4, 4, 4, 4, 4], [3, 4, 3, 4, 3, 4, 3, 4]]
+
+    seq, _ = greedy_decode(
+        model=model,
+        descr=descr,
+        input_attention_mask=attn,
+        device=torch.device("cpu"),
+        max_len=18,
+        start_symbol=BOS_IDX,
+        pad_idx=PAD_IDX,
+        block_size=8,
+        max_num_codes=2,
+        constrain_to_valid_blocks=True,
+        valid_block_token_ids=valid_blocks,
+    )
+
+    block1 = seq[0, 1:9].tolist()
+    assert block1 in valid_blocks
+
+
+def test_decode_constrain_to_valid_blocks_and_no_pad_inside_second_block():
+    class _DummyBlock2Model(torch.nn.Module):
+        def __init__(self, vocab_size=16):
+            super().__init__()
+            self.vocab_size = vocab_size
+
+        def encode(self, descr, input_attention_mask):
+            bsz = descr.size(0)
+            return torch.zeros(bsz, 1, 4, device=descr.device)
+
+        def decode(self, memory, target, target_mask, target_padding_mask):
+            bsz = target.size(0)
+            seq_len = target.size(1)
+            pos = seq_len - 1
+            logits = torch.full((bsz, seq_len, self.vocab_size), -12.0, device=target.device)
+            if pos == 8:
+                logits[:, -1, 5] = 7.0
+            elif 9 <= pos <= 15:
+                logits[:, -1, PAD_IDX] = 9.0
+                logits[:, -1, 6] = 8.0
+            else:
+                logits[:, -1, 5] = 8.0
+            return logits
+
+    model = _DummyBlock2Model()
+    descr = torch.ones(1, 3, dtype=torch.long)
+    attn = torch.ones(1, 3, dtype=torch.long)
+    valid_blocks = [[5, 6, 6, 6, 6, 6, 6, 6], [5, 5, 5, 5, 5, 5, 5, 5], [6, 6, 6, 6, 6, 6, 6, 6]]
+
+    seq, _ = greedy_decode(
+        model=model,
+        descr=descr,
+        input_attention_mask=attn,
+        device=torch.device("cpu"),
+        max_len=18,
+        start_symbol=BOS_IDX,
+        pad_idx=PAD_IDX,
+        block_size=8,
+        max_num_codes=2,
+        disallow_pad_inside_block=True,
+        constrain_to_valid_blocks=True,
+        valid_block_token_ids=valid_blocks,
+    )
+
+    block2 = seq[0, 9:17].tolist()
+    assert PAD_IDX not in block2
+    assert block2 in valid_blocks

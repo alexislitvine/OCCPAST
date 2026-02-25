@@ -695,6 +695,8 @@ def train_one_epoch(
         scaler: GradScaler | None = None,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = "trie",
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
         debug_double_audit: bool = False,
@@ -1071,6 +1073,8 @@ def train_one_epoch(
                         device=device,
                         disallow_pad_inside_block=disallow_pad_inside_block,
                         disallow_zero_at_block_start=disallow_zero_at_block_start,
+                        constrain_to_valid_pst2=constrain_to_valid_pst2,
+                        valid_pst2_decode_mode=valid_pst2_decode_mode,
                         compute_gating_metrics=compute_gating_metrics,
                         require_gold_num_codes=compute_gating_metrics,
                         run_probe=False,
@@ -1235,6 +1239,8 @@ def train_one_epoch(
                 device=device,
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
+                constrain_to_valid_pst2=constrain_to_valid_pst2,
+                valid_pst2_decode_mode=valid_pst2_decode_mode,
                 compute_gating_metrics=compute_gating_metrics,
                 require_gold_num_codes=compute_gating_metrics,
                 run_probe=True,
@@ -1372,6 +1378,8 @@ def evaluate(
         log_interval: int = 100,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
         require_gold_num_codes: bool = False,
         compute_gating_metrics: bool = False,
         run_probe: bool = True,
@@ -1396,6 +1404,7 @@ def evaluate(
     block2_nonpad_rate = Averager()
     block2_pad_start_rate = Averager()
     formatter = getattr(data_loader.dataset, "formatter", None)
+    valid_block_token_ids = _build_valid_block_token_ids_from_dataset(data_loader.dataset) if constrain_to_valid_pst2 and valid_pst2_decode_mode == 'trie' else None
 
     if hasattr(data_loader.dataset, "frame") and "pst2_2" in data_loader.dataset.frame.columns:
         first_batch_size = getattr(data_loader, "batch_size", 32) or 32
@@ -1583,6 +1592,8 @@ def evaluate(
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
                 zero_idx=zero_idx,
+                constrain_to_valid_blocks=bool(valid_block_token_ids),
+                valid_block_token_ids=valid_block_token_ids,
             )
             preds_seq = outputs[0].cpu().numpy()
             block2_start = 1 + formatter.block_size
@@ -1622,6 +1633,8 @@ def evaluate(
             seed=42,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
         )
 
     precision = gating_tp / (gating_tp + gating_fp) if (gating_tp + gating_fp) else 0.0
@@ -1969,6 +1982,32 @@ def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -
     return formatter.clean_pred(torch.tensor(seq).numpy())
 
 
+def _build_valid_block_token_ids_from_dataset(dataset) -> list[list[int]] | None:
+    formatter = getattr(dataset, "formatter", None)
+    inv_key = getattr(dataset, "map_code_label", None)
+    if formatter is None or not inv_key:
+        return None
+
+    valid_blocks: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for code in inv_key.keys():
+        try:
+            encoded = formatter.transform_label(str(code))
+        except Exception:
+            continue
+        if encoded is None:
+            continue
+        block = tuple(int(tok) for tok in encoded[1:1 + formatter.block_size])
+        if len(block) != formatter.block_size:
+            continue
+        if block in seen:
+            continue
+        seen.add(block)
+        valid_blocks.append(list(block))
+
+    return valid_blocks or None
+
+
 def _run_pst2_eval_probe(
         model: nn.Module,
         data_loader: torch.utils.data.DataLoader,
@@ -1977,6 +2016,8 @@ def _run_pst2_eval_probe(
         seed: int = 42,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
 ) -> None:
     strict_probe = os.getenv("STRICT_PROBE") == "1"
     try:
@@ -1988,6 +2029,8 @@ def _run_pst2_eval_probe(
             seed=seed,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
         )
     except Exception as exc:
         rank = 0
@@ -2008,6 +2051,8 @@ def _run_pst2_eval_probe_inner(
         seed: int = 42,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
 ) -> None:
     dataset = data_loader.dataset
     formatter = dataset.formatter
@@ -2040,10 +2085,12 @@ def _run_pst2_eval_probe_inner(
 
     model_to_decode = model.module if hasattr(model, 'module') else model
     model_to_decode.eval()
+    valid_block_token_ids = _build_valid_block_token_ids_from_dataset(dataset) if constrain_to_valid_pst2 and valid_pst2_decode_mode == 'trie' else None
 
     examples_a: list[_PST2ProbeRow] = []
     examples_b: list[_PST2ProbeRow] = []
     examples_c: list[_PST2ProbeRow] = []
+    examples_d: list[_PST2ProbeRow] = []
 
     print('\n' + '=' * 80)
     print('PST2 EVAL PROBE (deterministic sample)')
@@ -2103,6 +2150,9 @@ def _run_pst2_eval_probe_inner(
         gold_has2_block2_in_key = 0
         pred_has2_block2_in_key = 0
         pred_has2_valid_count = 0
+        block1_emitted_count = 0
+        block1_emitted_in_key = 0
+        block2_emitted_in_key = 0
         block2_token_match = 0
         block2_token_total = 0
         pad_prob_bins = {i: {"count": 0, "gold_has2": 0} for i in range(5)}
@@ -2131,6 +2181,8 @@ def _run_pst2_eval_probe_inner(
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
                 zero_idx=zero_idx,
+                constrain_to_valid_blocks=bool(valid_block_token_ids),
+                valid_block_token_ids=valid_block_token_ids,
             )
             preds_seq = outputs[0].cpu().numpy()
 
@@ -2179,6 +2231,12 @@ def _run_pst2_eval_probe_inner(
                 pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
                 pred_block1_in_key = pred_block1_norm in inv_key
                 pred_block2_in_key = pred_block2_norm in inv_key
+                if any(tok != PAD_IDX for tok in block1_tokens):
+                    block1_emitted_count += 1
+                    if pred_block1_in_key:
+                        block1_emitted_in_key += 1
+                if block2_nonpad and pred_block2_in_key:
+                    block2_emitted_in_key += 1
                 gold2_raw_clean = clean_target_value(record['pst2_2'])
                 gold2_norm = _normalize_code_for_lookup(gold2_raw_clean, inv_key, use_within_block_sep)
                 gold2_in_key = gold2_norm in inv_key if gold2_norm else False
@@ -2275,6 +2333,29 @@ def _run_pst2_eval_probe_inner(
                     block2_nonpad=block2_nonpad,
                 )
 
+                if block2_nonpad and pred_block2_in_key and gold_has2 and gold2_in_key and pred_block2_norm != gold2_norm and len(examples_d) < 10:
+                    examples_d.append(
+                        _PST2ProbeRow(
+                            index=int(dataset_idx),
+                            occ1=_truncate_text(record.get('occ1')),
+                            pst2_1=str(record.get('pst2_1')),
+                            pst2_2=str(record.get('pst2_2')),
+                            gold2_norm=gold2_norm,
+                            gold2_in_key=gold2_in_key,
+                            pred_block1_tokens=block1_tokens,
+                            pred_block2_tokens=block2_tokens,
+                            pred_block1_raw=pred_block1_raw,
+                            pred_block2_raw=pred_block2_raw,
+                            pred_block1_norm=pred_block1_norm,
+                            pred_block2_norm=pred_block2_norm,
+                            pred_block1_in_key=pred_block1_in_key,
+                            pred_block2_in_key=pred_block2_in_key,
+                            formatted_pred=formatted_pred,
+                            split_pred=split_pred,
+                            block2_nonpad=block2_nonpad,
+                        )
+                    )
+
                 if block2_nonpad and not pred_block2_in_key and len(examples_a) < 10:
                     examples_a.append(row)
                 if block2_nonpad and pred_block2_in_key and len(split_pred_list) == 1 and len(examples_b) < 10:
@@ -2313,8 +2394,11 @@ def _run_pst2_eval_probe_inner(
             print(f'  EM_block2 | gold_has2: {gold_has2_exact_match / gold_has2_count:.2%}')
             print(f'  token_acc_block2 | gold_has2: {block2_token_match / block2_token_total:.2%}')
             print(f'  % block2_in_key | gold_has2: {gold_has2_block2_in_key / gold_has2_count:.2%}')
+        if block1_emitted_count:
+            print(f'  % block1_in_key | block1_emitted: {block1_emitted_in_key / block1_emitted_count:.2%}')
         if pred_has2_count:
             print(f'  % block2_in_key | pred_has2: {pred_has2_block2_in_key / pred_has2_count:.2%}')
+            print(f'  % block2_in_key | block2_emitted: {block2_emitted_in_key / pred_has2_count:.2%}')
             print(f'  % block2_valid_post_sanitize | pred_has2: {pred_has2_valid_count / pred_has2_count:.2%}')
         single_total = total - gold_has2_count
         if single_total:
@@ -2366,6 +2450,7 @@ def _run_pst2_eval_probe_inner(
     _print_examples('A) block2_nonpad=True but norm2_in_key=False', examples_a)
     _print_examples('B) block2_nonpad=True, norm2_in_key=True but split_returns_1', examples_b)
     _print_examples('C) block2_nonpad=False', examples_c)
+    _print_examples('D) block2 mismatch where pred/gold are both in_key', examples_d)
     print('=' * 80 + '\n')
 
 
@@ -2390,6 +2475,8 @@ def train(
         use_amp: bool = False,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = "trie",
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
         debug_double_audit: bool = False,
@@ -2506,6 +2593,8 @@ def train(
             scaler=scaler,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
             min_double_steps=min_double_steps,
             min_double_ratio=min_double_ratio,
             debug_double_audit=debug_double_audit,
