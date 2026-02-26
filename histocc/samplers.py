@@ -24,6 +24,7 @@ class DistributedLanguageBalancedSampler(Sampler[int]):
         dataset,
         *,
         language_column: str = "lang",
+        batch_size: int | None = None,
         num_replicas: int | None = None,
         rank: int | None = None,
         shuffle: bool = True,
@@ -49,6 +50,7 @@ class DistributedLanguageBalancedSampler(Sampler[int]):
         self.language_column = language_column
         self.num_replicas = num_replicas
         self.rank = rank
+        self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
         self.drop_last = drop_last
@@ -103,28 +105,67 @@ class DistributedLanguageBalancedSampler(Sampler[int]):
             bucket_pos[lang] = 0
 
         sampled: list[int] = []
-        lang_tensor_size = len(self._local_languages)
+        num_langs = len(self._local_languages)
 
-        while len(sampled) < self.num_samples:
-            lang_idx = int(torch.randint(0, lang_tensor_size, (1,), generator=generator).item())
-            lang = self._local_languages[lang_idx]
-            bucket = local_buckets[lang]
+        if self.batch_size is None or self.batch_size <= 0:
+            while len(sampled) < self.num_samples:
+                lang_idx = int(torch.randint(0, num_langs, (1,), generator=generator).item())
+                lang = self._local_languages[lang_idx]
+                bucket = local_buckets[lang]
 
-            if not bucket:
-                continue
+                pos = bucket_pos[lang]
+                if pos >= len(bucket):
+                    if self.shuffle and len(bucket) > 1:
+                        perm = torch.randperm(len(bucket), generator=generator).tolist()
+                        bucket = [bucket[i] for i in perm]
+                        local_buckets[lang] = bucket
+                    pos = 0
+                    bucket_pos[lang] = 0
 
-            pos = bucket_pos[lang]
-            if pos >= len(bucket):
-                # Bucket exhausted for this rank: reshuffle and cycle.
-                if self.shuffle and len(bucket) > 1:
-                    perm = torch.randperm(len(bucket), generator=generator).tolist()
-                    bucket = [bucket[i] for i in perm]
-                    local_buckets[lang] = bucket
-                pos = 0
-                bucket_pos[lang] = 0
+                sampled.append(bucket[pos])
+                bucket_pos[lang] = pos + 1
+            return iter(sampled)
 
-            sampled.append(bucket[pos])
-            bucket_pos[lang] = pos + 1
+        full_batches = self.num_samples // self.batch_size
+        remainder = self.num_samples % self.batch_size
+        total_batches = full_batches if (self.drop_last or remainder == 0) else (full_batches + 1)
+
+        for batch_idx in range(total_batches):
+            current_batch_size = self.batch_size
+            if batch_idx == total_batches - 1 and remainder and not self.drop_last:
+                current_batch_size = remainder
+
+            base = current_batch_size // num_langs
+            extra = current_batch_size % num_langs
+            batch_counts = {lang: base for lang in self._local_languages}
+            if extra:
+                order = torch.randperm(num_langs, generator=generator).tolist()
+                for idx in order[:extra]:
+                    batch_counts[self._local_languages[idx]] += 1
+
+            batch_indices: list[int] = []
+            for lang in self._local_languages:
+                need = batch_counts[lang]
+                if need <= 0:
+                    continue
+                bucket = local_buckets[lang]
+                for _ in range(need):
+                    pos = bucket_pos[lang]
+                    if pos >= len(bucket):
+                        if self.shuffle and len(bucket) > 1:
+                            perm = torch.randperm(len(bucket), generator=generator).tolist()
+                            bucket = [bucket[i] for i in perm]
+                            local_buckets[lang] = bucket
+                        pos = 0
+                        bucket_pos[lang] = 0
+
+                    batch_indices.append(bucket[pos])
+                    bucket_pos[lang] = pos + 1
+
+            if self.shuffle and len(batch_indices) > 1:
+                perm = torch.randperm(len(batch_indices), generator=generator).tolist()
+                batch_indices = [batch_indices[i] for i in perm]
+            sampled.extend(batch_indices)
 
         return iter(sampled)
 

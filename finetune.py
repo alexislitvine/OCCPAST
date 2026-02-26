@@ -670,6 +670,7 @@ def main():
         if args.balanced_language_sampling:
             train_sampler = DistributedLanguageBalancedSampler(
                 dataset_train,
+                batch_size=args.batch_size,
                 shuffle=True,
                 drop_last=True,
             )
@@ -715,6 +716,25 @@ def main():
     if os.getenv("DEBUG_DATALOADER") == "1":
         debug_dataloader_schema(data_loader_train, name="train")
         debug_dataloader_schema(data_loader_val, name="val")
+
+    if is_main_process():
+        train_sampler_obj = data_loader_train.sampler
+        batch_sampler_obj = data_loader_train.batch_sampler
+        sampler_seed = getattr(train_sampler_obj, "seed", None)
+        if sampler_seed is None:
+            sampler_seed = getattr(args, "seed", None)
+        dataset_len_seen = len(train_sampler_obj) if train_sampler_obj is not None else len(dataset_train)
+        print(
+            "TRAIN_DATALOADER_DEBUG "
+            f"sampler_type={type(train_sampler_obj).__name__} "
+            f"batch_sampler_type={type(batch_sampler_obj).__name__} "
+            f"shuffle_arg=False "
+            f"uses_distributed_sampler={isinstance(train_sampler_obj, DistributedSampler)} "
+            f"batch_size={data_loader_train.batch_size} "
+            f"drop_last={getattr(batch_sampler_obj, 'drop_last', None)} "
+            f"generator_seed={sampler_seed} "
+            f"rank_dataset_len={dataset_len_seen}"
+        )
 
     # Setup model, optimizer, scheduler
     model = Seq2SeqMixerOccCANINE(
