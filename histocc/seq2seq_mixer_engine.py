@@ -636,6 +636,8 @@ def _apply_batch_transition(
     # Instead, we modify the batch_sampler's batch_size if available
     if hasattr(data_loader, "batch_sampler") and hasattr(data_loader.batch_sampler, "batch_size"):
         data_loader.batch_sampler.batch_size = per_rank_batch
+    if hasattr(data_loader, "sampler") and hasattr(data_loader.sampler, "batch_size"):
+        data_loader.sampler.batch_size = per_rank_batch
 
     late_phase_state["batch_size"] = per_rank_batch
     schedule["next_index"] += 1
@@ -731,6 +733,7 @@ def train_one_epoch(
     
     # Use tqdm progress bar only on rank 0
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
+    balanced_lang_batch_props: list[float] = []
 
     for batch_idx, batch in enumerate(iterator):
         if (
@@ -741,11 +744,29 @@ def train_one_epoch(
             and "lang" in batch
         ):
             lang_values = [str(x) for x in batch['lang']]
+            lang_counts = dict(Counter(lang_values))
+            batch_size = len(lang_values)
+            if lang_counts:
+                balanced_lang_batch_props.extend([count / batch_size for count in lang_counts.values()])
             tqdm.write(
                 "BALANCED_LANG_DEBUG "
                 f"epoch={epoch} batch={batch_idx} "
-                f"lang_counts_in_batch={dict(Counter(lang_values))}"
+                f"lang_counts_in_batch={lang_counts}"
             )
+            if batch_size == 512 and len(lang_counts) == 6:
+                bad = {lang: c for lang, c in lang_counts.items() if c < 70 or c > 100}
+                if bad:
+                    raise RuntimeError(
+                        "BALANCED_LANG_ASSERT failed for batch_size=512/num_langs=6: "
+                        f"out_of_range={bad} full_counts={lang_counts}"
+                    )
+            if batch_idx + 1 == balanced_language_debug_batches and balanced_lang_batch_props:
+                tqdm.write(
+                    "BALANCED_LANG_DEBUG_SUMMARY "
+                    f"epoch={epoch} batches={balanced_language_debug_batches} "
+                    f"lang_prop_mean={statistics.fmean(balanced_lang_batch_props):.4f} "
+                    f"lang_prop_median={statistics.median(balanced_lang_batch_props):.4f}"
+                )
 
         # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
