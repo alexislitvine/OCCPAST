@@ -699,13 +699,28 @@ def main():
             **dataloader_kwargs,
         )
     else:
-        train_sampler = None
-        data_loader_train = DataLoader(
-            dataset_train,
-            batch_size=args.batch_size,
-            shuffle=True,
-            **dataloader_kwargs,
-        )
+        if args.balanced_language_sampling:
+            train_sampler = DistributedLanguageBalancedSampler(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+            )
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=False,
+                sampler=train_sampler,
+                **dataloader_kwargs,
+            )
+        else:
+            train_sampler = None
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=True,
+                **dataloader_kwargs,
+            )
         data_loader_val = DataLoader(
             dataset_val,
             batch_size=args.batch_size,
