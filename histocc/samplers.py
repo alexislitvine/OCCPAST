@@ -71,11 +71,6 @@ class DistributedLanguageBalancedSampler(Sampler[int]):
             self._local_lang_to_indices[lang] = global_indices[self.rank::self.num_replicas]
 
         self._local_languages = [lang for lang in self.languages if self._local_lang_to_indices[lang]]
-        if len(self._local_languages) == 0 and len(dataset) > 0:
-            raise RuntimeError(
-                f"Rank {self.rank} has no local samples after language sharding. "
-                "Reduce world size or adjust dataset composition."
-            )
 
         dataset_len = len(self.dataset)
         if self.drop_last:
@@ -83,6 +78,12 @@ class DistributedLanguageBalancedSampler(Sampler[int]):
         else:
             self.num_samples = (dataset_len + self.num_replicas - 1) // self.num_replicas
         self.total_size = self.num_samples * self.num_replicas
+
+        if self.num_samples > 0 and len(self._local_languages) == 0:
+            raise RuntimeError(
+                f"Rank {self.rank} has no local samples after language sharding. "
+                "Reduce world size or adjust dataset composition."
+            )
 
     def __iter__(self) -> Iterator[int]:
         if self.num_samples == 0:
