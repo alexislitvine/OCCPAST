@@ -78,13 +78,13 @@ def main():
     parser.add_argument(
         "--input-dir",
         type=str,
-        default="Data/predictions/to_predict",
+        default="/rds/user/adl38/hpc-work/OCCPAST2/Data/predictions/to_predict",
         help="Directory containing CSV files to choose from when --input is not provided."
     )
     parser.add_argument(
         "--lookup",
         type=str,
-        default="Data/predictions/occpast/PST2CodeDict.json",
+        default="/rds/user/adl38/hpc-work/OCCPAST2/Data/predictions/occpast/PST2CodeDict.json",
         help="Path to PST2CodeDict.json."
     )
     parser.add_argument(
@@ -96,7 +96,7 @@ def main():
     parser.add_argument(
         "--model-root",
         type=str,
-        default="/rds/user/adl38/hpc-work/OCCPAST/Data/pst2",
+        default="/rds/user/adl38/hpc-work/OCCPAST2/Data/pst2",
         help="Root directory containing PST models in subfolders. Each model folder should contain a last.bin file."
     )
     parser.add_argument(
