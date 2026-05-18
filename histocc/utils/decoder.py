@@ -33,6 +33,8 @@ def greedy_decode(
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
         zero_idx: int | None = None,
+        constrain_to_valid_blocks: bool = False,
+        valid_block_token_ids: list[list[int]] | None = None,
         ) -> tuple[Tensor, Tensor]:
     core = unwrap_model(model)
     _require_encode(core)
@@ -43,9 +45,11 @@ def greedy_decode(
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
     code_region_len = None
-    if (disallow_pad_inside_block or disallow_zero_at_block_start) and block_size is not None and max_num_codes is not None:
+    if (disallow_pad_inside_block or disallow_zero_at_block_start or constrain_to_valid_blocks) and block_size is not None and max_num_codes is not None:
         code_region_len = block_size * max_num_codes
     finished_code_region = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    inactive_blocks = torch.zeros((batch_size, max_num_codes or 0), dtype=torch.bool, device=device)
+    valid_prefix_to_next = _build_prefix_next_map(valid_block_token_ids) if constrain_to_valid_blocks else None
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -56,6 +60,18 @@ def greedy_decode(
             target_mask=target_mask,
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
+
+        if constrain_to_valid_blocks and valid_prefix_to_next is not None and block_size is not None and max_num_codes is not None and seq.shape[1] <= code_region_len:
+            _apply_valid_block_constraint(
+                logits=out,
+                seq=seq,
+                pos=seq.shape[1] - 1,
+                block_size=block_size,
+                max_num_codes=max_num_codes,
+                pad_idx=pad_idx,
+                inactive_blocks=inactive_blocks,
+                valid_prefix_to_next=valid_prefix_to_next,
+            )
 
         if disallow_pad_inside_block and code_region_len is not None and seq.shape[1] <= code_region_len:
             pos = seq.shape[1] - 1
@@ -84,6 +100,15 @@ def greedy_decode(
                     torch.full_like(next_token, pad_idx),
                     next_token,
                 )
+
+        if constrain_to_valid_blocks and block_size is not None and max_num_codes is not None and pad_idx is not None:
+            pos = seq.shape[1] - 1
+            code_region_len_local = block_size * max_num_codes
+            if 0 <= pos < code_region_len_local:
+                pos_in_block = pos % block_size
+                block_idx = pos // block_size
+                if pos_in_block == 0 and block_idx > 0:
+                    inactive_blocks[:, block_idx] = inactive_blocks[:, block_idx] | (next_token.squeeze(1) == pad_idx)
 
         # Extend sequence by adding prediction of next token.
         seq = torch.cat([seq, next_token], dim=1)
@@ -106,6 +131,8 @@ def mixer_greedy_decode(
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
         zero_idx: int | None = None,
+        constrain_to_valid_blocks: bool = False,
+        valid_block_token_ids: list[list[int]] | None = None,
         ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     core = unwrap_model(model)
     _require_encode(core)
@@ -123,9 +150,11 @@ def mixer_greedy_decode(
     seq = torch.ones(batch_size, 1).fill_(start_symbol).type(torch.long).to(device)
     prob_seq = torch.ones(batch_size, 1).fill_(1.0).type(torch.long).to(device)
     code_region_len = None
-    if (disallow_pad_inside_block or disallow_zero_at_block_start) and block_size is not None and max_num_codes is not None:
+    if (disallow_pad_inside_block or disallow_zero_at_block_start or constrain_to_valid_blocks) and block_size is not None and max_num_codes is not None:
         code_region_len = block_size * max_num_codes
     finished_code_region = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    inactive_blocks = torch.zeros((batch_size, max_num_codes or 0), dtype=torch.bool, device=device)
+    valid_prefix_to_next = _build_prefix_next_map(valid_block_token_ids) if constrain_to_valid_blocks else None
 
     for _ in range(max_len - 1):
         target_mask = generate_square_subsequent_mask(seq.shape[1], device).type(torch.bool) # TODO do we need cast?
@@ -136,6 +165,18 @@ def mixer_greedy_decode(
             target_mask=target_mask,
             target_padding_mask=None,
             )[:, -1:, :] # Only use the prediction for the next token in seq
+
+        if constrain_to_valid_blocks and valid_prefix_to_next is not None and block_size is not None and max_num_codes is not None and seq.shape[1] <= code_region_len:
+            _apply_valid_block_constraint(
+                logits=out,
+                seq=seq,
+                pos=seq.shape[1] - 1,
+                block_size=block_size,
+                max_num_codes=max_num_codes,
+                pad_idx=pad_idx,
+                inactive_blocks=inactive_blocks,
+                valid_prefix_to_next=valid_prefix_to_next,
+            )
 
         if disallow_pad_inside_block and code_region_len is not None and seq.shape[1] <= code_region_len:
             pos = seq.shape[1] - 1
@@ -165,11 +206,73 @@ def mixer_greedy_decode(
                     next_token,
                 )
 
+        if constrain_to_valid_blocks and block_size is not None and max_num_codes is not None and pad_idx is not None:
+            pos = seq.shape[1] - 1
+            code_region_len_local = block_size * max_num_codes
+            if 0 <= pos < code_region_len_local:
+                pos_in_block = pos % block_size
+                block_idx = pos // block_size
+                if pos_in_block == 0 and block_idx > 0:
+                    inactive_blocks[:, block_idx] = inactive_blocks[:, block_idx] | (next_token.squeeze(1) == pad_idx)
+
         # Extend sequence by adding prediction of next token.
         seq = torch.cat([seq, next_token], dim=1)
         prob_seq = torch.cat([prob_seq, next_prob], dim=1)
 
     return seq, prob_seq, linear_topk, prob_linear_topk
+
+
+def _build_prefix_next_map(valid_block_token_ids: list[list[int]] | None) -> dict[tuple[int, ...], list[int]]:
+    if not valid_block_token_ids:
+        return {}
+    prefix_to_next: dict[tuple[int, ...], set[int]] = {}
+    for block in valid_block_token_ids:
+        prefix: tuple[int, ...] = tuple()
+        for tok in block:
+            prefix_to_next.setdefault(prefix, set()).add(int(tok))
+            prefix = (*prefix, int(tok))
+    return {k: sorted(v) for k, v in prefix_to_next.items()}
+
+
+def _apply_valid_block_constraint(
+    logits: Tensor,
+    seq: Tensor,
+    pos: int,
+    block_size: int,
+    max_num_codes: int,
+    pad_idx: int | None,
+    inactive_blocks: Tensor,
+    valid_prefix_to_next: dict[tuple[int, ...], list[int]],
+) -> None:
+    if pos < 0 or pos >= block_size * max_num_codes:
+        return
+    if not valid_prefix_to_next:
+        return
+
+    block_idx = pos // block_size
+    pos_in_block = pos % block_size
+    seq_start = 1 + block_idx * block_size
+    batch_size = seq.size(0)
+    device = logits.device
+    vocab_size = logits.size(-1)
+    min_val = torch.finfo(logits.dtype).min
+
+    for sample_idx in range(batch_size):
+        if block_idx > 0 and bool(inactive_blocks[sample_idx, block_idx].item()):
+            if pad_idx is None:
+                continue
+            allowed = [pad_idx]
+        else:
+            prefix = tuple(int(tok) for tok in seq[sample_idx, seq_start:seq_start + pos_in_block].tolist())
+            allowed = list(valid_prefix_to_next.get(prefix, []))
+            if pos_in_block == 0 and block_idx > 0 and pad_idx is not None:
+                allowed.append(pad_idx)
+            if not allowed:
+                continue
+
+        mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        mask[torch.tensor(sorted(set(allowed)), dtype=torch.long, device=device)] = True
+        logits[sample_idx, 0, ~mask] = min_val
 
 
 def flat_decode_flat_model(

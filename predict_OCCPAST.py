@@ -117,6 +117,19 @@ def main():
         default=None,
         help="Override max_num_codes for greedy decoding during prediction."
     )
+    parser.add_argument(
+        "--predict-system",
+        type=str,
+        choices=["both", "pst", "hisco"],
+        default="both",
+        help="Which system(s) to predict: both (default), pst only, or hisco only.",
+    )
+    parser.add_argument(
+        "--model-bin",
+        type=str,
+        default=None,
+        help="Optional direct path to a PST model .bin file. If set, skips interactive model selection.",
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
@@ -191,121 +204,136 @@ def main():
     # --- run predictions on df (same as before) ---
     # Import here to avoid slow startup before prompting the user.
     from histocc.prediction_assets import OccCANINE
-    mod_hisco = OccCANINE(
-        verbose=True,
-        disallow_pad_inside_block=args.disallow_pad_inside_block,
-        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
-    )
+    mod_hisco = None
+    if args.predict_system in {"both", "hisco"}:
+        mod_hisco = OccCANINE(
+            verbose=True,
+            disallow_pad_inside_block=args.disallow_pad_inside_block,
+            disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+        )
 
     # Discover PST models with last.bin under model_root and select
-    model_root = Path(args.model_root)
-    if not model_root.exists():
-        raise FileNotFoundError(f"Model root not found: {model_root}")
+    mod_pst = None
+    if args.predict_system in {"both", "pst"}:
+        if args.model_bin:
+            chosen_bin = Path(args.model_bin)
+            if not chosen_bin.exists():
+                raise FileNotFoundError(f"PST model not found: {chosen_bin}")
+            chosen_name = chosen_bin.parent.name
+        else:
+            model_root = Path(args.model_root)
+            if not model_root.exists():
+                raise FileNotFoundError(f"Model root not found: {model_root}")
 
-    candidates: list[tuple[str, Path, float]] = []  # (name, bin_path, mtime)
-    for entry in model_root.iterdir():
-        if entry.is_dir():
-            bin_path = entry / "last.bin"
-            if bin_path.exists():
+            candidates: list[tuple[str, Path, float]] = []  # (name, bin_path, mtime)
+            for entry in model_root.iterdir():
+                if entry.is_dir():
+                    bin_path = entry / "last.bin"
+                    if bin_path.exists():
+                        try:
+                            mtime = bin_path.stat().st_mtime
+                        except Exception:
+                            mtime = 0.0
+                        candidates.append((entry.name, bin_path, mtime))
+
+            if not candidates:
+                raise SystemExit(f"No models with last.bin found under {model_root}")
+
+            print("Available PST models (with last.bin):")
+            # Sort candidates by mtime desc
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            for i, (name, bin_path, mtime) in enumerate(candidates, start=1):
+                ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"{i}. {name}  [last.bin saved: {ts}] -> {bin_path}")
+
+            while True:
                 try:
-                    mtime = bin_path.stat().st_mtime
-                except Exception:
-                    mtime = 0.0
-                candidates.append((entry.name, bin_path, mtime))
+                    sel = input("Select PST model number (default 1): ").strip()
+                    idx = 1 if sel == "" else int(sel)
+                    if 1 <= idx <= len(candidates):
+                        break
+                    else:
+                        print(f"Please enter a number between 1 and {len(candidates)}.")
+                except ValueError:
+                    print("Please enter a valid number.")
 
-    if not candidates:
-        raise SystemExit(f"No models with last.bin found under {model_root}")
+            chosen_name, chosen_bin, chosen_mtime = candidates[idx - 1]
 
-    print("Available PST models (with last.bin):")
-    # Sort candidates by mtime desc
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    for i, (name, bin_path, mtime) in enumerate(candidates, start=1):
-        ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{i}. {name}  [last.bin saved: {ts}] -> {bin_path}")
+        print(f"Using PST model: {chosen_name} ({chosen_bin})")
+        mod_pst = OccCANINE(
+            str(chosen_bin),
+            hf=False,
+            system="pst",
+            use_within_block_sep=True,
+            verbose=True,
+            disallow_pad_inside_block=args.disallow_pad_inside_block,
+            disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+        )
 
-    while True:
-        try:
-            sel = input("Select PST model number (default 1): ").strip()
-            idx = 1 if sel == "" else int(sel)
-            if 1 <= idx <= len(candidates):
-                break
-            else:
-                print(f"Please enter a number between 1 and {len(candidates)}.")
-        except ValueError:
-            print("Please enter a valid number.")
+    hisco_out = None
+    pst_out = None
+    if mod_hisco is not None:
+        print("Running HISCO predictions…")
+        pred_hisco = mod_hisco(
+            df.occ1_clean.tolist(),
+            k_pred=HOW_MANY_PREDS,
+            debug=args.debug,
+            max_num_codes=args.max_num_codes,
+        )
+        pred_hisco["id"] = df["id"].tolist()
+        pred_hisco["occ1"] = df["occ1_original"].tolist()
+        pred_hisco["occ1_clean"] = df["occ1_clean"].tolist()
+        hisco_out = predicted_dir / f"{file_base}_predictions_hisco_{ts}.csv"
+        pred_hisco.to_csv(hisco_out, index=False, encoding=out_enc)
+        print(f"→ Saved HISCO to {hisco_out.name}")
 
-    chosen_name, chosen_bin, chosen_mtime = candidates[idx - 1]
-    print(f"Using PST model: {chosen_name} ({chosen_bin})")
+    if mod_pst is not None:
+        print("Running PST predictions…")
+        pred_pst = mod_pst(
+            df.occ1_clean.tolist(),
+            k_pred=HOW_MANY_PREDS,
+            debug=args.debug,
+            max_num_codes=args.max_num_codes,
+        )
+        pred_pst["id"] = df["id"].tolist()
+        pred_pst["occ1"] = df["occ1_original"].tolist()
+        pred_pst["occ1_clean"] = df["occ1_clean"].tolist()
+        pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}.csv"
+        pred_pst.to_csv(pst_out, index=False, encoding=out_enc)
+        print(f"→ Saved PST   to {pst_out.name}")
 
-    mod_pst = OccCANINE(
-        str(chosen_bin),
-        hf=False,
-        system="pst",
-        use_within_block_sep=True,
-        verbose=True,
-        disallow_pad_inside_block=args.disallow_pad_inside_block,
-        disallow_zero_at_block_start=args.disallow_zero_at_block_start,
-    )
+    if args.predict_system == "both":
+        # 4) path to PST2 lookup json
+        #    prompt so you can point to the exact file you want
+        user_lookup = input(f"Path to PST2CodeDict.json [{args.lookup}]: ").strip()
+        lookup_path = Path(user_lookup) if user_lookup else Path(args.lookup)
+        if not lookup_path.exists():
+            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
 
-    print("Running HISCO predictions…")
-    pred_hisco = mod_hisco(
-        df.occ1_clean.tolist(),
-        k_pred=HOW_MANY_PREDS,
-        debug=args.debug,
-        max_num_codes=args.max_num_codes,
-    )
-    pred_hisco["id"] = df["id"].tolist()
-    pred_hisco["occ1"] = df["occ1_original"].tolist()
-    pred_hisco["occ1_clean"] = df["occ1_clean"].tolist()
-    hisco_out = predicted_dir / f"{file_base}_predictions_hisco_{ts}.csv"
-    pred_hisco.to_csv(hisco_out, index=False, encoding=out_enc)
-    print(f"→ Saved HISCO to {hisco_out.name}")
+        # 5) Format & merge predictions -> combined JSON (with progress bars)
+        print("Formatting/merging predictions…")
+        entries, stats = format_predictions(
+            hisco_csv_path=hisco_out,
+            pst2_csv_path=pst_out,
+            pst2_lookup_json_path=lookup_path,
+            csv_encoding=out_enc,
+        )
 
-    print("Running PST predictions…")
-    pred_pst = mod_pst(
-        df.occ1_clean.tolist(),
-        k_pred=HOW_MANY_PREDS,
-        debug=args.debug,
-        max_num_codes=args.max_num_codes,
-    )
-    pred_pst["id"] = df["id"].tolist()
-    pred_pst["occ1"] = df["occ1_original"].tolist()
-    pred_pst["occ1_clean"] = df["occ1_clean"].tolist()
-    pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}.csv"
-    pred_pst.to_csv(pst_out, index=False, encoding=out_enc)
-    print(f"→ Saved PST   to {pst_out.name}")
+        # Log duplicates like the Node script
+        if stats.duplicate_strings:
+            print("Duplicate entries found for the following strings:")
+            for s, c in stats.duplicate_strings:
+                print(f'"{s}" occurs {c} times')
+        else:
+            print("No duplicate entries found.")
 
-    # 4) path to PST2 lookup json
-    #    prompt so you can point to the exact file you want
-    user_lookup = input(f"Path to PST2CodeDict.json [{args.lookup}]: ").strip()
-    lookup_path = Path(user_lookup) if user_lookup else Path(args.lookup)
-    if not lookup_path.exists():
-        raise FileNotFoundError(f"Lookup not found: {lookup_path}")
-
-    # 5) Format & merge predictions -> combined JSON (with progress bars)
-    print("Formatting/merging predictions…")
-    entries, stats = format_predictions(
-        hisco_csv_path=hisco_out,
-        pst2_csv_path=pst_out,
-        pst2_lookup_json_path=lookup_path,
-        csv_encoding=out_enc,
-    )
-
-    # Log duplicates like the Node script
-    if stats.duplicate_strings:
-        print("Duplicate entries found for the following strings:")
-        for s, c in stats.duplicate_strings:
-            print(f'"{s}" occurs {c} times')
-    else:
-        print("No duplicate entries found.")
-
-    combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}.json"
-    write_json(combined_json, serialize_formatted_entries(entries))
-    print(f"→ Wrote combined formatted JSON: {combined_json.name}")
-    print(
-        f"Total predictions processed: {stats.total_predictions_processed} | "
-        f"Failures: {stats.failures}"
-    )
+        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}.json"
+        write_json(combined_json, serialize_formatted_entries(entries))
+        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
+        print(
+            f"Total predictions processed: {stats.total_predictions_processed} | "
+            f"Failures: {stats.failures}"
+        )
 
     # # 6) Create 4 sampled chunks as JSON + CSV (titles) beside the combined JSON
     # print("Writing 4 sampled quarter-chunks (JSON + CSV)…")

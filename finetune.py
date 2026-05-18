@@ -25,6 +25,7 @@ from histocc import (
     LossMixer,
 )
 from histocc.dataloader import debug_collate
+from histocc.samplers import DistributedLanguageBalancedSampler
 from histocc.seq2seq_mixer_engine import train
 from histocc.formatter import (
     BlockyFormatter,
@@ -33,6 +34,7 @@ from histocc.formatter import (
     EOS_IDX,
 )
 from histocc.utils import wandb_init
+from histocc.target_cleaning import clean_target_value
 from histocc.utils.distributed import configure_slurm_env
 
 try:
@@ -81,6 +83,8 @@ def parse_args():
     parser.add_argument('--num-epochs', type=int, default=5)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--num-workers', type=int, default=0, help='Number of workers for data loading')
+    parser.add_argument('--balanced-language-sampling', action='store_true', default=False, help='Sample training batches by first sampling language uniformly, then sampling rows uniformly within that language (DDP-aware).')
+    parser.add_argument('--balanced-language-debug-batches', type=int, default=5, help='Number of first batches per epoch (rank 0) to print language counts for when --balanced-language-sampling is enabled.')
     parser.add_argument('--prefetch-factor', type=int, default=None, help='Number of batches loaded in advance by each worker (default: None uses PyTorch default of 2)')
     parser.add_argument('--pin-memory', action='store_true', default=False, help='Pin memory for faster data transfer to GPU')
     parser.add_argument('--persistent-workers', action='store_true', default=False, help='Keep workers alive between epochs (requires num_workers > 0)')
@@ -89,6 +93,12 @@ def parse_args():
     parser.add_argument('--learning-rate', type=float, default=2e-05)
     parser.add_argument('--seq2seq-weight', type=float, default=0.1)
     parser.add_argument('--warmup-pct', type=float, default=0.05, help='Warmup steps as percentage of total steps (default: 0.05 = 5%%)')
+    parser.add_argument('--use-gold-num-codes-loss', action='store_true', default=False, help='Pass gold_num_codes into the seq2seq loss during training.')
+    parser.add_argument('--coverage-penalty-weight', type=float, default=0.0, help='Extra penalty (feature flag) for PAD at required block starts when gold_num_codes>=2.')
+    parser.add_argument('--enforce-double-coverage', action='store_true', default=False, help='Penalize PAD at block2 start for gold doubles (uses decoder logits).')
+    parser.add_argument('--enforce-double-coverage-weight', type=float, default=0.0, help='Weight for enforce-double-coverage penalty (default 0; set to 1.0 when --enforce-double-coverage is set).')
+    parser.add_argument('--enforce-no-pad-inside-block', action='store_true', default=False, help='Penalize PAD probability across all block2 positions for gold doubles.')
+    parser.add_argument('--enforce-no-pad-inside-block-weight', type=float, default=0.0, help='Weight for --enforce-no-pad-inside-block penalty.')
 
     # Model initialization
     parser.add_argument('--initial-checkpoint', type=str, default=None, help='Model weights to use for initialization. Discarded if resume state exists at --save-path')
@@ -119,8 +129,11 @@ def parse_args():
     # Debugging: PST2 sample diagnostics
     parser.add_argument('--debug-pst2-samples', type=int, default=0, help='Number of deterministic PST2 rows to print diagnostics for (requires pst2_1 and pst2_2 in target cols).')
     parser.add_argument('--debug-pst2-seed', type=int, default=42, help='Random seed (int) for selecting PST2 debug rows.')
-    parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Disallow PAD during greedy decoding inside code blocks during eval/probing.')
+    parser.add_argument('--constrain-pad-within-block', action=argparse.BooleanOptionalAction, default=True, help='Mask PAD token during decoding inside emitted code blocks (default: on).')
+    parser.add_argument('--disallow-pad-inside-block', action='store_true', default=False, help='Deprecated alias for --constrain-pad-within-block.')
     parser.add_argument('--disallow-zero-at-block-start', action='store_true', default=False, help='Disallow predicting token "0" at the start of each block during greedy decoding.')
+    parser.add_argument('--constrain-to-valid-pst2', action=argparse.BooleanOptionalAction, default=True, help='Constrain greedy decoding so each emitted block is a valid code from the key/all-codes scheme (default: on).')
+    parser.add_argument('--valid-pst2-decode-mode', type=str, choices=['trie', 'score_all'], default='trie', help='Decode constraint mode for valid PST2 blocks.')
     parser.add_argument('--min-double-steps', type=int, default=5000, help='Number of initial steps to enforce a minimum doubles quota per batch.')
     parser.add_argument('--min-double-ratio', type=float, default=0.1, help='Minimum doubles ratio per batch during warmup steps.')
     parser.add_argument('--debug-double-audit', action='store_true', default=False, help='Enable debug auditing of double (block2) prevalence during training.')
@@ -159,16 +172,16 @@ def parse_args():
             print('Warning: --include-descriptions enabled but no --descriptions-file provided. '
                   'No descriptions will be included in training.')
 
+
+    if args.disallow_pad_inside_block:
+        args.constrain_pad_within_block = True
+
     return args
 
 
 def _is_present_pst2(value: str | None) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return False
-    value = str(value)
-    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
+    normalized = clean_target_value(value)
+    return normalized not in {None, '?'}
 
 
 def print_pst2_sample_diagnostics(
@@ -263,15 +276,10 @@ def prepare_target_cols(
         drop_bad_rows: bool = False,
         allow_codes_shorter_than_block_size: bool = False,
 ) -> pd.DataFrame:
-    # All cases of space (' ') are cast to NaN
-    for i, target_col in enumerate(formatter.target_cols):
-        # Some NaN values instead coded as spaces
-        data[target_col] = data[target_col].replace(' ', None)
-        data[target_col] = data[target_col].replace(
-            {'nan': None, 'NaN': None, 'NAN': None, 'none': None, 'None': None, 'null': None, 'NULL': None}
-        )
+    for target_col in formatter.target_cols:
+        data[target_col] = data[target_col].map(clean_target_value)
 
-    # First colummn should not contain any NaN -> use the '?' token instead
+    # First column should not contain missing values -> use '?' token instead.
     assert '?' in formatter.map_char_idx
     data[formatter.target_cols[0]] = data[formatter.target_cols[0]].fillna('?')
 
@@ -659,11 +667,19 @@ def main():
         dataloader_kwargs['collate_fn'] = debug_collate
     
     if distributed:
-        train_sampler = DistributedSampler(
-            dataset_train,
-            shuffle=True,
-            drop_last=True,
-        )
+        if args.balanced_language_sampling:
+            train_sampler = DistributedLanguageBalancedSampler(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=True,
+            )
+        else:
+            train_sampler = DistributedSampler(
+                dataset_train,
+                shuffle=True,
+                drop_last=True,
+            )
         val_sampler = DistributedSampler(
             dataset_val,
             shuffle=False,
@@ -683,13 +699,28 @@ def main():
             **dataloader_kwargs,
         )
     else:
-        train_sampler = None
-        data_loader_train = DataLoader(
-            dataset_train,
-            batch_size=args.batch_size,
-            shuffle=True,
-            **dataloader_kwargs,
-        )
+        if args.balanced_language_sampling:
+            train_sampler = DistributedLanguageBalancedSampler(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=True,
+                drop_last=False,
+            )
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=False,
+                sampler=train_sampler,
+                **dataloader_kwargs,
+            )
+        else:
+            train_sampler = None
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size=args.batch_size,
+                shuffle=True,
+                **dataloader_kwargs,
+            )
         data_loader_val = DataLoader(
             dataset_val,
             batch_size=args.batch_size,
@@ -700,6 +731,25 @@ def main():
     if os.getenv("DEBUG_DATALOADER") == "1":
         debug_dataloader_schema(data_loader_train, name="train")
         debug_dataloader_schema(data_loader_val, name="val")
+
+    if is_main_process():
+        train_sampler_obj = data_loader_train.sampler
+        batch_sampler_obj = data_loader_train.batch_sampler
+        sampler_seed = getattr(train_sampler_obj, "seed", None)
+        if sampler_seed is None:
+            sampler_seed = getattr(args, "seed", None)
+        dataset_len_seen = len(train_sampler_obj) if train_sampler_obj is not None else len(dataset_train)
+        print(
+            "TRAIN_DATALOADER_DEBUG "
+            f"sampler_type={type(train_sampler_obj).__name__} "
+            f"batch_sampler_type={type(batch_sampler_obj).__name__} "
+            f"shuffle_arg=False "
+            f"uses_distributed_sampler={isinstance(train_sampler_obj, DistributedSampler)} "
+            f"batch_size={data_loader_train.batch_size} "
+            f"drop_last={getattr(batch_sampler_obj, 'drop_last', None)} "
+            f"generator_seed={sampler_seed} "
+            f"rank_dataset_len={dataset_len_seen}"
+        )
 
     # Setup model, optimizer, scheduler
     model = Seq2SeqMixerOccCANINE(
@@ -730,11 +780,19 @@ def main():
         num_training_steps=total_steps,
     )
 
+    if args.enforce_double_coverage and args.enforce_double_coverage_weight == 0.0:
+        args.enforce_double_coverage_weight = 1.0
+    if args.enforce_no_pad_inside_block and args.enforce_no_pad_inside_block_weight == 0.0:
+        args.enforce_no_pad_inside_block_weight = 1.0
+
     # Setup mixed loss
     loss_fn_seq2seq = BlockOrderInvariantLoss(
         pad_idx=PAD_IDX,
         nb_blocks=formatter.max_num_codes,
         block_size=formatter.block_size,
+        coverage_penalty_weight=args.coverage_penalty_weight,
+        enforce_double_coverage_weight=args.enforce_double_coverage_weight,
+        enforce_no_pad_inside_block_weight=args.enforce_no_pad_inside_block_weight,
     )
     loss_fn_linear = torch.nn.BCEWithLogitsLoss()
     loss_fn = LossMixer(
@@ -782,8 +840,10 @@ def main():
         distributed=distributed,
         is_main_process=is_main_process(),
         use_amp=args.use_amp,
-        disallow_pad_inside_block=args.disallow_pad_inside_block,
+        disallow_pad_inside_block=args.constrain_pad_within_block,
         disallow_zero_at_block_start=args.disallow_zero_at_block_start,
+        constrain_to_valid_pst2=args.constrain_to_valid_pst2,
+        valid_pst2_decode_mode=args.valid_pst2_decode_mode,
         min_double_steps=args.min_double_steps,
         min_double_ratio=args.min_double_ratio,
         debug_double_audit=args.debug_double_audit,
@@ -807,6 +867,9 @@ def main():
         late_phase_batch_sizes=args.late_phase_batch_sizes,
         late_phase_batch_steps=args.late_phase_batch_steps,
         late_phase_lr_mults=args.late_phase_lr_mults,
+        use_gold_num_codes_loss=args.use_gold_num_codes_loss,
+        balanced_language_sampling=args.balanced_language_sampling,
+        balanced_language_debug_batches=args.balanced_language_debug_batches,
     )
     
     # Cleanup distributed training

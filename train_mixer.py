@@ -100,6 +100,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--decoder-dim-feedforward', type=int, default=None, help='Defaults to endoder hidden dim if not specified.')
     parser.add_argument('--seq2seq-weight', type=float, default=0.5)
     parser.add_argument('--formatter', type=str, default='hisco', choices=MAP_FORMATTER.keys(), help='Target-side tokenization')
+    parser.add_argument('--use-gold-num-codes-loss', action='store_true', default=False, help='Pass gold_num_codes into the seq2seq loss during training.')
+    parser.add_argument('--coverage-penalty-weight', type=float, default=0.0, help='Extra penalty (feature flag) for PAD at required block starts when gold_num_codes>=2.')
+    parser.add_argument('--enforce-double-coverage', action='store_true', default=False, help='Penalize PAD at block2 start for gold doubles (uses decoder logits).')
+    parser.add_argument('--enforce-double-coverage-weight', type=float, default=0.0, help='Weight for enforce-double-coverage penalty (default 0; set to 1.0 when --enforce-double-coverage is set).')
+    parser.add_argument('--enforce-no-pad-inside-block', action='store_true', default=False, help='Penalize PAD probability across all block2 positions for gold doubles.')
+    parser.add_argument('--enforce-no-pad-inside-block-weight', type=float, default=0.0, help='Weight for --enforce-no-pad-inside-block penalty.')
 
     # Augmentation
     parser.add_argument('--num-transformations', type=int, default=3)
@@ -298,11 +304,19 @@ def main():
         num_training_steps=total_steps,
     )
 
+    if args.enforce_double_coverage and args.enforce_double_coverage_weight == 0.0:
+        args.enforce_double_coverage_weight = 1.0
+    if args.enforce_no_pad_inside_block and args.enforce_no_pad_inside_block_weight == 0.0:
+        args.enforce_no_pad_inside_block_weight = 1.0
+
     # Setup mixed loss
     loss_fn_seq2seq = BlockOrderInvariantLoss(
         pad_idx=PAD_IDX,
         nb_blocks=formatter.max_num_codes,
         block_size=formatter.block_size,
+        coverage_penalty_weight=args.coverage_penalty_weight,
+        enforce_double_coverage_weight=args.enforce_double_coverage_weight,
+        enforce_no_pad_inside_block_weight=args.enforce_no_pad_inside_block_weight,
     )
     loss_fn_linear = torch.nn.BCEWithLogitsLoss()
     loss_fn = LossMixer(
@@ -350,6 +364,7 @@ def main():
         log_wandb=args.log_wandb and is_main_process,
         distributed=distributed,
         is_main_process=is_main_process,
+        use_gold_num_codes_loss=args.use_gold_num_codes_loss,
     )
     
     # Cleanup distributed training

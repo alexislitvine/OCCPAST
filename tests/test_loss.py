@@ -307,6 +307,85 @@ class TestBlockOrderInvariantLoss(unittest.TestCase):
         # have non-zero loss due to push-to-pad mechanism
         self.assertAlmostEqual(full_loss.item(), 0) # pylint: disable=W0212
 
+    def test_coverage_penalty_increases_for_missing_block2(self):
+        formatter = hisco_blocky5()
+        loss = BlockOrderInvariantLoss(
+            pad_idx=PAD_IDX,
+            nb_blocks=formatter.max_num_codes,
+            block_size=5,
+            coverage_penalty_weight=1.0,
+        )
+        target = torch.tensor([
+            [
+                BOS_IDX,
+                10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19,
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                EOS_IDX,
+            ],
+            [
+                BOS_IDX,
+                7, 7, 7, 7, 7,
+                8, 8, 8, 8, 8,
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                EOS_IDX,
+            ],
+        ], dtype=torch.long)
+        gold_num_codes = torch.tensor([2, 2], dtype=torch.long)
+        perfect_pred = _gen_perfect_pred(
+            target,
+            vocab_size=max(formatter.map_idx_char) + 1,
+        )
+        block1_only_pred = perfect_pred.clone()
+        block2_start = loss.block_size
+        block2_end = block2_start + loss.block_size
+        block1_only_pred[:, block2_start:block2_end, :] = 0
+        block1_only_pred[:, block2_start:block2_end, PAD_IDX] = 1000
+
+        loss_full = loss(perfect_pred, target, gold_num_codes=gold_num_codes)
+        loss_block1_only = loss(block1_only_pred, target, gold_num_codes=gold_num_codes)
+
+        self.assertGreater(loss_block1_only.item(), loss_full.item())
+
+    def test_enforce_double_coverage_penalty(self):
+        formatter = hisco_blocky5()
+        loss = BlockOrderInvariantLoss(
+            pad_idx=PAD_IDX,
+            nb_blocks=formatter.max_num_codes,
+            block_size=5,
+            enforce_double_coverage_weight=1.0,
+        )
+        target = torch.tensor([
+            [
+                BOS_IDX,
+                10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19,
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                *([PAD_IDX] * 5),
+                EOS_IDX,
+            ],
+        ], dtype=torch.long)
+        gold_num_codes = torch.tensor([2], dtype=torch.long)
+        perfect_pred = _gen_perfect_pred(
+            target,
+            vocab_size=max(formatter.map_idx_char) + 1,
+        )
+        block2_start = loss.block_size
+        block2_end = block2_start + loss.block_size
+        block1_only_pred = perfect_pred.clone()
+        block1_only_pred[:, block2_start:block2_end, :] = 0
+        block1_only_pred[:, block2_start:block2_end, PAD_IDX] = 1000
+
+        loss_full = loss(perfect_pred, target, gold_num_codes=gold_num_codes)
+        loss_block1_only = loss(block1_only_pred, target, gold_num_codes=gold_num_codes)
+
+        self.assertGreater(loss_block1_only.item(), loss_full.item())
+
 
 if __name__ == '__main__':
     unittest.main()

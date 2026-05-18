@@ -26,6 +26,10 @@ from .utils.masking import generate_square_subsequent_mask
 from .model_assets import Seq2SeqMixerOccCANINE
 from .loss import LossMixer
 from .utils.decoder import mixer_greedy_decode
+from .target_cleaning import clean_target_value
+
+
+_LOSS_DIAGNOSTICS_RAN = False
 
 
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
@@ -118,6 +122,294 @@ def collate_sampled_items(
             continue
         stacked_batch[key] = values
     return stacked_batch
+
+
+def _log_loss_debug(
+        *,
+        debug_info: dict | None,
+        gold_num_codes: torch.Tensor,
+        step: int,
+        prefix: str = "LOSS_DEBUG",
+        extra_metrics: dict | None = None,
+        ) -> None:
+    if debug_info is None:
+        return
+
+    def _masked_mean(values: torch.Tensor | None, mask: torch.Tensor) -> float:
+        if values is None:
+            return float("nan")
+        if not mask.any():
+            return float("nan")
+        masked = values[mask]
+        if masked.numel() == 0:
+            return 0.0
+        return float(masked.mean().item())
+
+    def _masked_pctl(values: torch.Tensor | None, mask: torch.Tensor, q: float) -> float:
+        if values is None:
+            return float("nan")
+        if mask.dtype is not torch.bool:
+            mask = mask.bool()
+        if not mask.any():
+            return float("nan")
+        masked = values[mask]
+        if masked.numel() == 0:
+            return float("nan")
+        masked = masked.float()
+        masked = masked[torch.isfinite(masked)]
+        if masked.numel() == 0:
+            return float("nan")
+        return float(torch.quantile(masked, q).item())
+
+    gold_num_codes = gold_num_codes.detach().cpu()
+    singles = gold_num_codes == 1
+    doubles = gold_num_codes >= 2
+
+    order_per_sample = debug_info.get("order_invariant_per_sample")
+    push_per_sample = debug_info.get("push_to_pad_per_sample")
+    gate_per_sample = debug_info.get("gate_loss_per_sample")
+    coverage_per_sample = debug_info.get("coverage_loss_per_sample")
+    double_coverage_per_sample = debug_info.get("double_coverage_loss_per_sample")
+    if order_per_sample is not None:
+        order_per_sample = order_per_sample.detach().cpu()
+    if push_per_sample is not None:
+        push_per_sample = push_per_sample.detach().cpu()
+    if gate_per_sample is not None:
+        gate_per_sample = gate_per_sample.detach().cpu()
+    if coverage_per_sample is not None:
+        coverage_per_sample = coverage_per_sample.detach().cpu()
+    if double_coverage_per_sample is not None:
+        double_coverage_per_sample = double_coverage_per_sample.detach().cpu()
+
+    if gate_per_sample is not None and gate_per_sample.shape[0] != gold_num_codes.shape[0]:
+        tqdm.write(
+            f"{prefix} step={step} gate_loss_per_sample_shape_mismatch "
+            f"gate_shape={tuple(gate_per_sample.shape)} gold_shape={tuple(gold_num_codes.shape)}"
+        )
+
+    msg = (
+        f"{prefix} step={step} "
+        f"order_mean_s={_masked_mean(order_per_sample, singles):.4f} "
+        f"order_mean_d={_masked_mean(order_per_sample, doubles):.4f} "
+        f"push_mean_s={_masked_mean(push_per_sample, singles):.4f} "
+        f"push_mean_d={_masked_mean(push_per_sample, doubles):.4f} "
+        f"gate_mean_s={_masked_mean(gate_per_sample, singles):.4f} "
+        f"gate_mean_d={_masked_mean(gate_per_sample, doubles):.4f} "
+        f"coverage_mean_s={_masked_mean(coverage_per_sample, singles):.4f} "
+        f"coverage_mean_d={_masked_mean(coverage_per_sample, doubles):.4f} "
+        f"double_cov_mean_d={_masked_mean(double_coverage_per_sample, doubles):.4f}"
+    )
+    msg += (
+        f" order_p90_s={_masked_pctl(order_per_sample, singles, 0.9):.4f} "
+        f"order_p90_d={_masked_pctl(order_per_sample, doubles, 0.9):.4f} "
+        f"gate_p90_d={_masked_pctl(gate_per_sample, doubles, 0.9):.4f} "
+        f"coverage_p90_d={_masked_pctl(coverage_per_sample, doubles, 0.9):.4f} "
+        f"double_cov_p90_d={_masked_pctl(double_coverage_per_sample, doubles, 0.9):.4f}"
+    )
+
+    best_idx = debug_info.get("matching_best_idx")
+    best_loss = debug_info.get("matching_best_loss")
+    valid_blocks = debug_info.get("matching_valid_blocks")
+    if best_idx is not None and valid_blocks is not None:
+        best_idx = best_idx.detach().cpu()
+        valid_blocks = valid_blocks.detach().cpu()
+        if best_loss is not None:
+            best_loss = best_loss.detach().cpu()
+
+        block2_valid = doubles & valid_blocks[:, 1]
+        if block2_valid.any():
+            block2_assign = best_idx[block2_valid, 1]
+            block2_to_block1 = float((block2_assign == 0).float().mean().item())
+            block2_to_block2 = float((block2_assign == 1).float().mean().item())
+            block2_best_loss = float(best_loss[block2_valid, 1].mean().item()) if best_loss is not None else float("nan")
+            msg += (
+                f" block2_assign_to1={block2_to_block1:.3f}"
+                f" block2_assign_to2={block2_to_block2:.3f}"
+                f" block2_best_loss={block2_best_loss:.4f}"
+            )
+
+    if extra_metrics:
+        extra_str = " ".join(f"{key}={value}" for key, value in extra_metrics.items())
+        msg += f" {extra_str}"
+
+    tqdm.write(msg)
+
+
+def _run_loss_controlled_experiment(
+        *,
+        loss_fn_seq2seq: nn.Module,
+        out_seq2seq: torch.Tensor,
+        targets_seq2seq: torch.Tensor,
+        gold_num_codes: torch.Tensor,
+        output_path: str,
+        ) -> None:
+    global _LOSS_DIAGNOSTICS_RAN
+    if _LOSS_DIAGNOSTICS_RAN:
+        return
+    _LOSS_DIAGNOSTICS_RAN = True
+
+    device = out_seq2seq.device
+    batch_size = out_seq2seq.size(0)
+    vocab_size = out_seq2seq.size(-1)
+    seq_len = out_seq2seq.size(1)
+    block_size = loss_fn_seq2seq.block_size
+    block2_start = block_size
+    block2_end = block2_start + block_size
+
+    def _one_hot_logits(tokens: torch.Tensor, high: float = 30.0, low: float = -30.0) -> torch.Tensor:
+        logits = torch.full((tokens.size(0), tokens.size(1), vocab_size), low, device=device)
+        logits.scatter_(2, tokens.unsqueeze(-1), high)
+        pad_logits = torch.full((tokens.size(0), 1, vocab_size), low, device=device)
+        pad_logits[:, 0, PAD_IDX] = high
+        return torch.cat([logits, pad_logits], dim=1)
+
+    tokens = targets_seq2seq[:, 1:-1]
+    tokens_only_block1 = tokens.clone()
+    tokens_only_block1[:, block2_start:block2_end] = PAD_IDX
+
+    fixed_logits = out_seq2seq.detach()
+    logits_full = _one_hot_logits(tokens)
+    logits_block1_only = _one_hot_logits(tokens_only_block1)
+
+    prev_debug = getattr(loss_fn_seq2seq, "debug", False)
+    loss_fn_seq2seq.debug = True
+
+    loss_fixed_with_gold = loss_fn_seq2seq(fixed_logits, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_fixed_with_gold = loss_fn_seq2seq.last_debug
+    loss_fixed_without_gold = loss_fn_seq2seq(fixed_logits, targets_seq2seq, gold_num_codes=None)
+    debug_fixed_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_full_with_gold = loss_fn_seq2seq(logits_full, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_full_with_gold = loss_fn_seq2seq.last_debug
+    loss_full_without_gold = loss_fn_seq2seq(logits_full, targets_seq2seq, gold_num_codes=None)
+    debug_full_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_block1_with_gold = loss_fn_seq2seq(logits_block1_only, targets_seq2seq, gold_num_codes=gold_num_codes)
+    debug_block1_with_gold = loss_fn_seq2seq.last_debug
+    loss_block1_without_gold = loss_fn_seq2seq(logits_block1_only, targets_seq2seq, gold_num_codes=None)
+    debug_block1_without_gold = loss_fn_seq2seq.last_debug
+
+    loss_fn_seq2seq.debug = prev_debug
+
+    def _fmt_loss(value: torch.Tensor) -> str:
+        return f"{value.item():.6f}"
+
+    def _debug_summary(debug: dict | None) -> dict:
+        if debug is None:
+            return {}
+        return {
+            "order_invariant": float(debug["order_invariant_loss"].item()),
+            "push_to_pad": float(debug["push_to_pad_loss"].item()),
+            "gate": float(debug["gate_loss"].item()) if debug.get("gate_loss") is not None else 0.0,
+            "coverage": float(debug["coverage_loss"].item()) if debug.get("coverage_loss") is not None else 0.0,
+            "double_coverage": float(debug["double_coverage_loss"].item()) if debug.get("double_coverage_loss") is not None else 0.0,
+        }
+
+    report = [
+        "# Loss Controlled Experiment",
+        "",
+        f"- Batch size: {batch_size}",
+        f"- Seq len (no BOS/EOS): {seq_len}",
+        f"- Gold num codes distribution: {gold_num_codes.detach().cpu().tolist()}",
+        "",
+        "## Fixed model outputs (detached logits)",
+        "",
+        "| Setting | Total loss | Order-invariant | Push-to-pad | Gate | Coverage | Double-coverage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    for label, loss_value, debug in [
+        ("gold_num_codes", loss_fixed_with_gold, debug_fixed_with_gold),
+        ("no_gold_num_codes", loss_fixed_without_gold, debug_fixed_without_gold),
+    ]:
+        summary = _debug_summary(debug)
+        report.append(
+            f"| {label} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
+            f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
+            f"{summary.get('coverage', float('nan')):.6f} | {summary.get('double_coverage', float('nan')):.6f} |"
+        )
+
+    report.extend(
+        [
+            "",
+            "## Crafted predictions",
+            "",
+            "| Prediction | gold_num_codes | Total loss | Order-invariant | Push-to-pad | Gate | Coverage | Double-coverage |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+
+    crafted_rows = [
+        ("both_blocks_correct", "gold_num_codes", loss_full_with_gold, debug_full_with_gold),
+        ("both_blocks_correct", "no_gold_num_codes", loss_full_without_gold, debug_full_without_gold),
+        ("block1_only_pad_block2", "gold_num_codes", loss_block1_with_gold, debug_block1_with_gold),
+        ("block1_only_pad_block2", "no_gold_num_codes", loss_block1_without_gold, debug_block1_without_gold),
+    ]
+    for label, setting, loss_value, debug in crafted_rows:
+        summary = _debug_summary(debug)
+        report.append(
+            f"| {label} | {setting} | {_fmt_loss(loss_value)} | {summary.get('order_invariant', float('nan')):.6f} | "
+            f"{summary.get('push_to_pad', float('nan')):.6f} | {summary.get('gate', float('nan')):.6f} | "
+            f"{summary.get('coverage', float('nan')):.6f} | {summary.get('double_coverage', float('nan')):.6f} |"
+        )
+
+    report_text = "\n".join(report) + "\n"
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write(report_text)
+
+
+def _run_loss_nan_audit(
+        *,
+        debug_info: dict | None,
+        gold_num_codes: torch.Tensor,
+        step: int,
+        prefix: str = "LOSS_NAN_AUDIT",
+        ) -> None:
+    if debug_info is None:
+        return
+    gold_num_codes = gold_num_codes.detach().cpu()
+    singles = gold_num_codes == 1
+    doubles = gold_num_codes >= 2
+
+    def _count(mask: torch.Tensor) -> int:
+        return int(mask.sum().item())
+
+    def _finite_stats(values: torch.Tensor | None) -> tuple[int, int]:
+        if values is None:
+            return 0, 0
+        values = values.detach()
+        return int(values.numel()), int(torch.isfinite(values).sum().item())
+
+    gate_per_sample = debug_info.get("gate_loss_per_sample")
+    coverage_per_sample = debug_info.get("coverage_loss_per_sample")
+
+    gate_numel, gate_finite = _finite_stats(gate_per_sample)
+    cov_numel, cov_finite = _finite_stats(coverage_per_sample)
+    gate_pos_count = _count(doubles)
+    gate_neg_count = _count(singles)
+    gate_nonfinite_s = 0
+    gate_nonfinite_d = 0
+    cov_nonfinite_s = 0
+    cov_nonfinite_d = 0
+    if gate_per_sample is not None:
+        gate_vals = gate_per_sample.detach().cpu()
+        gate_nonfinite_s = int((~torch.isfinite(gate_vals[singles])).sum().item()) if singles.any() else 0
+        gate_nonfinite_d = int((~torch.isfinite(gate_vals[doubles])).sum().item()) if doubles.any() else 0
+    if coverage_per_sample is not None:
+        cov_vals = coverage_per_sample.detach().cpu()
+        cov_nonfinite_s = int((~torch.isfinite(cov_vals[singles])).sum().item()) if singles.any() else 0
+        cov_nonfinite_d = int((~torch.isfinite(cov_vals[doubles])).sum().item()) if doubles.any() else 0
+
+    msg = (
+        f"{prefix} step={step} "
+        f"gold_counts_s={_count(singles)} gold_counts_d={_count(doubles)} "
+        f"gate_pos_count={gate_pos_count} gate_neg_count={gate_neg_count} "
+        f"gate_numel={gate_numel} gate_finite={gate_finite} "
+        f"gate_nonfinite_s={gate_nonfinite_s} gate_nonfinite_d={gate_nonfinite_d} "
+        f"coverage_numel={cov_numel} coverage_finite={cov_finite} "
+        f"coverage_nonfinite_s={cov_nonfinite_s} coverage_nonfinite_d={cov_nonfinite_d}"
+    )
+    tqdm.write(msg)
 
 
 def _is_gate_stable(late_phase_state: dict) -> bool:
@@ -344,6 +636,8 @@ def _apply_batch_transition(
     # Instead, we modify the batch_sampler's batch_size if available
     if hasattr(data_loader, "batch_sampler") and hasattr(data_loader.batch_sampler, "batch_size"):
         data_loader.batch_sampler.batch_size = per_rank_batch
+    if hasattr(data_loader, "sampler") and hasattr(data_loader.sampler, "batch_size"):
+        data_loader.sampler.batch_size = per_rank_batch
 
     late_phase_state["batch_size"] = per_rank_batch
     schedule["next_index"] += 1
@@ -403,6 +697,8 @@ def train_one_epoch(
         scaler: GradScaler | None = None,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = "trie",
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
         debug_double_audit: bool = False,
@@ -411,6 +707,10 @@ def train_one_epoch(
         debug_double_assert_min_ratio: float | None = None,
         debug_double_audit_info: dict | None = None,
         late_phase_state: dict | None = None,
+        use_gold_num_codes_loss: bool = False,
+        loss_debug_every: int = 0,
+        balanced_language_sampling: bool = False,
+        balanced_language_debug_batches: int = 0,
         ) -> int:
     model = model.train()
 
@@ -433,8 +733,41 @@ def train_one_epoch(
     
     # Use tqdm progress bar only on rank 0
     iterator = tqdm(data_loader, disable=not is_main_process, ncols=100, desc=f"Epoch {epoch}")
+    balanced_lang_batch_props: list[float] = []
 
     for batch_idx, batch in enumerate(iterator):
+        if (
+            balanced_language_sampling
+            and is_main_process
+            and balanced_language_debug_batches > 0
+            and batch_idx < balanced_language_debug_batches
+            and "lang" in batch
+        ):
+            lang_values = [str(x) for x in batch['lang']]
+            lang_counts = dict(Counter(lang_values))
+            batch_size = len(lang_values)
+            if lang_counts:
+                balanced_lang_batch_props.extend([count / batch_size for count in lang_counts.values()])
+            tqdm.write(
+                "BALANCED_LANG_DEBUG "
+                f"epoch={epoch} batch={batch_idx} "
+                f"lang_counts_in_batch={lang_counts}"
+            )
+            if batch_size == 512 and len(lang_counts) == 6:
+                bad = {lang: c for lang, c in lang_counts.items() if c < 70 or c > 100}
+                if bad:
+                    raise RuntimeError(
+                        "BALANCED_LANG_ASSERT failed for batch_size=512/num_langs=6: "
+                        f"out_of_range={bad} full_counts={lang_counts}"
+                    )
+            if batch_idx + 1 == balanced_language_debug_batches and balanced_lang_batch_props:
+                tqdm.write(
+                    "BALANCED_LANG_DEBUG_SUMMARY "
+                    f"epoch={epoch} batches={balanced_language_debug_batches} "
+                    f"lang_prop_mean={statistics.fmean(balanced_lang_batch_props):.4f} "
+                    f"lang_prop_median={statistics.median(balanced_lang_batch_props):.4f}"
+                )
+
         # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
             _apply_late_phase_switch(
@@ -568,6 +901,7 @@ def train_one_epoch(
                     out_linear=out_linear,
                     target_seq2seq=targets_seq2seq,
                     target_linear=targets_linear,
+                    gold_num_codes=gold_num_codes if use_gold_num_codes_loss else None,
                     )
         else:
             out_seq2seq, out_linear = model(
@@ -583,8 +917,56 @@ def train_one_epoch(
                 out_linear=out_linear,
                 target_seq2seq=targets_seq2seq,
                 target_linear=targets_linear,
+                gold_num_codes=gold_num_codes if use_gold_num_codes_loss else None,
                 )
         losses.update(loss.item(), out_seq2seq.size(0))
+        if loss_debug_every > 0 and is_main_process and current_step % loss_debug_every == 0:
+            debug_info = loss_fn.loss_fn_seq2seq.last_debug
+            block2_start = loss_fn.loss_fn_seq2seq.block_size
+            doubles_mask = gold_num_codes >= 2
+            pred_tokens = out_seq2seq.argmax(dim=-1)
+            block2_tokens = pred_tokens[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size]
+            pred_has2 = (block2_tokens != PAD_IDX).any(dim=1)
+            pad_inside_block_mask = (block2_tokens[:, 1:] == PAD_IDX).any(dim=1)
+            if doubles_mask.any():
+                block2_nonpad_rate = float(pred_has2[doubles_mask].float().mean().item())
+                pad_probs = torch.softmax(out_seq2seq[:, block2_start, :], dim=-1)[:, PAD_IDX]
+                pad_start_prob = float(pad_probs[doubles_mask].mean().item())
+                pad_probs_block2 = torch.softmax(out_seq2seq[:, block2_start:block2_start + loss_fn.loss_fn_seq2seq.block_size, :], dim=-1)[..., PAD_IDX]
+                p_pad_block2_mean_d = float(pad_probs_block2[doubles_mask].mean().item())
+                pad_inside_pred_has2 = float(pad_inside_block_mask[pred_has2].float().mean().item()) if pred_has2.any() else float("nan")
+                pad_inside_gold_has2 = float(pad_inside_block_mask[doubles_mask].float().mean().item())
+            else:
+                block2_nonpad_rate = float("nan")
+                pad_start_prob = float("nan")
+                p_pad_block2_mean_d = float("nan")
+                pad_inside_pred_has2 = float("nan")
+                pad_inside_gold_has2 = float("nan")
+
+            gate_target_pos = 1 + block2_start
+            gate_target = targets_seq2seq[:, gate_target_pos]
+            gate_target_pad_d = int(((gate_target == PAD_IDX) & doubles_mask).sum().item())
+            gate_target_nonpad_d = int(((gate_target != PAD_IDX) & doubles_mask).sum().item())
+
+            _log_loss_debug(
+                debug_info=debug_info,
+                gold_num_codes=gold_num_codes,
+                step=current_step,
+                extra_metrics={
+                    "block2_nonpad_rate_d": f"{block2_nonpad_rate:.3f}",
+                    "p_pad_block2_start_d": f"{pad_start_prob:.3f}",
+                    "p_pad_block2_mean_d": f"{p_pad_block2_mean_d:.3f}",
+                    "pad_inside_block|pred_has2": f"{pad_inside_pred_has2:.3f}",
+                    "pad_inside_block|gold_has2": f"{pad_inside_gold_has2:.3f}",
+                    "gate_target_pad_d": gate_target_pad_d,
+                    "gate_target_nonpad_d": gate_target_nonpad_d,
+                },
+            )
+            _run_loss_nan_audit(
+                debug_info=debug_info,
+                gold_num_codes=gold_num_codes,
+                step=current_step,
+            )
 
         # Backward pass & step with optional AMP
         if accum_counter == 0:
@@ -716,7 +1098,11 @@ def train_one_epoch(
                     if is_main_process:
                         tqdm.write('\n' + '='*80)
                         tqdm.write('Starting evaluation pass...')
-                    compute_gating_metrics = late_phase_state is not None and is_main_process
+                    compute_gating_metrics = (
+                        late_phase_state is not None
+                        and late_phase_state.get("gate_switch_enabled", False)
+                        and is_main_process
+                    )
                     eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                         model=model,
                         data_loader=data_loader_eval,
@@ -724,6 +1110,8 @@ def train_one_epoch(
                         device=device,
                         disallow_pad_inside_block=disallow_pad_inside_block,
                         disallow_zero_at_block_start=disallow_zero_at_block_start,
+                        constrain_to_valid_pst2=constrain_to_valid_pst2,
+                        valid_pst2_decode_mode=valid_pst2_decode_mode,
                         compute_gating_metrics=compute_gating_metrics,
                         require_gold_num_codes=compute_gating_metrics,
                         run_probe=False,
@@ -768,7 +1156,11 @@ def train_one_epoch(
                             )
 
                         gating_summary = gating_metrics or {}
-                        if late_phase_state is not None and gating_summary:
+                        if (
+                            late_phase_state is not None
+                            and late_phase_state.get("gate_switch_enabled", False)
+                            and gating_summary
+                        ):
                             gate_metric = late_phase_state["gate_stabilize_metric"]
                             if gate_metric in gating_summary:
                                 history = late_phase_state["gate_metric_history"]
@@ -858,7 +1250,13 @@ def train_one_epoch(
                 raise RuntimeError("Eval/probe failed on rank0; aborting on all ranks.")
 
             switch_tensor = torch.tensor(
-                1 if late_phase_state is not None and late_phase_state["pending_switch"] else 0,
+                1
+                if (
+                    late_phase_state is not None
+                    and late_phase_state.get("gate_switch_enabled", False)
+                    and late_phase_state["pending_switch"]
+                )
+                else 0,
                 device=device,
             )
             ddp_broadcast(switch_tensor, "switch_flag", current_step, device)
@@ -867,7 +1265,10 @@ def train_one_epoch(
         elif is_eval_step and is_main_process:
             tqdm.write('\n' + '='*80)
             tqdm.write('Starting evaluation pass...')
-            compute_gating_metrics = late_phase_state is not None
+            compute_gating_metrics = (
+                late_phase_state is not None
+                and late_phase_state.get("gate_switch_enabled", False)
+            )
             eval_loss, eval_loss_linear, eval_loss_seq2seq, eval_seq_acc, eval_token_acc, eval_flat_acc, gating_metrics, lang_metrics = evaluate(
                 model=model,
                 data_loader=data_loader_eval,
@@ -875,6 +1276,8 @@ def train_one_epoch(
                 device=device,
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
+                constrain_to_valid_pst2=constrain_to_valid_pst2,
+                valid_pst2_decode_mode=valid_pst2_decode_mode,
                 compute_gating_metrics=compute_gating_metrics,
                 require_gold_num_codes=compute_gating_metrics,
                 run_probe=True,
@@ -918,7 +1321,11 @@ def train_one_epoch(
                 )
 
             gating_summary = gating_metrics or {}
-            if late_phase_state is not None and gating_summary:
+            if (
+                late_phase_state is not None
+                and late_phase_state.get("gate_switch_enabled", False)
+                and gating_summary
+            ):
                 gate_metric = late_phase_state["gate_stabilize_metric"]
                 if gate_metric in gating_summary:
                     history = late_phase_state["gate_metric_history"]
@@ -1008,6 +1415,8 @@ def evaluate(
         log_interval: int = 100,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
         require_gold_num_codes: bool = False,
         compute_gating_metrics: bool = False,
         run_probe: bool = True,
@@ -1024,8 +1433,26 @@ def evaluate(
     gating_fp = 0
     gating_fn = 0
     gating_tn = 0
+    gate_lang_confusion: dict[str, dict[str, int]] = {}
+    gate_gold1_fp = 0
+    gate_gold1_total = 0
+    gate_gold2_tp = 0
+    gate_gold2_total = 0
+    block2_nonpad_rate = Averager()
+    block2_pad_start_rate = Averager()
     formatter = getattr(data_loader.dataset, "formatter", None)
-    
+    valid_block_token_ids = _build_valid_block_token_ids_from_dataset(data_loader.dataset) if constrain_to_valid_pst2 and valid_pst2_decode_mode == 'trie' else None
+
+    if hasattr(data_loader.dataset, "frame") and "pst2_2" in data_loader.dataset.frame.columns:
+        first_batch_size = getattr(data_loader, "batch_size", 32) or 32
+        raw_vals = data_loader.dataset.frame["pst2_2"].head(first_batch_size)
+        cleaned_vals = raw_vals.map(clean_target_value)
+        raw_counts = Counter("none" if v is None else ("float_nan" if isinstance(v, float) else "str") for v in raw_vals.tolist())
+        cleaned_counts = Counter("none" if v is None else "str" for v in cleaned_vals.tolist())
+        tqdm.write(f"  Eval PST2_2 first-batch dist raw={dict(raw_counts)} cleaned={dict(cleaned_counts)}")
+        if any(isinstance(v, str) and v.lower() == "nan" for v in cleaned_vals.tolist()):
+            raise AssertionError("cleaned pst2_2 contains literal 'nan' string")
+
     # Language-specific metrics tracking
     lang_token_accs = {}
     lang_seq_accs = {}
@@ -1078,6 +1505,47 @@ def evaluate(
         )
         seq_accs.update(seq_acc.item(), out_seq2seq.size(0))
         token_accs.update(token_acc.item(), out_seq2seq.size(0))
+
+        if os.getenv("METRIC_SANITY") == "1" and batch_idx == 0 and formatter is not None and getattr(data_loader.dataset, "map_code_label", None) is not None:
+            inv_key = data_loader.dataset.map_code_label
+            use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
+            pred_with_bos = torch.cat([
+                torch.full((out_seq2seq.size(0), 1), BOS_IDX, device=out_seq2seq.device, dtype=torch.long),
+                out_seq2seq.argmax(dim=-1),
+            ], dim=1)
+            shown = 0
+            for i in range(out_seq2seq.size(0)):
+                sacc_i, tacc_i = order_invariant_accuracy(
+                    output=out_seq2seq[i:i+1],
+                    target=targets_seq2seq[i:i+1, 1:],
+                    pad_idx=PAD_IDX,
+                    nb_blocks=loss_fn.loss_fn_seq2seq.nb_blocks,
+                    block_size=loss_fn.loss_fn_seq2seq.block_size,
+                )
+                if tacc_i.item() >= 90.0 and sacc_i.item() < 100.0:
+                    pred_blocks = _extract_normalized_blocks_from_seq(pred_with_bos[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep)
+                    gold_blocks = _extract_normalized_blocks_from_seq(targets_seq2seq[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep)
+                    tqdm.write(f"  METRIC_SANITY idx={i} token_acc={tacc_i.item():.2f} seq_acc={sacc_i.item():.2f} flat_match={Counter(pred_blocks)==Counter(gold_blocks)} pred={pred_blocks} gold={gold_blocks}")
+                    shown += 1
+                    if shown >= 5:
+                        break
+
+        if gold_num_codes is not None:
+            pred_tokens = out_seq2seq.argmax(dim=-1)
+            block2_start = loss_fn.loss_fn_seq2seq.block_size
+            block2_end = block2_start + loss_fn.loss_fn_seq2seq.block_size
+            pred_block2_tokens = pred_tokens[:, block2_start:block2_end]
+            pred_block2_nonpad = (pred_block2_tokens != PAD_IDX).any(dim=1)
+            gold_has2 = gold_num_codes >= 2
+            if gold_has2.any():
+                block2_nonpad_rate.update(pred_block2_nonpad[gold_has2].float().mean().item(), gold_has2.sum().item())
+                block2_pad_start = pred_tokens[:, block2_start] == PAD_IDX
+                block2_pad_start_rate.update(block2_pad_start[gold_has2].float().mean().item(), gold_has2.sum().item())
+
+            gate_gold1_total += int((gold_num_codes == 1).sum().item())
+            gate_gold1_fp += int((pred_block2_nonpad & (gold_num_codes == 1)).sum().item())
+            gate_gold2_total += int((gold_has2).sum().item())
+            gate_gold2_tp += int((pred_block2_nonpad & gold_has2).sum().item())
         
         # Track language-specific accuracies
         langs = batch.get('lang', None)
@@ -1101,12 +1569,45 @@ def evaluate(
                 lang_seq_accs[lang].update(sample_seq_acc.item(), 1)
                 lang_counts[lang] += 1
 
-        # Linear decoder accuracy
-        preds_linear = torch.sigmoid(out_linear) > 0.5
-        preds_linear = preds_linear.float().cpu()
+            if gold_num_codes is not None:
+                for i, lang in enumerate(langs):
+                    if lang not in gate_lang_confusion:
+                        gate_lang_confusion[lang] = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+                    gold_has2_lang = bool(gold_num_codes[i].item() >= 2)
+                    pred_has2_lang = bool(pred_block2_nonpad[i].item())
+                    if pred_has2_lang and gold_has2_lang:
+                        gate_lang_confusion[lang]["tp"] += 1
+                    elif pred_has2_lang and not gold_has2_lang:
+                        gate_lang_confusion[lang]["fp"] += 1
+                    elif (not pred_has2_lang) and gold_has2_lang:
+                        gate_lang_confusion[lang]["fn"] += 1
+                    else:
+                        gate_lang_confusion[lang]["tn"] += 1
 
-        acc_flat = accuracy_score(preds_linear, targets_linear.cpu())
-        flat_accs.update(acc_flat, preds_linear.size(0))
+        # Flat accuracy (seq2seq): first two blocks, order-invariant, normalized
+        if formatter is not None and getattr(data_loader.dataset, "map_code_label", None) is not None:
+            inv_key = data_loader.dataset.map_code_label
+            use_within_block_sep = bool(getattr(formatter, 'within_block_sep', None))
+            pred_with_bos = torch.cat(
+                [
+                    torch.full((out_seq2seq.size(0), 1), BOS_IDX, device=out_seq2seq.device, dtype=torch.long),
+                    out_seq2seq.argmax(dim=-1),
+                ],
+                dim=1,
+            )
+            acc_flat = _flat_accuracy_from_seq2seq(
+                pred_with_bos,
+                targets_seq2seq,
+                formatter,
+                inv_key,
+                use_within_block_sep,
+            )
+            flat_accs.update(acc_flat, out_seq2seq.size(0))
+        else:
+            preds_linear = torch.sigmoid(out_linear) > 0.5
+            preds_linear = preds_linear.float().cpu()
+            acc_flat = accuracy_score(preds_linear, targets_linear.cpu()) * 100.0
+            flat_accs.update(acc_flat, preds_linear.size(0))
 
         if compute_gating_metrics:
             if formatter is None:
@@ -1128,6 +1629,8 @@ def evaluate(
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
                 zero_idx=zero_idx,
+                constrain_to_valid_blocks=bool(valid_block_token_ids),
+                valid_block_token_ids=valid_block_token_ids,
             )
             preds_seq = outputs[0].cpu().numpy()
             block2_start = 1 + formatter.block_size
@@ -1138,6 +1641,18 @@ def evaluate(
             gating_fn += int((~pred_has2 & gold_has2).sum())
             gating_fp += int((pred_has2 & ~gold_has2).sum())
             gating_tn += int((~pred_has2 & ~gold_has2).sum())
+
+        if os.getenv("LOSS_DIAGNOSTICS") == "1" and gold_num_codes is not None:
+            is_main = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+            if is_main:
+                output_path = os.getenv("LOSS_DIAGNOSTICS_PATH", "loss_debug_report.md")
+                _run_loss_controlled_experiment(
+                    loss_fn_seq2seq=loss_fn.loss_fn_seq2seq,
+                    out_seq2seq=out_seq2seq,
+                    targets_seq2seq=targets_seq2seq,
+                    gold_num_codes=gold_num_codes,
+                    output_path=output_path,
+                )
 
         if batch_idx % log_interval == 0:
             tqdm.write(f'  Eval Batch {batch_idx + 1}/{len(data_loader)} | '
@@ -1155,6 +1670,8 @@ def evaluate(
             seed=42,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
         )
 
     precision = gating_tp / (gating_tp + gating_fp) if (gating_tp + gating_fp) else 0.0
@@ -1176,6 +1693,26 @@ def evaluate(
         lang_metrics[f'seq_acc_{lang}'] = lang_seq_accs[lang].avg
         lang_metrics[f'token_acc_{lang}'] = lang_token_accs[lang].avg
         lang_metrics[f'count_{lang}'] = lang_counts[lang]
+
+    if block2_nonpad_rate.count > 0:
+        lang_metrics["block2_nonpad_rate_gold2"] = block2_nonpad_rate.avg
+    if block2_pad_start_rate.count > 0:
+        lang_metrics["block2_pad_start_rate_gold2"] = block2_pad_start_rate.avg
+    if gate_gold1_total > 0:
+        lang_metrics["gate_fp_rate_gold1"] = gate_gold1_fp / gate_gold1_total
+    if gate_gold2_total > 0:
+        lang_metrics["gate_recall_gold2"] = gate_gold2_tp / gate_gold2_total
+
+    for lang, conf in sorted(gate_lang_confusion.items()):
+        tp = conf["tp"]
+        fp = conf["fp"]
+        fn = conf["fn"]
+        precision_lang = tp / (tp + fp) if (tp + fp) else 0.0
+        recall_lang = tp / (tp + fn) if (tp + fn) else 0.0
+        f1_lang = 2 * precision_lang * recall_lang / (precision_lang + recall_lang) if (precision_lang + recall_lang) else 0.0
+        lang_metrics[f"gate_precision_{lang}"] = precision_lang
+        lang_metrics[f"gate_recall_{lang}"] = recall_lang
+        lang_metrics[f"gate_f1_{lang}"] = f1_lang
 
     return losses.avg, losses_linear.avg, losses_seq2seq.avg, seq_accs.avg, token_accs.avg, flat_accs.avg, gating_metrics, lang_metrics
 
@@ -1202,12 +1739,8 @@ class _PST2ProbeRow:
 
 
 def _pst2_value_present(value: str | None) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, float):
-        return False
-    value = str(value)
-    return value.lower() not in {'', ' ', '?', 'nan', 'none', 'null'}
+    normalized = clean_target_value(value)
+    return normalized not in {None, '?'}
 
 
 def _truncate_text(value: str | None, limit: int = 120) -> str:
@@ -1392,7 +1925,11 @@ def _split_str_s2s(pred: str, sep_value: str) -> list[str] | str:
     return pred
 
 
-def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: bool) -> str:
+def _normalize_code_for_lookup(code: str | None, inv_key: dict, use_within_block_sep: bool) -> str:
+    normalized = clean_target_value(code)
+    if normalized is None:
+        return ""
+    code = normalized.replace(' ', '')
     if not use_within_block_sep:
         return code
     if code in inv_key:
@@ -1400,11 +1937,56 @@ def _normalize_code_for_lookup(code: str, inv_key: dict, use_within_block_sep: b
     parts = code.split(',')
     while len(parts) > 1 and parts[-1] == '0':
         parts = parts[:-1]
-        normalized = ','.join(parts)
-        if normalized in inv_key:
-            return normalized
+        candidate = ','.join(parts)
+        if candidate in inv_key:
+            return candidate
     return code
 
+
+
+
+def _extract_normalized_blocks_from_seq(
+        seq_tokens: np.ndarray,
+        formatter,
+        inv_key: dict,
+        use_within_block_sep: bool,
+) -> list[str]:
+    formatted = formatter.clean_pred(seq_tokens)
+    split_pred = _split_str_s2s(formatted, formatter.sep_value)
+    blocks = split_pred if isinstance(split_pred, list) else [split_pred]
+    blocks = [
+        _normalize_code_for_lookup(block, inv_key, use_within_block_sep)
+        for block in blocks[:2]
+        if _normalize_code_for_lookup(block, inv_key, use_within_block_sep) != ""
+    ]
+    return blocks
+
+
+def _flat_accuracy_from_seq2seq(
+        pred_tokens: torch.Tensor,
+        gold_tokens_with_bos: torch.Tensor,
+        formatter,
+        inv_key: dict,
+        use_within_block_sep: bool,
+) -> float:
+    """Flat accuracy over first two blocks, order-invariant after normalization.
+
+    - uses formatter.clean_pred + lookup normalization
+    - ignores block order
+    - compares only first two blocks
+    """
+    correct = 0
+    total = pred_tokens.size(0)
+    for i in range(total):
+        pred_blocks = _extract_normalized_blocks_from_seq(
+            pred_tokens[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep
+        )
+        gold_blocks = _extract_normalized_blocks_from_seq(
+            gold_tokens_with_bos[i].detach().cpu().numpy(), formatter, inv_key, use_within_block_sep
+        )
+        if Counter(pred_blocks) == Counter(gold_blocks):
+            correct += 1
+    return 100.0 * correct / max(1, total)
 
 def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -> str:
     seq_len = formatter.max_seq_len
@@ -1437,6 +2019,32 @@ def _decode_block_string(formatter, block_tokens: list[int], block_index: int) -
     return formatter.clean_pred(torch.tensor(seq).numpy())
 
 
+def _build_valid_block_token_ids_from_dataset(dataset) -> list[list[int]] | None:
+    formatter = getattr(dataset, "formatter", None)
+    inv_key = getattr(dataset, "map_code_label", None)
+    if formatter is None or not inv_key:
+        return None
+
+    valid_blocks: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for code in inv_key.keys():
+        try:
+            encoded = formatter.transform_label(str(code))
+        except Exception:
+            continue
+        if encoded is None:
+            continue
+        block = tuple(int(tok) for tok in encoded[1:1 + formatter.block_size])
+        if len(block) != formatter.block_size:
+            continue
+        if block in seen:
+            continue
+        seen.add(block)
+        valid_blocks.append(list(block))
+
+    return valid_blocks or None
+
+
 def _run_pst2_eval_probe(
         model: nn.Module,
         data_loader: torch.utils.data.DataLoader,
@@ -1445,6 +2053,8 @@ def _run_pst2_eval_probe(
         seed: int = 42,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
 ) -> None:
     strict_probe = os.getenv("STRICT_PROBE") == "1"
     try:
@@ -1456,6 +2066,8 @@ def _run_pst2_eval_probe(
             seed=seed,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
         )
     except Exception as exc:
         rank = 0
@@ -1476,6 +2088,8 @@ def _run_pst2_eval_probe_inner(
         seed: int = 42,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = 'trie',
 ) -> None:
     dataset = data_loader.dataset
     formatter = dataset.formatter
@@ -1487,7 +2101,16 @@ def _run_pst2_eval_probe_inner(
         print('PST2 eval probe skipped: dataset has no map_code_label.')
         return
 
-    has_second = dataset.frame['pst2_2'].apply(_pst2_value_present).to_numpy()
+    raw_pst2_2 = dataset.frame['pst2_2'].head(sample_size)
+    raw_stats = Counter('none' if v is None else ('float_nan' if isinstance(v, float) else 'str') for v in raw_pst2_2.tolist())
+    cleaned_pst2_2 = raw_pst2_2.map(clean_target_value)
+    cleaned_stats = Counter('none' if v is None else 'str' for v in cleaned_pst2_2.tolist())
+    print(f"  debug_pst2_2_dist raw={dict(raw_stats)} cleaned={dict(cleaned_stats)}")
+    if any(isinstance(v, str) and v.lower() == 'nan' for v in cleaned_pst2_2.tolist()):
+        raise AssertionError("cleaned pst2_2 contains literal 'nan' string")
+
+    cleaned_pst2_2_full = dataset.frame['pst2_2'].map(clean_target_value)
+    has_second = cleaned_pst2_2_full.apply(_pst2_value_present).to_numpy()
     eligible_positions = [idx for idx, flag in enumerate(has_second) if flag]
     if not eligible_positions:
         print('PST2 eval probe: no rows with pst2_2 present in eval dataset.')
@@ -1499,10 +2122,12 @@ def _run_pst2_eval_probe_inner(
 
     model_to_decode = model.module if hasattr(model, 'module') else model
     model_to_decode.eval()
+    valid_block_token_ids = _build_valid_block_token_ids_from_dataset(dataset) if constrain_to_valid_pst2 and valid_pst2_decode_mode == 'trie' else None
 
     examples_a: list[_PST2ProbeRow] = []
     examples_b: list[_PST2ProbeRow] = []
     examples_c: list[_PST2ProbeRow] = []
+    examples_d: list[_PST2ProbeRow] = []
 
     print('\n' + '=' * 80)
     print('PST2 EVAL PROBE (deterministic sample)')
@@ -1562,6 +2187,9 @@ def _run_pst2_eval_probe_inner(
         gold_has2_block2_in_key = 0
         pred_has2_block2_in_key = 0
         pred_has2_valid_count = 0
+        block1_emitted_count = 0
+        block1_emitted_in_key = 0
+        block2_emitted_in_key = 0
         block2_token_match = 0
         block2_token_total = 0
         pad_prob_bins = {i: {"count": 0, "gold_has2": 0} for i in range(5)}
@@ -1590,6 +2218,8 @@ def _run_pst2_eval_probe_inner(
                 disallow_pad_inside_block=disallow_pad_inside_block,
                 disallow_zero_at_block_start=disallow_zero_at_block_start,
                 zero_idx=zero_idx,
+                constrain_to_valid_blocks=bool(valid_block_token_ids),
+                valid_block_token_ids=valid_block_token_ids,
             )
             preds_seq = outputs[0].cpu().numpy()
 
@@ -1638,10 +2268,16 @@ def _run_pst2_eval_probe_inner(
                 pred_block2_norm = _normalize_code_for_lookup(pred_block2_raw, inv_key, use_within_block_sep)
                 pred_block1_in_key = pred_block1_norm in inv_key
                 pred_block2_in_key = pred_block2_norm in inv_key
-                gold2_raw = str(record['pst2_2'])
-                gold2_norm = _normalize_code_for_lookup(gold2_raw, inv_key, use_within_block_sep)
-                gold2_in_key = gold2_norm in inv_key
-                gold_has2 = _pst2_value_present(record['pst2_2'])
+                if any(tok != PAD_IDX for tok in block1_tokens):
+                    block1_emitted_count += 1
+                    if pred_block1_in_key:
+                        block1_emitted_in_key += 1
+                if block2_nonpad and pred_block2_in_key:
+                    block2_emitted_in_key += 1
+                gold2_raw_clean = clean_target_value(record['pst2_2'])
+                gold2_norm = _normalize_code_for_lookup(gold2_raw_clean, inv_key, use_within_block_sep)
+                gold2_in_key = gold2_norm in inv_key if gold2_norm else False
+                gold_has2 = _pst2_value_present(gold2_raw_clean)
 
                 formatted_pred = formatter.clean_pred(torch.tensor(raw_seq).numpy())
                 split_pred = _split_str_s2s(formatted_pred, formatter.sep_value)
@@ -1718,7 +2354,7 @@ def _run_pst2_eval_probe_inner(
                     index=int(dataset_idx),
                     occ1=str(record['occ1']),
                     pst2_1=str(record['pst2_1']),
-                    pst2_2=str(record['pst2_2']),
+                    pst2_2=str(clean_target_value(record['pst2_2'])),
                     gold2_norm=gold2_norm,
                     gold2_in_key=gold2_in_key,
                     pred_block1_tokens=block1_tokens,
@@ -1733,6 +2369,29 @@ def _run_pst2_eval_probe_inner(
                     split_pred=split_pred,
                     block2_nonpad=block2_nonpad,
                 )
+
+                if block2_nonpad and pred_block2_in_key and gold_has2 and gold2_in_key and pred_block2_norm != gold2_norm and len(examples_d) < 10:
+                    examples_d.append(
+                        _PST2ProbeRow(
+                            index=int(dataset_idx),
+                            occ1=_truncate_text(record.get('occ1')),
+                            pst2_1=str(record.get('pst2_1')),
+                            pst2_2=str(record.get('pst2_2')),
+                            gold2_norm=gold2_norm,
+                            gold2_in_key=gold2_in_key,
+                            pred_block1_tokens=block1_tokens,
+                            pred_block2_tokens=block2_tokens,
+                            pred_block1_raw=pred_block1_raw,
+                            pred_block2_raw=pred_block2_raw,
+                            pred_block1_norm=pred_block1_norm,
+                            pred_block2_norm=pred_block2_norm,
+                            pred_block1_in_key=pred_block1_in_key,
+                            pred_block2_in_key=pred_block2_in_key,
+                            formatted_pred=formatted_pred,
+                            split_pred=split_pred,
+                            block2_nonpad=block2_nonpad,
+                        )
+                    )
 
                 if block2_nonpad and not pred_block2_in_key and len(examples_a) < 10:
                     examples_a.append(row)
@@ -1772,8 +2431,11 @@ def _run_pst2_eval_probe_inner(
             print(f'  EM_block2 | gold_has2: {gold_has2_exact_match / gold_has2_count:.2%}')
             print(f'  token_acc_block2 | gold_has2: {block2_token_match / block2_token_total:.2%}')
             print(f'  % block2_in_key | gold_has2: {gold_has2_block2_in_key / gold_has2_count:.2%}')
+        if block1_emitted_count:
+            print(f'  % block1_in_key | block1_emitted: {block1_emitted_in_key / block1_emitted_count:.2%}')
         if pred_has2_count:
             print(f'  % block2_in_key | pred_has2: {pred_has2_block2_in_key / pred_has2_count:.2%}')
+            print(f'  % block2_in_key | block2_emitted: {block2_emitted_in_key / pred_has2_count:.2%}')
             print(f'  % block2_valid_post_sanitize | pred_has2: {pred_has2_valid_count / pred_has2_count:.2%}')
         single_total = total - gold_has2_count
         if single_total:
@@ -1825,13 +2487,14 @@ def _run_pst2_eval_probe_inner(
     _print_examples('A) block2_nonpad=True but norm2_in_key=False', examples_a)
     _print_examples('B) block2_nonpad=True, norm2_in_key=True but split_returns_1', examples_b)
     _print_examples('C) block2_nonpad=False', examples_c)
+    _print_examples('D) block2 mismatch where pred/gold are both in_key', examples_d)
     print('=' * 80 + '\n')
 
 
 def train(
         model: Seq2SeqMixerOccCANINE,
         data_loaders: dict[str, torch.utils.data.DataLoader], # TODO split or use dataclass
-        train_sampler: torch.utils.data.distributed.DistributedSampler | None = None,
+        train_sampler: torch.utils.data.Sampler | None = None,
         loss_fn: LossMixer = None,
         optimizer: torch.optim.Optimizer = None,
         device: torch.device = None,
@@ -1849,6 +2512,8 @@ def train(
         use_amp: bool = False,
         disallow_pad_inside_block: bool = False,
         disallow_zero_at_block_start: bool = False,
+        constrain_to_valid_pst2: bool = True,
+        valid_pst2_decode_mode: str = "trie",
         min_double_steps: int = 0,
         min_double_ratio: float = 0.0,
         debug_double_audit: bool = False,
@@ -1869,9 +2534,15 @@ def train(
         late_phase_batch_sizes: list[int] | None = None,
         late_phase_batch_steps: list[int] | None = None,
         late_phase_lr_mults: list[float] | None = None,
+        use_gold_num_codes_loss: bool = False,
+        balanced_language_sampling: bool = False,
+        balanced_language_debug_batches: int = 0,
         ):
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
+    loss_debug_every = int(os.getenv("LOSS_DEBUG_EVERY", "0"))
+    if loss_debug_every > 0 and loss_fn is not None:
+        loss_fn.loss_fn_seq2seq.debug = True
 
     world_size = 1
     if distributed and dist.is_available() and dist.is_initialized():
@@ -1891,12 +2562,12 @@ def train(
         is_main_process=is_main_process,
     )
 
-    enable_late_phase = (
+    gate_switch_enabled = (
         late_grad_accum > 1
         or late_lr_mult != 1.0
         or late_warmup_steps > 0
-        or batch_schedule is not None
     )
+    enable_late_phase = gate_switch_enabled or batch_schedule is not None
     late_phase_state = None
     if enable_late_phase:
         late_phase_state = {
@@ -1916,6 +2587,7 @@ def train(
             "gate_stabilize_delta": gate_stabilize_delta,
             "gate_stabilize_min": gate_stabilize_min,
             "late_switch_once": late_switch_once,
+            "gate_switch_enabled": gate_switch_enabled,
             "batch_size": batch_size,
             "world_size": world_size,
             "batch_schedule": batch_schedule,
@@ -1960,6 +2632,8 @@ def train(
             scaler=scaler,
             disallow_pad_inside_block=disallow_pad_inside_block,
             disallow_zero_at_block_start=disallow_zero_at_block_start,
+            constrain_to_valid_pst2=constrain_to_valid_pst2,
+            valid_pst2_decode_mode=valid_pst2_decode_mode,
             min_double_steps=min_double_steps,
             min_double_ratio=min_double_ratio,
             debug_double_audit=debug_double_audit,
@@ -1968,6 +2642,10 @@ def train(
             debug_double_assert_min_ratio=debug_double_assert_min_ratio,
             debug_double_audit_info=debug_double_audit_info,
             late_phase_state=late_phase_state,
+            use_gold_num_codes_loss=use_gold_num_codes_loss,
+            loss_debug_every=loss_debug_every,
+            balanced_language_sampling=balanced_language_sampling,
+            balanced_language_debug_batches=balanced_language_debug_batches,
         )
         
         # Save at the end of each epoch if the flag is set
