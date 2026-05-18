@@ -56,11 +56,35 @@ def wandb_init(
     if not os.path.exists(_dir):
         os.makedirs(_dir)
 
-    wandb.init(
-        project=project,
-        name=name,
-        dir=_dir,
-        resume=resume,
-        config=config,
-        mode=mode,
-        )
+    init_timeout = int(os.getenv("WANDB_INIT_TIMEOUT", "120"))
+    settings = wandb.Settings(init_timeout=init_timeout)
+    fallback_mode = os.getenv("WANDB_FALLBACK_MODE", "offline")
+    allow_fail = os.getenv("WANDB_ALLOW_INIT_FAIL", "0") == "1"
+
+    try:
+        wandb.init(
+            project=project,
+            name=name,
+            dir=_dir,
+            resume=resume,
+            config=config,
+            mode=mode,
+            settings=settings,
+            )
+    except wandb.errors.CommError as exc:
+        if allow_fail:
+            print(f"W&B init failed: {exc}. Continuing without W&B.")
+            return
+        if fallback_mode:
+            print(f"W&B init failed: {exc}. Falling back to mode={fallback_mode}.")
+            wandb.init(
+                project=project,
+                name=name,
+                dir=_dir,
+                resume=resume,
+                config=config,
+                mode=fallback_mode,
+                settings=settings,
+                )
+        else:
+            raise

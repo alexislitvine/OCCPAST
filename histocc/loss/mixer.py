@@ -21,8 +21,9 @@ class LossMixer(nn.Module):
             out_linear: Tensor, # [BATCH_SIZE, TOTAL_NUM_CODES]
             target_seq2seq: Tensor, # [BATCH_SIZE, BLOCK_SIZE * NB_BLOCKS + 2]
             target_linear: Tensor, # [BATCH_SIZE, TOTAL_NUM_CODES]
+            gold_num_codes: Tensor | None = None,
     ) -> Tensor:
-        loss_seq2seq = self.loss_fn_seq2seq(out_seq2seq, target_seq2seq)
+        loss_seq2seq = self.loss_fn_seq2seq(out_seq2seq, target_seq2seq, gold_num_codes=gold_num_codes)
         loss_linear = self.loss_fn_linear(out_linear, target_linear)
 
         loss = self.seq2seq_weight * loss_seq2seq + (1 - self.seq2seq_weight) * loss_linear

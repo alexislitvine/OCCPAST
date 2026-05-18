@@ -17,7 +17,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .constants import PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX
+from .constants import UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX
 
 
 def build_mapping(chars: list[int | str]) -> tuple[dict[str, int], dict[int, str]]:
@@ -83,10 +83,11 @@ def clean_code(
     cleaned = []
 
     for idx in formatted_code:
-        if idx in {PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX}:
+        idx_int = int(idx)
+        if idx_int in {UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX, SEP_IDX}:
             continue
 
-        cleaned.append(rev_mapping[idx])
+        cleaned.append(rev_mapping.get(idx_int, '<UNK>'))
 
     if within_block_sep is not None:
         join_char = within_block_sep

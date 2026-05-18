@@ -20,10 +20,13 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import get_worker_info
+from torch.utils.data._utils.collate import default_collate
 from transformers import CanineTokenizer
 
 import numpy as np
 import pandas as pd
+from .target_cleaning import get_gold_num_codes_from_values
 import seaborn as sns
 
 import matplotlib.pyplot as plt
@@ -37,6 +40,71 @@ from .formatter import (
     BlockyOCC1950Formatter,
     BlockyFormatter,
 )
+
+
+def _debug_dataloader_value(value: object, limit: int = 160) -> str:
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _debug_dataloader_schema(batch: list, *, prefix: str) -> None:
+    if not batch:
+        print(f"{prefix} empty_batch=True")
+        return
+    first = batch[0]
+    if isinstance(first, dict):
+        keys = sorted(first.keys())
+        print(f"{prefix} keys={keys}")
+        for key in keys:
+            values = [sample.get(key) for sample in batch]
+            types = {type(val).__name__ for val in values}
+            if all(torch.is_tensor(val) for val in values if val is not None):
+                shapes = [tuple(val.shape) for val in values if torch.is_tensor(val)]
+                dtypes = {str(val.dtype) for val in values if torch.is_tensor(val)}
+                print(f"{prefix} key={key} tensor dtypes={sorted(dtypes)} shapes={shapes}")
+            else:
+                print(f"{prefix} key={key} types={sorted(types)}")
+    else:
+        types = {type(item).__name__ for item in batch}
+        print(f"{prefix} types={sorted(types)}")
+
+
+def _debug_dataloader_mixed_types(batch: list, *, prefix: str) -> None:
+    if not batch or not isinstance(batch[0], dict):
+        return
+    record_indices = [sample.get("record_idx") for sample in batch]
+    for key in sorted(batch[0].keys()):
+        values = [sample.get(key) for sample in batch]
+        types = {type(val).__name__ for val in values}
+        if len(types) <= 1:
+            continue
+        print(f"{prefix} key={key} mixed_types={sorted(types)}")
+        first_type = type(values[0]).__name__
+        for idx, value in enumerate(values):
+            if type(value).__name__ != first_type:
+                record_idx = record_indices[idx]
+                print(
+                    f"{prefix} key={key} record_idx={record_idx} "
+                    f"type={type(value).__name__} value={_debug_dataloader_value(value)}"
+                )
+
+
+def debug_collate(batch: list) -> object:
+    worker_info = get_worker_info()
+    worker_id = worker_info.id if worker_info else "main"
+    prefix = f"DEBUG_DATALOADER worker={worker_id}"
+    if not getattr(debug_collate, "_logged_first", False):
+        _debug_dataloader_schema(batch, prefix=f"{prefix} BATCH_SCHEMA")
+        debug_collate._logged_first = True
+    try:
+        return default_collate(batch)
+    except Exception as exc:  # noqa: BLE001 - re-raise after logging diagnostics
+        print(f"{prefix} COLLATE_ERROR type={type(exc).__name__} msg={exc}")
+        _debug_dataloader_schema(batch, prefix=f"{prefix} BATCH_SCHEMA_ERROR")
+        _debug_dataloader_mixed_types(batch, prefix=f"{prefix} MIXED_TYPE")
+        raise
 
 
 def _read_data_file(
@@ -718,10 +786,17 @@ class OccDatasetV2InMemMultipleFiles(OccDatasetV2):
                 f,
                 usecols=['occ1', 'lang', *target_cols],
                 dtype={'lang': str, **{x: str for x in target_cols}},
-                converters={'occ1': lambda x: x}, # ensure to do not read the str 'nan' as NaN
+                converters={'occ1': lambda x: x},  # ensure to do not read the str 'nan' as NaN
+                keep_default_na=False,
+                na_values=['', 'nan', 'NaN', 'NAN', 'none', 'None', 'null', 'NULL'],
             ) for f in fnames_data
         ]
         self.frame = pd.concat(frames)
+        for col in target_cols:
+            if col in self.frame.columns:
+                self.frame[col] = self.frame[col].replace(
+                    {'nan': None, 'NaN': None, 'NAN': None, 'none': None, 'None': None, 'null': None, 'NULL': None}
+                )
 
         super().__init__(
             fname_data=fnames_data[0], # we define self.colnames in parent class by reading 1 row
@@ -974,6 +1049,9 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
 
         return target
 
+    def _get_gold_num_codes(self, record: pd.Series) -> int:
+        return get_gold_num_codes_from_values([record[col] for col in self.target_cols])
+
     def __len__(self) -> int:
         return len(self.frame)
 
@@ -982,8 +1060,14 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
 
         occ_descr: str = record.occ1
         lang: str = record.lang
+        raw_occ_descr: str = record.occ1
+        raw_lang: str = record.lang
+        raw_target_1 = record[self.target_cols[0]] if self.target_cols else None
+        raw_target_2 = record[self.target_cols[1]] if len(self.target_cols) > 1 else ""
+        serialized_target = self.formatter.sanitize(record)
         targets_seq2seq = self.formatter.transform_label(record)
         target_linear = self._get_target_linear(record)
+        gold_num_codes = self._get_gold_num_codes(record)
 
         # Optionally include description in the input during training
         if (self.include_descriptions and self.training and
@@ -1017,7 +1101,31 @@ class OccDatasetMixerInMemMultipleFiles(OccDatasetV2):
             'attention_mask': encoded_input_seq['attention_mask'].flatten(),
             'targets_seq2seq': torch.tensor(targets_seq2seq, dtype=torch.long),
             'targets_linear': torch.tensor(target_linear, dtype=torch.float),
+            'gold_num_codes': torch.tensor(gold_num_codes, dtype=torch.long),
+            'lang': lang,
         }
+
+        if getattr(self, "debug_double_audit", False):
+            def _stringify_debug(value: object) -> str:
+                if value is None:
+                    return ""
+                if isinstance(value, float) and math.isnan(value):
+                    return ""
+                return str(value)
+
+            batch_data.update(
+                {
+                    'raw_occ1': _stringify_debug(raw_occ_descr),
+                    'raw_lang': _stringify_debug(raw_lang),
+                    'raw_pst2_1': _stringify_debug(raw_target_1),
+                    'raw_pst2_2': _stringify_debug(raw_target_2),
+                    'serialized_target': _stringify_debug(serialized_target),
+                    'record_idx': item,
+                }
+            )
+
+        if os.getenv("DEBUG_DATALOADER") == "1":
+            batch_data.setdefault("record_idx", item)
 
         return batch_data
 

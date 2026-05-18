@@ -47,6 +47,7 @@ from .formatter import (
     hisco_blocky5,
     BOS_IDX,
     PAD_IDX,
+    EOS_IDX,
     construct_general_purpose_formatter,
 )
 from .utils import (
@@ -162,6 +163,10 @@ class OccCANINE:
             descriptions: pd.DataFrame | None = None,
             use_within_block_sep: bool = False, # Should be True for systems with ',' between digits
             target_cols: list[str] | None = None,
+            disallow_pad_inside_block: bool = False,
+            disallow_zero_at_block_start: bool = False,
+            constrain_to_valid_pst2: bool = True,
+            valid_pst2_decode_mode: str = "trie",
     ):
         """
         Initializes the OccCANINE model with specified configurations.
@@ -202,6 +207,10 @@ class OccCANINE:
         # System
         self.system = system
         self.use_within_block_sep = use_within_block_sep
+        self.disallow_pad_inside_block = disallow_pad_inside_block
+        self.disallow_zero_at_block_start = disallow_zero_at_block_start
+        self.constrain_to_valid_pst2 = constrain_to_valid_pst2
+        self.valid_pst2_decode_mode = valid_pst2_decode_mode
 
         if self.system == "hisco": # TODO: Handle other model specs
             # Formatter
@@ -507,6 +516,11 @@ class OccCANINE:
             deduplicate: bool = False,
             order_invariant_conf: bool = True,
             debug: bool = False,
+            disallow_pad_inside_block: bool | None = None,
+            disallow_zero_at_block_start: bool | None = None,
+            constrain_to_valid_pst2: bool | None = None,
+            valid_pst2_decode_mode: str | None = None,
+            max_num_codes: int | None = None,
     ):
         """
         Makes predictions on a batch of occupational strings.
@@ -547,6 +561,14 @@ class OccCANINE:
         """
         # Store debug flag for use in other methods
         self._debug = debug
+        if disallow_pad_inside_block is not None:
+            self.disallow_pad_inside_block = disallow_pad_inside_block
+        if disallow_zero_at_block_start is not None:
+            self.disallow_zero_at_block_start = disallow_zero_at_block_start
+        if constrain_to_valid_pst2 is not None:
+            self.constrain_to_valid_pst2 = constrain_to_valid_pst2
+        if valid_pst2_decode_mode is not None:
+            self.valid_pst2_decode_mode = valid_pst2_decode_mode
         
         # Validate prediction arguments' compatability
         prediction_type = self._validate_and_update_prediction_parameters(behavior, prediction_type)
@@ -626,7 +648,7 @@ class OccCANINE:
         if prediction_type == 'flat':
             out, out_type, inputs = self._predict_flat(data_loader, what)
         elif prediction_type == 'greedy':
-            out, out_type, inputs = self._predict_greedy(data_loader, order_invariant_conf=order_invariant_conf)
+            out, out_type, inputs = self._predict_greedy(data_loader, order_invariant_conf=order_invariant_conf, max_num_codes=max_num_codes,)
         elif prediction_type == 'full':
             out, out_type, inputs = self._predict_full(data_loader)
         elif prediction_type == 'embeddings':
@@ -776,7 +798,7 @@ class OccCANINE:
         return results, out_type, inputs
 
     @torch.no_grad()
-    def _predict_greedy(self, data_loader, order_invariant_conf):
+    def _predict_greedy(self, data_loader, order_invariant_conf, max_num_codes: int | None = None):
         model = self.model.eval()
 
         inputs = []
@@ -809,12 +831,33 @@ class OccCANINE:
         verbose = self.verbose
         total_batches = len(data_loader)
 
+        key_lookup = getattr(data_loader.dataset, "map_code_label", None)
+        if key_lookup is None:
+            key_lookup = {v: k for k, v in self.key.items()}
+        valid_block_token_ids = None
+        if self.constrain_to_valid_pst2 and self.valid_pst2_decode_mode == "trie":
+            seen = set()
+            valid_block_token_ids = []
+            for code in key_lookup.keys():
+                try:
+                    enc = data_loader.dataset.formatter.transform_label(str(code))
+                except Exception:
+                    continue
+                if enc is None:
+                    continue
+                block = tuple(int(tok) for tok in enc[1:1 + data_loader.dataset.formatter.block_size])
+                if block in seen:
+                    continue
+                seen.add(block)
+                valid_block_token_ids.append(list(block))
+
         for batch_idx, batch in enumerate(data_loader, start=1):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
 
             batch_time_data.update(time.time() - end)
 
+            decoder_max_num_codes = max_num_codes if max_num_codes is not None else data_loader.dataset.formatter.max_num_codes
             outputs = decoder(
                 model = model,
                 descr = input_ids,
@@ -822,11 +865,18 @@ class OccCANINE:
                 device = self.device,
                 max_len = data_loader.dataset.formatter.max_seq_len,
                 start_symbol = BOS_IDX,
+                pad_idx = PAD_IDX,
+                block_size = data_loader.dataset.formatter.block_size,
+                max_num_codes = decoder_max_num_codes,
+                disallow_pad_inside_block = self.disallow_pad_inside_block,
+                disallow_zero_at_block_start = self.disallow_zero_at_block_start,
+                zero_idx = data_loader.dataset.formatter.map_char_idx.get('0'),
+                constrain_to_valid_blocks = bool(valid_block_token_ids),
+                valid_block_token_ids = valid_block_token_ids,
                 )
 
             outputs_s2s = outputs[0].cpu().numpy()
             probs_s2s = outputs[1].cpu().numpy()
-
             # Compute order invariant confidence
             if order_invariant_conf:
                 # Location of multiple labels
