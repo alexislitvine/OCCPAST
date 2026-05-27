@@ -59,6 +59,15 @@ def select_csv_file(directory: Path) -> Path:
     return csv_files[choice - 1]
 
 
+def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
+    pattern = f"*_predictions_{system}_*.csv"
+    matches = list(search_dir.glob(pattern))
+    if not matches:
+        return None
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
+
+
 def main():
     # CLI flags
     parser = argparse.ArgumentParser(
@@ -130,9 +139,94 @@ def main():
         default=None,
         help="Optional direct path to a PST model .bin file. If set, skips interactive model selection.",
     )
+    parser.add_argument(
+        "--format-only",
+        action="store_true",
+        help="Skip preprocessing/inference and only format existing HISCO/PST CSV predictions into final JSON.",
+    )
+    parser.add_argument(
+        "--hisco-csv",
+        type=str,
+        default=None,
+        help="Path to an existing HISCO predictions CSV (used with --format-only).",
+    )
+    parser.add_argument(
+        "--pst-csv",
+        type=str,
+        default=None,
+        help="Path to an existing PST predictions CSV (used with --format-only).",
+    )
     args = parser.parse_args()
 
     tqdm.pandas(desc="Cleaning strings")
+
+    # Format-only flow: merge existing prediction CSVs into final JSON without inference.
+    if args.format_only:
+        if args.predict_system != "both":
+            raise ValueError("--format-only currently requires --predict-system both.")
+
+        auto_search_dir = Path(args.output_dir) if args.output_dir else (Path(args.input_dir).parent / "predicted")
+
+        hisco_out = Path(args.hisco_csv) if args.hisco_csv else None
+        pst_out = Path(args.pst_csv) if args.pst_csv else None
+
+        if hisco_out is None:
+            hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
+            if hisco_out is not None:
+                print(f"Auto-selected latest HISCO CSV: {hisco_out}")
+        if pst_out is None:
+            pst_out = _latest_prediction_csv(auto_search_dir, "pst")
+            if pst_out is not None:
+                print(f"Auto-selected latest PST CSV: {pst_out}")
+
+        if hisco_out is None:
+            raise FileNotFoundError(
+                f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
+            )
+        if pst_out is None:
+            raise FileNotFoundError(
+                f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
+            )
+
+        if not hisco_out.exists():
+            raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
+        if not pst_out.exists():
+            raise FileNotFoundError(f"PST CSV not found: {pst_out}")
+
+        lookup_path = Path(args.lookup)
+        if not lookup_path.exists():
+            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
+
+        predicted_dir = Path(args.output_dir) if args.output_dir else pst_out.parent
+        predicted_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", pst_out.stem)
+
+        print("Formatting/merging predictions…")
+        entries, stats = format_predictions(
+            hisco_csv_path=hisco_out,
+            pst2_csv_path=pst_out,
+            pst2_lookup_json_path=lookup_path,
+            csv_encoding="utf-8-sig",
+        )
+
+        if stats.duplicate_strings:
+            print("Duplicate entries found for the following strings:")
+            for s, c in stats.duplicate_strings:
+                print(f'"{s}" occurs {c} times')
+        else:
+            print("No duplicate entries found.")
+
+        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}.json"
+        write_json(combined_json, serialize_formatted_entries(entries))
+        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
+        print(
+            f"Total predictions processed: {stats.total_predictions_processed} | "
+            f"Failures: {stats.failures}"
+        )
+        print("All done ✅")
+        return
 
     if args.input:
         csv_file = Path(args.input)
@@ -303,12 +397,11 @@ def main():
         print(f"→ Saved PST   to {pst_out.name}")
 
     if args.predict_system == "both":
-        # 4) path to PST2 lookup json
-        #    prompt so you can point to the exact file you want
-        user_lookup = input(f"Path to PST2CodeDict.json [{args.lookup}]: ").strip()
-        lookup_path = Path(user_lookup) if user_lookup else Path(args.lookup)
+        lookup_path = Path(args.lookup)
         if not lookup_path.exists():
             raise FileNotFoundError(f"Lookup not found: {lookup_path}")
+        if hisco_out is None or pst_out is None:
+            raise RuntimeError("Both prediction outputs are required to format combined results.")
 
         # 5) Format & merge predictions -> combined JSON (with progress bars)
         print("Formatting/merging predictions…")
