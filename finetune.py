@@ -1,5 +1,7 @@
 import argparse
+import math
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -47,6 +49,10 @@ except ImportError:
 from train_mixer import load_states
 
 
+def _cli_arg_supplied(option: str) -> bool:
+    return any(arg == option or arg.startswith(f'{option}=') for arg in sys.argv[1:])
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -80,8 +86,11 @@ def parse_args():
     parser.add_argument('--wandb-project-name', type=str, default='histco-v2-mixer')
 
     # Data parameters
-    parser.add_argument('--num-epochs', type=int, default=5)
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--num-epochs', type=int, default=5, help='Backward-compatible epoch stop. Prefer --max-steps for step-centric training.')
+    parser.add_argument('--max-steps', type=int, default=None, help='Total optimizer update steps to train. If omitted, derived from --num-epochs and --grad-accum-steps.')
+    parser.add_argument('--per-gpu-batch-size', type=int, default=None, help='Samples per GPU/process per dataloader forward/backward pass.')
+    parser.add_argument('--batch-size', type=int, default=None, help='Deprecated alias for --per-gpu-batch-size.')
+    parser.add_argument('--grad-accum-steps', type=int, default=1, help='Micro-batches accumulated before each optimizer.step().')
     parser.add_argument('--num-workers', type=int, default=0, help='Number of workers for data loading')
     parser.add_argument('--balanced-language-sampling', action='store_true', default=False, help='Sample training batches by first sampling language uniformly, then sampling rows uniformly within that language (DDP-aware).')
     parser.add_argument('--balanced-language-debug-batches', type=int, default=5, help='Number of first batches per epoch (rank 0) to print language counts for when --balanced-language-sampling is enabled.')
@@ -144,16 +153,45 @@ def parse_args():
     parser.add_argument('--gate-stabilize-window', type=int, default=5, help='Number of eval points to check for gating stabilization.')
     parser.add_argument('--gate-stabilize-delta', type=float, default=0.02, help='Maximum allowed metric range within stabilization window.')
     parser.add_argument('--gate-stabilize-min', type=float, default=0.90, help='Minimum metric value required within stabilization window.')
-    parser.add_argument('--late-grad-accum', type=int, default=1, help='Gradient accumulation steps after gating stabilization.')
+    parser.add_argument('--late-grad-accum', type=int, default=1, help='Deprecated metric-triggered gradient accumulation steps after gating stabilization.')
     parser.add_argument('--late-lr-mult', type=float, default=1.0, help='Multiplier applied to LR when switching to late phase.')
     parser.add_argument('--late-warmup-steps', type=int, default=0, help='Warmup steps after switching to late phase.')
     parser.add_argument('--late-switch-once', action=argparse.BooleanOptionalAction, default=True, help='Only switch to late phase once when stabilization is detected.')
-    parser.add_argument('--late-phase-start-step', type=int, default=None, help='Step to begin late-phase true batch scaling (global batch sizes).')
-    parser.add_argument('--late-phase-batch-sizes', type=int, nargs='+', default=None, help='Global batch sizes for late-phase scaling (e.g., 512 1024 2048).')
-    parser.add_argument('--late-phase-batch-steps', type=int, nargs='+', default=None, help='Absolute steps for each batch-size transition (length = len(batch_sizes)-1).')
-    parser.add_argument('--late-phase-lr-mults', type=float, nargs='+', default=None, help='LR multipliers per batch-size transition (default: 0.7 per transition).')
+    parser.add_argument('--late-phase-start-step', type=int, default=None, help='Optimizer step where the first late phase starts.')
+    parser.add_argument('--late-phase-steps', type=int, nargs='+', default=None, help='Optimizer-step transition points for late phases.')
+    parser.add_argument('--late-phase-grad-accum-steps', type=int, nargs='+', default=None, help='Gradient accumulation steps for each late phase.')
+    parser.add_argument('--late-phase-batch-sizes', type=int, nargs='+', default=None, help='Deprecated: effective batch sizes for late phases. Converted to --late-phase-grad-accum-steps.')
+    parser.add_argument('--late-phase-batch-steps', type=int, nargs='+', default=None, help='Deprecated alias for --late-phase-steps.')
+    parser.add_argument('--late-phase-lr-mults', type=float, nargs='+', default=None, help='LR multiplier for each late phase (default: 1.0).')
+    parser.add_argument('--print-training-schedule-only', action='store_true', default=False, help='Resolve and print training schedule, then exit before model/training initialization.')
 
     args = parser.parse_args()
+
+    batch_size_supplied = _cli_arg_supplied('--batch-size')
+    per_gpu_batch_size_supplied = _cli_arg_supplied('--per-gpu-batch-size')
+    if batch_size_supplied and per_gpu_batch_size_supplied:
+        print(
+            'Warning: both --batch-size and --per-gpu-batch-size were supplied. '
+            'Using --per-gpu-batch-size; --batch-size is a deprecated alias.'
+        )
+    if args.per_gpu_batch_size is None:
+        args.per_gpu_batch_size = args.batch_size if args.batch_size is not None else 128
+        if batch_size_supplied:
+            print('Warning: --batch-size is deprecated; use --per-gpu-batch-size for per-device dataloader batch size.')
+    args.batch_size = args.per_gpu_batch_size
+
+    if args.per_gpu_batch_size <= 0:
+        raise ValueError('--per-gpu-batch-size must be a positive integer')
+    if args.grad_accum_steps <= 0:
+        raise ValueError('--grad-accum-steps must be a positive integer')
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError('--max-steps must be a positive integer')
+
+    if args.late_phase_batch_steps is not None:
+        print('Warning: --late-phase-batch-steps is deprecated; use --late-phase-steps.')
+        if args.late_phase_steps is not None:
+            raise ValueError('Specify only one of --late-phase-steps and deprecated --late-phase-batch-steps')
+        args.late_phase_steps = args.late_phase_batch_steps
 
     if args.language != 'unk' and args.language_col is not None:
         raise ValueError('Only specify one of --language and --language-col')
@@ -530,6 +568,189 @@ def debug_dataloader_schema(data_loader: DataLoader, *, name: str, max_batches: 
     print(f"DEBUG_DATALOADER_SCHEMA done name={name}")
 
 
+def _resolve_transition_steps(args, num_late_phases: int) -> list[int]:
+    steps = list(args.late_phase_steps) if args.late_phase_steps is not None else None
+    if args.late_phase_start_step is not None:
+        start_step = int(args.late_phase_start_step)
+        if steps is None:
+            steps = [start_step]
+        elif not steps:
+            steps = [start_step]
+        elif steps[0] != start_step:
+            if start_step < steps[0]:
+                steps = [start_step] + steps
+            else:
+                raise ValueError('--late-phase-start-step must be <= the first --late-phase-steps value')
+    if steps is None:
+        if num_late_phases == 0:
+            return []
+        raise ValueError('--late-phase-start-step or --late-phase-steps is required when configuring late phases')
+    steps = [int(step) for step in steps]
+    if len(steps) != num_late_phases:
+        raise ValueError(
+            '--late-phase-steps/--late-phase-start-step must define one transition step '
+            f'per late phase ({len(steps)} steps for {num_late_phases} late phases).'
+        )
+    if any(step <= 0 for step in steps):
+        raise ValueError('Late-phase transition steps must be positive optimizer step integers.')
+    if any(next_step <= prev_step for prev_step, next_step in zip(steps, steps[1:])):
+        raise ValueError('Late-phase transition steps must be strictly increasing optimizer steps.')
+    return steps
+
+
+def _resolve_late_phase_grad_accum_steps(args, global_micro_batch_size: int) -> list[int]:
+    if args.late_phase_grad_accum_steps is not None and args.late_phase_batch_sizes is not None:
+        raise ValueError('Specify only one of --late-phase-grad-accum-steps and deprecated --late-phase-batch-sizes')
+
+    if args.late_phase_grad_accum_steps is not None:
+        grad_accum_steps = [int(value) for value in args.late_phase_grad_accum_steps]
+    elif args.late_phase_batch_sizes is not None:
+        print(
+            'Warning: --late-phase-batch-sizes is deprecated and is now interpreted as '
+            'late-phase effective batch sizes. Use --late-phase-grad-accum-steps instead.'
+        )
+        grad_accum_steps = []
+        for effective_batch_size in args.late_phase_batch_sizes:
+            if effective_batch_size % global_micro_batch_size != 0:
+                raise ValueError(
+                    f'Cannot convert deprecated late effective batch size {effective_batch_size} '
+                    f'to grad_accum_steps because it is not divisible by '
+                    f'global_micro_batch_size={global_micro_batch_size}. '
+                    'Use --late-phase-grad-accum-steps explicitly.'
+                )
+            grad_accum_steps.append(effective_batch_size // global_micro_batch_size)
+
+        # Old schedules commonly included the current/base effective batch as the
+        # first value and transition steps for the remaining values.
+        old_steps = args.late_phase_steps
+        if grad_accum_steps and grad_accum_steps[0] == args.grad_accum_steps:
+            if old_steps is None or len(old_steps) == len(grad_accum_steps) - 1:
+                print(
+                    'Warning: dropping the first deprecated --late-phase-batch-sizes value '
+                    'because it matches the current effective batch.'
+                )
+                grad_accum_steps = grad_accum_steps[1:]
+    else:
+        grad_accum_steps = []
+
+    if any(value <= 0 for value in grad_accum_steps):
+        raise ValueError('All grad accumulation values must be positive integers.')
+    return grad_accum_steps
+
+
+def build_training_schedule(
+        *,
+        args: argparse.Namespace,
+        world_size: int,
+        micro_batches_per_epoch: int,
+) -> tuple[list[dict], int]:
+    global_micro_batch_size = args.per_gpu_batch_size * world_size
+    base_effective_batch_size = global_micro_batch_size * args.grad_accum_steps
+    base_optimizer_steps_per_epoch = math.ceil(micro_batches_per_epoch / args.grad_accum_steps)
+
+    if args.max_steps is None:
+        total_optimizer_steps = math.ceil((micro_batches_per_epoch * args.num_epochs) / args.grad_accum_steps)
+        if args.late_phase_grad_accum_steps is not None or args.late_phase_batch_sizes is not None:
+            print(
+                'Warning: --max-steps was not supplied, so total optimizer steps are derived '
+                'from --num-epochs using the initial --grad-accum-steps. Prefer --max-steps '
+                'when late-phase accumulation changes are configured.'
+            )
+    else:
+        total_optimizer_steps = args.max_steps
+
+    late_grad_accum_steps = _resolve_late_phase_grad_accum_steps(args, global_micro_batch_size)
+    transition_steps = _resolve_transition_steps(args, len(late_grad_accum_steps))
+    lr_mults = [1.0] * len(late_grad_accum_steps)
+    if args.late_phase_lr_mults is not None:
+        lr_mults = [float(value) for value in args.late_phase_lr_mults]
+        if len(lr_mults) != len(late_grad_accum_steps):
+            raise ValueError('--late-phase-lr-mults must have one value per late phase.')
+
+    phases = [
+        {
+            'phase_name': 'base',
+            'start_step': 0,
+            'end_step': transition_steps[0] if transition_steps else total_optimizer_steps,
+            'per_gpu_batch_size': args.per_gpu_batch_size,
+            'world_size': world_size,
+            'grad_accum_steps': args.grad_accum_steps,
+            'global_micro_batch_size': global_micro_batch_size,
+            'effective_batch_size': base_effective_batch_size,
+            'lr_multiplier': 1.0,
+            'optimizer_steps_per_epoch': base_optimizer_steps_per_epoch,
+        }
+    ]
+    for idx, (start_step, grad_accum, lr_mult) in enumerate(zip(transition_steps, late_grad_accum_steps, lr_mults), start=1):
+        phases.append(
+            {
+                'phase_name': f'late_{idx}',
+                'start_step': start_step,
+                'end_step': transition_steps[idx] if idx < len(transition_steps) else total_optimizer_steps,
+                'per_gpu_batch_size': args.per_gpu_batch_size,
+                'world_size': world_size,
+                'grad_accum_steps': grad_accum,
+                'global_micro_batch_size': global_micro_batch_size,
+                'effective_batch_size': global_micro_batch_size * grad_accum,
+                'lr_multiplier': lr_mult,
+                'optimizer_steps_per_epoch': math.ceil(micro_batches_per_epoch / grad_accum),
+            }
+        )
+
+    effective_batches = [phase['effective_batch_size'] for phase in phases]
+    if len(set(effective_batches)) > 1:
+        print(f'Effective batch schedule: {effective_batches}')
+
+    return phases, total_optimizer_steps
+
+
+def print_and_log_training_schedule(
+        *,
+        schedule: list[dict],
+        total_optimizer_steps: int,
+        micro_batches_per_epoch: int,
+        eval_interval: int | None,
+        save_interval: int | None,
+        train_dataset_size: int,
+        val_dataset_size: int,
+        save_path: str,
+        log_wandb: bool,
+) -> None:
+    os.makedirs(save_path, exist_ok=True)
+    schedule_df = pd.DataFrame(schedule)
+    schedule_path = os.path.join(save_path, 'training_schedule.csv')
+    schedule_df.to_csv(schedule_path, index=False)
+
+    print('\nResolved training schedule (steps are optimizer update steps):')
+    print(schedule_df.to_string(index=False))
+    print(f'Training dataset rows: {train_dataset_size:,}')
+    print(f'Validation dataset rows: {val_dataset_size:,}')
+    print(f'Total optimizer steps: {total_optimizer_steps:,}')
+    print(f'Micro-batches per epoch: {micro_batches_per_epoch:,}')
+    eval_events = list(range(eval_interval, total_optimizer_steps + 1, eval_interval)) if eval_interval else []
+    save_events = list(range(save_interval, total_optimizer_steps + 1, save_interval)) if save_interval else []
+    print(f'Eval events: every {eval_interval} optimizer steps; count={len(eval_events)}; first={eval_events[:10]}')
+    print(f'Save events: every {save_interval} optimizer steps; count={len(save_events)}; first={save_events[:10]}')
+    print(f'Training schedule written to {schedule_path}')
+
+    if log_wandb:
+        import wandb  # pylint: disable=C0415
+
+        wandb.config.update(
+            {
+                'total_optimizer_steps': total_optimizer_steps,
+                'micro_batches_per_epoch': micro_batches_per_epoch,
+                'train_dataset_size': train_dataset_size,
+                'val_dataset_size': val_dataset_size,
+                'eval_events_first_10': eval_events[:10],
+                'save_events_first_10': save_events[:10],
+                'training_schedule': schedule,
+            },
+            allow_val_change=True,
+        )
+        wandb.log({'training_schedule': wandb.Table(dataframe=schedule_df)}, step=0)
+
+
 def main():
     # Arguments
     args = parse_args()
@@ -670,7 +891,7 @@ def main():
         if args.balanced_language_sampling:
             train_sampler = DistributedLanguageBalancedSampler(
                 dataset_train,
-                batch_size=args.batch_size,
+                batch_size=args.per_gpu_batch_size,
                 shuffle=True,
                 drop_last=True,
             )
@@ -686,14 +907,14 @@ def main():
         )
         data_loader_train = DataLoader(
             dataset_train,
-            batch_size=args.batch_size,
+            batch_size=args.per_gpu_batch_size,
             shuffle=False,
             sampler=train_sampler,
             **dataloader_kwargs,
         )
         data_loader_val = DataLoader(
             dataset_val,
-            batch_size=args.batch_size,
+            batch_size=args.per_gpu_batch_size,
             shuffle=False,
             sampler=val_sampler,
             **dataloader_kwargs,
@@ -702,13 +923,13 @@ def main():
         if args.balanced_language_sampling:
             train_sampler = DistributedLanguageBalancedSampler(
                 dataset_train,
-                batch_size=args.batch_size,
+                batch_size=args.per_gpu_batch_size,
                 shuffle=True,
                 drop_last=False,
             )
             data_loader_train = DataLoader(
                 dataset_train,
-                batch_size=args.batch_size,
+                batch_size=args.per_gpu_batch_size,
                 shuffle=False,
                 sampler=train_sampler,
                 **dataloader_kwargs,
@@ -717,13 +938,13 @@ def main():
             train_sampler = None
             data_loader_train = DataLoader(
                 dataset_train,
-                batch_size=args.batch_size,
+                batch_size=args.per_gpu_batch_size,
                 shuffle=True,
                 **dataloader_kwargs,
             )
         data_loader_val = DataLoader(
             dataset_val,
-            batch_size=args.batch_size,
+            batch_size=args.per_gpu_batch_size,
             shuffle=False,
             **dataloader_kwargs,
         )
@@ -745,11 +966,35 @@ def main():
             f"batch_sampler_type={type(batch_sampler_obj).__name__} "
             f"shuffle_arg=False "
             f"uses_distributed_sampler={isinstance(train_sampler_obj, DistributedSampler)} "
-            f"batch_size={data_loader_train.batch_size} "
+            f"per_gpu_batch_size={data_loader_train.batch_size} "
             f"drop_last={getattr(batch_sampler_obj, 'drop_last', None)} "
             f"generator_seed={sampler_seed} "
             f"rank_dataset_len={dataset_len_seen}"
         )
+
+    training_schedule, total_optimizer_steps = build_training_schedule(
+        args=args,
+        world_size=world_size,
+        micro_batches_per_epoch=len(data_loader_train),
+    )
+    if is_main_process():
+        print_and_log_training_schedule(
+            schedule=training_schedule,
+            total_optimizer_steps=total_optimizer_steps,
+            micro_batches_per_epoch=len(data_loader_train),
+            eval_interval=args.eval_interval,
+            save_interval=args.save_interval,
+            train_dataset_size=len(dataset_train),
+            val_dataset_size=len(dataset_val),
+            save_path=args.save_path,
+            log_wandb=args.log_wandb,
+        )
+
+    if args.print_training_schedule_only:
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
 
     # Setup model, optimizer, scheduler
     model = Seq2SeqMixerOccCANINE(
@@ -772,7 +1017,7 @@ def main():
     else:
         optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
-    total_steps = len(data_loader_train) * args.num_epochs
+    total_steps = total_optimizer_steps
     num_warmup_steps = int(total_steps * args.warmup_pct)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -811,6 +1056,13 @@ def main():
         initial_checkpoint=args.initial_checkpoint,
         only_encoder=args.only_encoder,
     )
+    current_micro_step = current_step * args.grad_accum_steps
+    last_checkpoint_path = os.path.join(args.save_path, 'last.bin')
+    if os.path.isfile(last_checkpoint_path):
+        checkpoint_meta = torch.load(last_checkpoint_path, map_location='cpu', weights_only=False)
+        saved_micro_step = checkpoint_meta.get('global_micro_step')
+        if saved_micro_step is not None:
+            current_micro_step = int(saved_micro_step)
 
     # Save arguments (only from main process)
     if is_main_process():
@@ -833,6 +1085,7 @@ def main():
         save_dir=args.save_path,
         total_steps=total_steps,
         current_step=current_step,
+        current_micro_step=current_micro_step,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         log_wandb=args.log_wandb and is_main_process(),
@@ -862,10 +1115,13 @@ def main():
         late_lr_mult=args.late_lr_mult,
         late_warmup_steps=args.late_warmup_steps,
         late_switch_once=args.late_switch_once,
-        batch_size=args.batch_size,
+        grad_accum_steps=args.grad_accum_steps,
+        per_gpu_batch_size=args.per_gpu_batch_size,
+        training_schedule=training_schedule,
+        batch_size=args.per_gpu_batch_size,
         late_phase_start_step=args.late_phase_start_step,
         late_phase_batch_sizes=args.late_phase_batch_sizes,
-        late_phase_batch_steps=args.late_phase_batch_steps,
+        late_phase_batch_steps=args.late_phase_steps,
         late_phase_lr_mults=args.late_phase_lr_mults,
         use_gold_num_codes_loss=args.use_gold_num_codes_loss,
         balanced_language_sampling=args.balanced_language_sampling,

@@ -1,4 +1,5 @@
 import os
+import signal
 import time
 import statistics
 import random
@@ -30,6 +31,38 @@ from .target_cleaning import clean_target_value
 
 
 _LOSS_DIAGNOSTICS_RAN = False
+_REQUESTED_STOP_SIGNAL: str | None = None
+
+
+def _request_stop(signum, _frame) -> None:
+    global _REQUESTED_STOP_SIGNAL
+    try:
+        _REQUESTED_STOP_SIGNAL = signal.Signals(signum).name
+    except ValueError:
+        _REQUESTED_STOP_SIGNAL = str(signum)
+
+
+def _install_signal_handlers() -> None:
+    for signame in ("SIGUSR1", "SIGTERM"):
+        signum = getattr(signal, signame, None)
+        if signum is not None:
+            signal.signal(signum, _request_stop)
+
+
+def _stop_requested() -> bool:
+    return _REQUESTED_STOP_SIGNAL is not None
+
+
+def _distributed_stop_requested(device: torch.device) -> bool:
+    global _REQUESTED_STOP_SIGNAL
+    requested = 1 if _stop_requested() else 0
+    if dist.is_available() and dist.is_initialized():
+        flag = torch.tensor(requested, device=device, dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        requested = int(flag.item())
+        if requested and _REQUESTED_STOP_SIGNAL is None:
+            _REQUESTED_STOP_SIGNAL = "REMOTE_STOP"
+    return bool(requested)
 
 
 def ddp_sync_point(tag: str, step: int, device: torch.device) -> None:
@@ -52,6 +85,7 @@ def _save_model_checkpoint(
         current_step: int,
         save_dir: str,
         dataset_map_code_label: dict,
+        global_micro_step: int | None = None,
         ) -> None:
     """Helper function to save model checkpoint.
     
@@ -71,6 +105,8 @@ def _save_model_checkpoint(
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'step': current_step,
+        'global_step': current_step,
+        'global_micro_step': global_micro_step,
         'key': dataset_map_code_label,
     }
     torch.save(states, os.path.join(save_dir, f'{current_step}.bin'))
@@ -676,6 +712,93 @@ def _apply_batch_transition(
     )
 
 
+def _active_schedule_index(training_schedule: list[dict], global_step: int) -> int:
+    active_idx = 0
+    for idx, phase in enumerate(training_schedule):
+        if global_step >= int(phase["start_step"]):
+            active_idx = idx
+        else:
+            break
+    return active_idx
+
+
+def _schedule_metrics(late_phase_state: dict, global_micro_step: int) -> dict:
+    phase = late_phase_state["training_schedule"][late_phase_state["active_phase_index"]]
+    per_gpu_batch_size = int(late_phase_state.get("batch_size", phase["per_gpu_batch_size"]))
+    world_size = int(late_phase_state.get("world_size", phase["world_size"]))
+    grad_accum_steps = int(late_phase_state.get("grad_accum_steps", phase["grad_accum_steps"]))
+    global_micro_batch_size = per_gpu_batch_size * world_size
+    effective_batch_size = global_micro_batch_size * grad_accum_steps
+    phase_name = phase["phase_name"]
+    if late_phase_state.get("enabled") and not late_phase_state.get("has_step_schedule", False):
+        phase_name = "late_dynamic"
+    return {
+        "per_gpu_batch_size": per_gpu_batch_size,
+        "world_size": world_size,
+        "grad_accum_steps": grad_accum_steps,
+        "global_micro_batch_size": global_micro_batch_size,
+        "effective_batch_size": effective_batch_size,
+        "effective_batch": effective_batch_size,
+        "global_micro_step": global_micro_step,
+        "phase_name": phase_name,
+        "optimizer_steps_per_epoch": phase["optimizer_steps_per_epoch"],
+        "lr_multiplier": phase["lr_multiplier"],
+        "late_phase_enabled": int(late_phase_state.get("enabled", False)),
+    }
+
+
+def _apply_step_phase_if_needed(
+        late_phase_state: dict | None,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler.LRScheduler,
+        global_step: int,
+        global_micro_step: int,
+        save_dir: str | None,
+        log_wandb: bool,
+        is_main_process: bool,
+        ) -> None:
+    if late_phase_state is None or not late_phase_state.get("training_schedule"):
+        return
+
+    schedule = late_phase_state["training_schedule"]
+    new_index = _active_schedule_index(schedule, global_step)
+    if new_index == late_phase_state["active_phase_index"]:
+        return
+
+    new_phase = schedule[new_index]
+    new_multiplier = float(new_phase.get("lr_multiplier", 1.0))
+    for group in optimizer.param_groups:
+        group["lr"] *= new_multiplier
+    scheduler.base_lrs = [base_lr * new_multiplier for base_lr in scheduler.base_lrs]
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = [lr * new_multiplier for lr in scheduler._last_lr]
+
+    old_phase = schedule[late_phase_state["active_phase_index"]]
+    late_phase_state["active_phase_index"] = new_index
+    late_phase_state["grad_accum_steps"] = int(new_phase["grad_accum_steps"])
+    late_phase_state["batch_size"] = int(new_phase["per_gpu_batch_size"])
+    late_phase_state["enabled"] = new_phase["phase_name"] != "base"
+
+    metrics = _schedule_metrics(late_phase_state, global_micro_step)
+    if is_main_process:
+        tqdm.write(
+            "Training phase transition "
+            f"global_step={global_step} "
+            f"phase={old_phase['phase_name']}->{new_phase['phase_name']} "
+            f"grad_accum={old_phase['grad_accum_steps']}->{new_phase['grad_accum_steps']} "
+            f"effective_batch={old_phase['effective_batch_size']}->{new_phase['effective_batch_size']} "
+            f"lr_multiplier={old_phase['lr_multiplier']}->{new_phase['lr_multiplier']}"
+        )
+
+    if save_dir is not None:
+        update_summary(
+            global_step,
+            metrics=metrics,
+            filename=os.path.join(save_dir, 'logs.csv'),
+            log_wandb=log_wandb,
+        )
+
+
 def train_one_epoch(
         model: Seq2SeqMixerOccCANINE,
         data_loader: torch.utils.data.DataLoader,
@@ -684,6 +807,8 @@ def train_one_epoch(
         device: torch.device,
         scheduler: torch.optim.lr_scheduler.LRScheduler,
         current_step: int,
+        current_micro_step: int = 0,
+        total_steps: int | None = None,
         epoch: int = 0,
         log_interval: int = 100,
         eval_interval: int | None = None,
@@ -711,7 +836,7 @@ def train_one_epoch(
         loss_debug_every: int = 0,
         balanced_language_sampling: bool = False,
         balanced_language_debug_batches: int = 0,
-        ) -> int:
+        ) -> tuple[int, int]:
     model = model.train()
 
     last_step = len(data_loader) - 1
@@ -721,7 +846,6 @@ def train_one_epoch(
     samples_per_sec = Averager()
     grad_accum_steps = 1 if late_phase_state is None else late_phase_state["grad_accum_steps"]
     accum_counter = 0
-    optimizer_step_count = 0
     startup_audit_logged = False
     
     # Check GPU availability once
@@ -736,6 +860,21 @@ def train_one_epoch(
     balanced_lang_batch_props: list[float] = []
 
     for batch_idx, batch in enumerate(iterator):
+        if total_steps is not None and current_step >= total_steps:
+            break
+
+        _apply_step_phase_if_needed(
+            late_phase_state=late_phase_state,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            global_step=current_step,
+            global_micro_step=current_micro_step,
+            save_dir=save_dir,
+            log_wandb=log_wandb,
+            is_main_process=is_main_process,
+        )
+        grad_accum_steps = 1 if late_phase_state is None else late_phase_state["grad_accum_steps"]
+
         if (
             balanced_language_sampling
             and is_main_process
@@ -768,7 +907,8 @@ def train_one_epoch(
                     f"lang_prop_median={statistics.median(balanced_lang_batch_props):.4f}"
                 )
 
-        # Only switch late-phase settings right after an optimizer step (accum_counter == 0).
+        # Deprecated metric-triggered switch. It is only applied between optimizer
+        # updates, never in the middle of an accumulation window.
         if late_phase_state is not None and late_phase_state["pending_switch"] and accum_counter == 0:
             _apply_late_phase_switch(
                 late_phase_state=late_phase_state,
@@ -780,13 +920,17 @@ def train_one_epoch(
             )
             grad_accum_steps = late_phase_state["grad_accum_steps"]
 
-        current_step += 1
+        # A micro step is one dataloader batch on each process. Gradients from
+        # micro steps are accumulated until accum_counter reaches
+        # grad_accum_steps; only then do we call optimizer.step() and increment
+        # global_step/current_step.
+        current_micro_step += 1
 
         if debug_double_audit and is_main_process and not startup_audit_logged:
             _print_debug_double_startup(debug_double_audit_info)
             startup_audit_logged = True
 
-        if min_double_steps and current_step <= min_double_steps and min_double_ratio > 0:
+        if min_double_steps and current_step < min_double_steps and min_double_ratio > 0:
             dataset = data_loader.dataset
             if not hasattr(dataset, "_double_indices"):
                 target_cols = getattr(dataset, "target_cols", [])
@@ -830,20 +974,20 @@ def train_one_epoch(
                                     batch[key][row_idx] = stacked[idx]
 
         will_step = (accum_counter + 1) == grad_accum_steps
-        next_optimizer_step = optimizer_step_count + 1 if will_step else optimizer_step_count
+        next_global_step = current_step + 1 if will_step else current_step
         do_debug_audit = (
             debug_double_audit
             and is_main_process
             and will_step
             and debug_double_audit_every > 0
-            and (next_optimizer_step % debug_double_audit_every == 0)
+            and (next_global_step % debug_double_audit_every == 0)
         )
         if do_debug_audit:
             _debug_double_audit_batch(
                 batch=batch,
                 dataset=data_loader.dataset,
-                step=current_step,
-                optimizer_step=next_optimizer_step,
+                step=current_micro_step,
+                optimizer_step=next_global_step,
                 min_double_ratio=min_double_ratio,
                 min_double_steps=min_double_steps,
                 debug_samples=debug_double_audit_samples,
@@ -870,7 +1014,7 @@ def train_one_epoch(
             else:
                 block2_all_pad_doubles = float("nan")
             block2_all_pad_overall = float(block2_all_pad.float().mean().item())
-            if current_step <= min_double_steps or current_step % log_interval == 0:
+            if current_step < min_double_steps or (log_interval > 0 and current_step % log_interval == 0):
                 tqdm.write(
                     "DEBUG_BLOCK2 "
                     f"step={current_step} "
@@ -920,7 +1064,7 @@ def train_one_epoch(
                 gold_num_codes=gold_num_codes if use_gold_num_codes_loss else None,
                 )
         losses.update(loss.item(), out_seq2seq.size(0))
-        if loss_debug_every > 0 and is_main_process and current_step % loss_debug_every == 0:
+        if loss_debug_every > 0 and is_main_process and will_step and next_global_step % loss_debug_every == 0:
             debug_info = loss_fn.loss_fn_seq2seq.last_debug
             block2_start = loss_fn.loss_fn_seq2seq.block_size
             doubles_mask = gold_num_codes >= 2
@@ -951,7 +1095,7 @@ def train_one_epoch(
             _log_loss_debug(
                 debug_info=debug_info,
                 gold_num_codes=gold_num_codes,
-                step=current_step,
+                step=next_global_step,
                 extra_metrics={
                     "block2_nonpad_rate_d": f"{block2_nonpad_rate:.3f}",
                     "p_pad_block2_start_d": f"{pad_start_prob:.3f}",
@@ -965,10 +1109,11 @@ def train_one_epoch(
             _run_loss_nan_audit(
                 debug_info=debug_info,
                 gold_num_codes=gold_num_codes,
-                step=current_step,
+                step=next_global_step,
             )
 
-        # Backward pass & step with optional AMP
+        # Backward pass. The loss is divided by grad_accum_steps so the
+        # accumulated gradient has the same scale as one effective batch.
         if accum_counter == 0:
             optimizer.zero_grad()
         loss = loss / grad_accum_steps
@@ -978,6 +1123,7 @@ def train_one_epoch(
         else:
             loss.backward()
         accum_counter += 1
+        did_optimizer_step = False
         if accum_counter == grad_accum_steps:
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -988,7 +1134,8 @@ def train_one_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             accum_counter = 0
-            optimizer_step_count += 1
+            current_step += 1
+            did_optimizer_step = True
 
             if late_phase_state is not None and late_phase_state["late_warmup_remaining"] > 0:
                 _apply_late_warmup_step(
@@ -1001,39 +1148,43 @@ def train_one_epoch(
             else:
                 scheduler.step()
 
-            if late_phase_state is not None and late_phase_state.get("batch_schedule"):
-                schedule = late_phase_state["batch_schedule"]
-                if schedule["next_index"] < len(schedule["batch_sizes"]):
-                    next_step = schedule["batch_steps"][schedule["next_index"] - 1]
-                    should_transition = current_step >= next_step
-                    if distributed and dist.is_available() and dist.is_initialized():
-                        transition_tensor = torch.tensor(
-                            1 if (should_transition and is_main_process) else 0,
-                            device=device,
-                        )
-                        ddp_broadcast(transition_tensor, "batch_scale", current_step, device)
-                        should_transition = bool(transition_tensor.item())
-                    if should_transition:
-                        _apply_batch_transition(
-                            late_phase_state=late_phase_state,
-                            data_loader=data_loader,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            current_step=current_step,
-                            save_dir=save_dir,
-                            log_wandb=log_wandb,
-                            is_main_process=is_main_process,
-                        )
-                        last_step = len(data_loader) - 1
-                        if is_main_process:
-                            iterator.total = len(data_loader)
-                            iterator.refresh()
+            _apply_step_phase_if_needed(
+                late_phase_state=late_phase_state,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                global_step=current_step,
+                global_micro_step=current_micro_step,
+                save_dir=save_dir,
+                log_wandb=log_wandb,
+                is_main_process=is_main_process,
+            )
+
+            if _distributed_stop_requested(device):
+                if distributed and dist.is_available() and dist.is_initialized():
+                    ddp_sync_point("pre_signal_checkpoint", current_step, device)
+                if is_main_process:
+                    tqdm.write(
+                        f"Received {_REQUESTED_STOP_SIGNAL}; saving checkpoint at "
+                        f"global_step={current_step}, global_micro_step={current_micro_step} and stopping."
+                    )
+                    _save_model_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        current_step=current_step,
+                        save_dir=save_dir,
+                        dataset_map_code_label=data_loader.dataset.map_code_label,
+                        global_micro_step=current_micro_step,
+                    )
+                if distributed and dist.is_available() and dist.is_initialized():
+                    ddp_sync_point("post_signal_checkpoint", current_step, device)
+                break
 
         elapsed = time.time() - end
         batch_time.update(elapsed)
         samples_per_sec.update(out_seq2seq.size(0) / elapsed)
 
-        if is_main_process and (batch_idx % log_interval == 0 or batch_idx == last_step):
+        if is_main_process and did_optimizer_step and (current_step % log_interval == 0 or batch_idx == last_step):
             # Calculate ETA
             batches_remaining = len(data_loader) - (batch_idx + 1)
             eta_seconds = batches_remaining * batch_time.avg
@@ -1042,7 +1193,10 @@ def train_one_epoch(
             # Get current learning rate
             current_lr = optimizer.param_groups[0]['lr']
             
-            tqdm.write(f'[Epoch {epoch}] Batch {batch_idx + 1}/{len(data_loader)} | '
+            phase_name = _schedule_metrics(late_phase_state, current_micro_step)["phase_name"] if late_phase_state is not None else "base"
+            tqdm.write(f'[Epoch {epoch}] Optimizer step {current_step} | Micro step {current_micro_step} | '
+                       f'Batch {batch_idx + 1}/{len(data_loader)} | '
+                       f'Phase: {phase_name} | '
                        f'Loss: {losses.avg:.6f} | '
                        f'LR: {current_lr:.2e} | '
                        f'Batch time: {batch_time.avg:.2f}s (data: {batch_time_data.avg:.2f}s) | '
@@ -1054,7 +1208,7 @@ def train_one_epoch(
                 tqdm.write(f'  GPU Memory - Allocated: {torch.cuda.max_memory_allocated() / (1024 ** 3):.2f} GB | '
                            f'Reserved: {torch.cuda.max_memory_reserved() / (1024 ** 3):.2f} GB')
 
-        if save_interval is not None and current_step % save_interval == 0 and distributed and dist.is_available() and dist.is_initialized():
+        if did_optimizer_step and save_interval is not None and current_step % save_interval == 0 and distributed and dist.is_available() and dist.is_initialized():
             ddp_sync_point("pre_checkpoint", current_step, device)
             if is_main_process and not save_each_epoch:
                 _save_model_checkpoint(
@@ -1064,9 +1218,10 @@ def train_one_epoch(
                     current_step=current_step,
                     save_dir=save_dir,
                     dataset_map_code_label=data_loader.dataset.map_code_label,
+                    global_micro_step=current_micro_step,
                 )
             ddp_sync_point("post_checkpoint", current_step, device)
-        elif save_interval is not None and current_step % save_interval == 0 and is_main_process and not save_each_epoch:
+        elif did_optimizer_step and save_interval is not None and current_step % save_interval == 0 and is_main_process and not save_each_epoch:
             _save_model_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -1074,9 +1229,10 @@ def train_one_epoch(
                 current_step=current_step,
                 save_dir=save_dir,
                 dataset_map_code_label=data_loader.dataset.map_code_label,
+                global_micro_step=current_micro_step,
             )
 
-        is_eval_step = eval_interval is not None and current_step % eval_interval == 0
+        is_eval_step = did_optimizer_step and eval_interval is not None and current_step % eval_interval == 0
         if eval_interval is not None and distributed and dist.is_available() and dist.is_initialized():
             eval_tensor = torch.tensor(1 if is_eval_step and is_main_process else 0, device=device)
             ddp_broadcast(eval_tensor, "eval_flag", current_step, device)
@@ -1146,14 +1302,7 @@ def train_one_epoch(
                         tqdm.write('='*80 + '\n')
 
                         if late_phase_state is not None:
-                            effective_batch = late_phase_state["batch_size"] * late_phase_state["world_size"] * late_phase_state["grad_accum_steps"]
-                            late_phase_metrics.update(
-                                {
-                                    "late_phase_enabled": int(late_phase_state["enabled"]),
-                                    "grad_accum_steps": late_phase_state["grad_accum_steps"],
-                                    "effective_batch": effective_batch,
-                                }
-                            )
+                            late_phase_metrics.update(_schedule_metrics(late_phase_state, current_micro_step))
 
                         gating_summary = gating_metrics or {}
                         if (
@@ -1174,6 +1323,8 @@ def train_one_epoch(
                         update_summary(
                             current_step,
                             metrics={
+                                'global_step': current_step,
+                                'global_micro_step': current_micro_step,
                                 'batch_time': batch_time.avg,
                                 'batch_time_data': batch_time_data.avg,
                                 'train_loss': losses.avg,
@@ -1311,14 +1462,7 @@ def train_one_epoch(
 
             late_phase_metrics = {}
             if late_phase_state is not None:
-                effective_batch = late_phase_state["batch_size"] * late_phase_state["world_size"] * late_phase_state["grad_accum_steps"]
-                late_phase_metrics.update(
-                    {
-                        "late_phase_enabled": int(late_phase_state["enabled"]),
-                        "grad_accum_steps": late_phase_state["grad_accum_steps"],
-                        "effective_batch": effective_batch,
-                    }
-                )
+                late_phase_metrics.update(_schedule_metrics(late_phase_state, current_micro_step))
 
             gating_summary = gating_metrics or {}
             if (
@@ -1339,6 +1483,8 @@ def train_one_epoch(
             update_summary(
                 current_step,
                 metrics={
+                    'global_step': current_step,
+                    'global_micro_step': current_micro_step,
                     'batch_time': batch_time.avg,
                     'batch_time_data': batch_time_data.avg,
                     'train_loss': losses.avg,
@@ -1358,8 +1504,10 @@ def train_one_epoch(
             )
 
         end = time.time()
+        if total_steps is not None and current_step >= total_steps:
+            break
 
-    if accum_counter:
+    if accum_counter and (total_steps is None or current_step < total_steps):
         if scaler is not None:
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1369,6 +1517,7 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         accum_counter = 0
+        current_step += 1
         if late_phase_state is not None and late_phase_state["late_warmup_remaining"] > 0:
             _apply_late_warmup_step(
                 late_phase_state=late_phase_state,
@@ -1379,31 +1528,39 @@ def train_one_epoch(
             )
         else:
             scheduler.step()
-        if late_phase_state is not None and late_phase_state.get("batch_schedule"):
-            schedule = late_phase_state["batch_schedule"]
-            if schedule["next_index"] < len(schedule["batch_sizes"]):
-                next_step = schedule["batch_steps"][schedule["next_index"] - 1]
-                should_transition = current_step >= next_step
-                if distributed and dist.is_available() and dist.is_initialized():
-                    transition_tensor = torch.tensor(
-                        1 if (should_transition and is_main_process) else 0,
-                        device=device,
-                    )
-                    ddp_broadcast(transition_tensor, "batch_scale", current_step, device)
-                    should_transition = bool(transition_tensor.item())
-                if should_transition:
-                    _apply_batch_transition(
-                        late_phase_state=late_phase_state,
-                        data_loader=data_loader,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        current_step=current_step,
-                        save_dir=save_dir,
-                        log_wandb=log_wandb,
-                        is_main_process=is_main_process,
-                    )
 
-    return current_step
+        _apply_step_phase_if_needed(
+            late_phase_state=late_phase_state,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            global_step=current_step,
+            global_micro_step=current_micro_step,
+            save_dir=save_dir,
+            log_wandb=log_wandb,
+            is_main_process=is_main_process,
+        )
+
+        if _stop_requested():
+            if distributed and dist.is_available() and dist.is_initialized():
+                ddp_sync_point("pre_signal_checkpoint", current_step, device)
+            if is_main_process:
+                tqdm.write(
+                    f"Received {_REQUESTED_STOP_SIGNAL}; saving checkpoint at "
+                    f"global_step={current_step}, global_micro_step={current_micro_step} and stopping."
+                )
+                _save_model_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    current_step=current_step,
+                    save_dir=save_dir,
+                    dataset_map_code_label=data_loader.dataset.map_code_label,
+                    global_micro_step=current_micro_step,
+                )
+            if distributed and dist.is_available() and dist.is_initialized():
+                ddp_sync_point("post_signal_checkpoint", current_step, device)
+
+    return current_step, current_micro_step
 
 
 @torch.no_grad
@@ -2502,6 +2659,7 @@ def train(
         save_dir: str = None,
         total_steps: int = None,
         current_step: int = 0,
+        current_micro_step: int = 0,
         log_interval: int = 100,
         eval_interval: int = 1000,
         save_interval: int = 1000,
@@ -2529,6 +2687,9 @@ def train(
         late_lr_mult: float = 1.0,
         late_warmup_steps: int = 0,
         late_switch_once: bool = True,
+        grad_accum_steps: int = 1,
+        per_gpu_batch_size: int | None = None,
+        training_schedule: list[dict] | None = None,
         batch_size: int | None = None,
         late_phase_start_step: int | None = None,
         late_phase_batch_sizes: list[int] | None = None,
@@ -2538,6 +2699,7 @@ def train(
         balanced_language_sampling: bool = False,
         balanced_language_debug_batches: int = 0,
         ):
+    _install_signal_handlers()
     # Initialize GradScaler for AMP if enabled
     scaler = GradScaler('cuda') if use_amp else None
     loss_debug_every = int(os.getenv("LOSS_DEBUG_EVERY", "0"))
@@ -2549,56 +2711,100 @@ def train(
         world_size = dist.get_world_size()
     elif data_loaders.get("data_loader_train") is not None:
         world_size = getattr(data_loaders["data_loader_train"].sampler, "num_replicas", 1)
-    if batch_size is None:
-        batch_size = data_loaders["data_loader_train"].batch_size
-    current_global_batch = batch_size * world_size
-    batch_schedule = _normalize_batch_schedule(
-        batch_sizes=late_phase_batch_sizes,
-        batch_steps=late_phase_batch_steps,
-        start_step=late_phase_start_step,
-        lr_mults=late_phase_lr_mults,
-        current_global_batch=current_global_batch,
-        world_size=world_size,
-        is_main_process=is_main_process,
-    )
+    if per_gpu_batch_size is None:
+        per_gpu_batch_size = batch_size if batch_size is not None else data_loaders["data_loader_train"].batch_size
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+    global_micro_batch_size = per_gpu_batch_size * world_size
 
+    if training_schedule is None:
+        training_schedule = [
+            {
+                "phase_name": "base",
+                "start_step": 0,
+                "end_step": total_steps,
+                "per_gpu_batch_size": per_gpu_batch_size,
+                "world_size": world_size,
+                "grad_accum_steps": grad_accum_steps,
+                "global_micro_batch_size": global_micro_batch_size,
+                "effective_batch_size": global_micro_batch_size * grad_accum_steps,
+                "lr_multiplier": 1.0,
+                "optimizer_steps_per_epoch": int(np.ceil(len(data_loaders["data_loader_train"]) / grad_accum_steps)),
+            }
+        ]
+        if late_phase_batch_sizes is not None:
+            if late_phase_batch_steps is None and late_phase_start_step is None:
+                raise ValueError("late_phase_start_step or late_phase_batch_steps is required for deprecated late_phase_batch_sizes")
+            converted_grad_accum = []
+            for effective_batch_size in late_phase_batch_sizes:
+                if effective_batch_size % global_micro_batch_size != 0:
+                    raise ValueError(
+                        f"Deprecated late_phase_batch_sizes value {effective_batch_size} is not divisible "
+                        f"by global_micro_batch_size={global_micro_batch_size}."
+                    )
+                converted_grad_accum.append(effective_batch_size // global_micro_batch_size)
+            if converted_grad_accum and converted_grad_accum[0] == grad_accum_steps:
+                converted_grad_accum = converted_grad_accum[1:]
+            steps = list(late_phase_batch_steps) if late_phase_batch_steps is not None else [late_phase_start_step]
+            if late_phase_start_step is not None and steps[0] != late_phase_start_step:
+                steps = [late_phase_start_step] + steps
+            if len(steps) != len(converted_grad_accum):
+                raise ValueError("Deprecated late phase batch schedule has incompatible batch/step lengths")
+            lr_mults = late_phase_lr_mults or [1.0] * len(converted_grad_accum)
+            if len(lr_mults) != len(converted_grad_accum):
+                raise ValueError("late_phase_lr_mults must have one value per late phase")
+            training_schedule[0]["end_step"] = steps[0]
+            for idx, (step, accum, lr_mult) in enumerate(zip(steps, converted_grad_accum, lr_mults), start=1):
+                training_schedule.append(
+                    {
+                        "phase_name": f"late_{idx}",
+                        "start_step": step,
+                        "end_step": steps[idx] if idx < len(steps) else total_steps,
+                        "per_gpu_batch_size": per_gpu_batch_size,
+                        "world_size": world_size,
+                        "grad_accum_steps": accum,
+                        "global_micro_batch_size": global_micro_batch_size,
+                        "effective_batch_size": global_micro_batch_size * accum,
+                        "lr_multiplier": lr_mult,
+                        "optimizer_steps_per_epoch": int(np.ceil(len(data_loaders["data_loader_train"]) / accum)),
+                    }
+                )
+
+    has_step_schedule = len(training_schedule) > 1
     gate_switch_enabled = (
-        late_grad_accum > 1
-        or late_lr_mult != 1.0
-        or late_warmup_steps > 0
+        not has_step_schedule
+        and (
+            late_grad_accum > 1
+            or late_lr_mult != 1.0
+            or late_warmup_steps > 0
+        )
     )
-    enable_late_phase = gate_switch_enabled or batch_schedule is not None
-    late_phase_state = None
-    if enable_late_phase:
-        late_phase_state = {
-            "enabled": False,
-            "pending_switch": False,
-            "grad_accum_steps": 1,
-            "late_grad_accum": late_grad_accum,
-            "late_lr_mult": late_lr_mult,
-            "late_warmup_steps": late_warmup_steps,
-            "late_warmup_total": 0,
-            "late_warmup_remaining": 0,
-            "late_warmup_step": 0,
-            "late_warmup_target_lrs": [],
-            "gate_metric_history": [],
-            "gate_stabilize_metric": gate_stabilize_metric,
-            "gate_stabilize_window": gate_stabilize_window,
-            "gate_stabilize_delta": gate_stabilize_delta,
-            "gate_stabilize_min": gate_stabilize_min,
-            "late_switch_once": late_switch_once,
-            "gate_switch_enabled": gate_switch_enabled,
-            "batch_size": batch_size,
-            "world_size": world_size,
-            "batch_schedule": batch_schedule,
-        }
-        if batch_schedule is not None and is_main_process:
-            tqdm.write(
-                "Late-phase batch scaling schedule "
-                f"global_batches={batch_schedule['batch_sizes']} "
-                f"steps={batch_schedule['batch_steps']} "
-                f"lr_mults={batch_schedule['lr_mults']}"
-            )
+    active_phase_index = _active_schedule_index(training_schedule, current_step)
+    active_phase = training_schedule[active_phase_index]
+    late_phase_state = {
+        "enabled": active_phase["phase_name"] != "base",
+        "pending_switch": False,
+        "grad_accum_steps": int(active_phase["grad_accum_steps"]),
+        "late_grad_accum": late_grad_accum,
+        "late_lr_mult": late_lr_mult,
+        "late_warmup_steps": late_warmup_steps,
+        "late_warmup_total": 0,
+        "late_warmup_remaining": 0,
+        "late_warmup_step": 0,
+        "late_warmup_target_lrs": [],
+        "gate_metric_history": [],
+        "gate_stabilize_metric": gate_stabilize_metric,
+        "gate_stabilize_window": gate_stabilize_window,
+        "gate_stabilize_delta": gate_stabilize_delta,
+        "gate_stabilize_min": gate_stabilize_min,
+        "late_switch_once": late_switch_once,
+        "gate_switch_enabled": gate_switch_enabled,
+        "batch_size": per_gpu_batch_size,
+        "world_size": world_size,
+        "training_schedule": training_schedule,
+        "active_phase_index": active_phase_index,
+        "has_step_schedule": has_step_schedule,
+    }
     
     epoch = 0
     while current_step < total_steps:
@@ -2611,7 +2817,7 @@ def train(
         if distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        current_step = train_one_epoch(
+        current_step, current_micro_step = train_one_epoch(
             model,
             data_loaders['data_loader_train'],
             loss_fn,
@@ -2619,6 +2825,8 @@ def train(
             device,
             scheduler,
             current_step=current_step,
+            current_micro_step=current_micro_step,
+            total_steps=total_steps,
             epoch=epoch,
             log_interval=log_interval,
             eval_interval=eval_interval,
@@ -2647,6 +2855,11 @@ def train(
             balanced_language_sampling=balanced_language_sampling,
             balanced_language_debug_batches=balanced_language_debug_batches,
         )
+
+        if _stop_requested():
+            if is_main_process:
+                print(f"Stopping early after {_REQUESTED_STOP_SIGNAL}; checkpoint is ready for resume.")
+            break
         
         # Save at the end of each epoch if the flag is set
         if save_each_epoch and is_main_process:
@@ -2657,6 +2870,7 @@ def train(
                 current_step=current_step,
                 save_dir=save_dir,
                 dataset_map_code_label=data_loaders['data_loader_train'].dataset.map_code_label,
+                global_micro_step=current_micro_step,
             )
             print(f'Model saved at end of epoch {epoch} (step {current_step})')
         
@@ -2671,7 +2885,11 @@ def train(
             current_step=current_step,
             save_dir=save_dir,
             dataset_map_code_label=data_loaders['data_loader_train'].dataset.map_code_label,
+            global_micro_step=current_micro_step,
         )
         print('\n' + '='*80)
-        print(f'TRAINING COMPLETE - Final model saved at step {current_step}')
+        if _stop_requested():
+            print(f'TRAINING INTERRUPTED - Resume checkpoint saved at step {current_step}')
+        else:
+            print(f'TRAINING COMPLETE - Final model saved at step {current_step}')
         print('='*80)
