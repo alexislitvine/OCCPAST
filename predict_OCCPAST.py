@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse
 import pandas as pd
 import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import unicodedata
 import re  # NEW
@@ -12,6 +12,14 @@ import os
 def sanitize_filename_component(text: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
     return s or "unknown_model"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("Value must be a positive integer.")
+    return parsed
+
 
 def detect_encoding(p: Path) -> str:
     """
@@ -193,7 +201,7 @@ def main():
     )
     parser.add_argument(
         "--batch-size",
-        type=int,
+        type=positive_int,
         default=256,
         help="Batch size used during model inference.",
     )
@@ -445,7 +453,7 @@ def main():
     if args.parallel_systems and mod_hisco is not None and mod_pst is not None:
         print("Running HISCO and PST predictions in parallel…")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
+            future_to_system = {
                 executor.submit(
                     _run_system_predictions,
                     "hisco",
@@ -460,7 +468,7 @@ def main():
                     HOW_MANY_PREDS,
                     args.debug,
                     args.max_num_codes,
-                ),
+                ): "hisco",
                 executor.submit(
                     _run_system_predictions,
                     "pst",
@@ -476,10 +484,16 @@ def main():
                     args.debug,
                     args.max_num_codes,
                     pst_model_slug,
-                ),
-            ]
-            for future in futures:
-                system_name, out_path = future.result()
+                ): "pst",
+            }
+            for future in as_completed(future_to_system):
+                expected_system = future_to_system[future]
+                try:
+                    system_name, out_path = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{expected_system.upper()} prediction failed during parallel inference."
+                    ) from exc
                 if system_name == "hisco":
                     hisco_out = out_path
                 else:
