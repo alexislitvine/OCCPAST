@@ -9,6 +9,8 @@ import unicodedata
 import re  # NEW
 import os
 
+MAX_PARALLEL_SYSTEMS = 2
+
 def sanitize_filename_component(text: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
     return s or "unknown_model"
@@ -458,7 +460,7 @@ def main():
 
     if args.parallel_systems and mod_hisco is not None and mod_pst is not None:
         print("Running HISCO and PST predictions in parallel…")
-        max_workers = min(args.parallel_workers, 2)
+        max_workers = min(args.parallel_workers, MAX_PARALLEL_SYSTEMS)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_system = {
                 executor.submit(
