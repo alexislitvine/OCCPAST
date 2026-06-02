@@ -458,7 +458,8 @@ def main():
 
     if args.parallel_systems and mod_hisco is not None and mod_pst is not None:
         print("Running HISCO and PST predictions in parallel…")
-        with ThreadPoolExecutor(max_workers=args.parallel_workers) as executor:
+        max_workers = min(args.parallel_workers, 2)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_system = {
                 executor.submit(
                     _run_system_predictions,
@@ -498,7 +499,7 @@ def main():
                     system_name, out_path = future.result()
                 except Exception as exc:
                     raise RuntimeError(
-                        f"{expected_system.upper()} prediction failed during parallel inference "
+                        f"Parallel inference failed for expected {expected_system.upper()} task "
                         f"({type(exc).__name__}: {exc})"
                     ) from exc
                 if system_name == "hisco":

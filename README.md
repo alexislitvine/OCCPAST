@@ -158,6 +158,12 @@ Example (full inference, non-interactive input):
 python3 predict_OCCPAST.py --input predictions/to_predict/cedric_french_strings.csv --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
 ```
 
+Example (parallel HISCO+PST inference on one node/GPU):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/cedric_french_strings.csv --predict-system both --parallel-systems --batch-size 512 --parallel-workers 2 --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
 Example (format-only using latest files automatically):
 
 ```bash
