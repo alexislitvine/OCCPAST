@@ -3,14 +3,25 @@ from pathlib import Path
 import argparse
 import pandas as pd
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import unicodedata
 import re  # NEW
 import os
 
+MAX_PARALLEL_SYSTEMS = 2
+
 def sanitize_filename_component(text: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
     return s or "unknown_model"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got: {value}")
+    return parsed
+
 
 def detect_encoding(p: Path) -> str:
     """
@@ -79,6 +90,44 @@ def _extract_prediction_metadata(path: Path, system: str) -> tuple[str | None, s
     if not m:
         return None, None
     return m.group(1), m.group(2)
+
+
+def _run_system_predictions(
+    system: str,
+    model,
+    occ1_clean: list[str],
+    ids: list,
+    occ1_original: list[str],
+    out_dir: Path,
+    file_base: str,
+    ts: str,
+    out_enc: str,
+    k_pred: int,
+    debug: bool,
+    max_num_codes: int | None,
+    pst_model_slug: str | None = None,
+) -> tuple[str, Path]:
+    print(f"Running {system.upper()} predictions…")
+    preds = model(
+        occ1_clean,
+        k_pred=k_pred,
+        debug=debug,
+        max_num_codes=max_num_codes,
+    )
+    preds["id"] = ids
+    preds["occ1"] = occ1_original
+    preds["occ1_clean"] = occ1_clean
+
+    if system == "hisco":
+        out_path = out_dir / f"{file_base}_predictions_hisco_{ts}.csv"
+    elif system == "pst":
+        out_path = out_dir / f"{file_base}_predictions_pst_{ts}_{pst_model_slug}.csv"
+    else:
+        raise ValueError(f"Unknown prediction system: {system}")
+
+    preds.to_csv(out_path, index=False, encoding=out_enc)
+    print(f"→ Saved {system.upper()} to {out_path.name}")
+    return system, out_path
 
 
 def main():
@@ -151,6 +200,23 @@ def main():
         type=str,
         default=None,
         help="Optional direct path to a PST model .bin file. If set, skips interactive model selection.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=positive_int,
+        default=256,
+        help="Batch size used during model inference (must be > 0).",
+    )
+    parser.add_argument(
+        "--parallel-systems",
+        action="store_true",
+        help="Run HISCO and PST inference concurrently when --predict-system both is selected (GPU-bound workloads recommended).",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=positive_int,
+        default=2,
+        help="Worker count for --parallel-systems (must be > 0, capped at 2 for HISCO+PST).",
     )
     parser.add_argument(
         "--format-only",
@@ -320,6 +386,7 @@ def main():
     if args.predict_system in {"both", "hisco"}:
         mod_hisco = OccCANINE(
             verbose=True,
+            batch_size=args.batch_size,
             disallow_pad_inside_block=args.disallow_pad_inside_block,
             disallow_zero_at_block_start=args.disallow_zero_at_block_start,
         )
@@ -378,6 +445,7 @@ def main():
             str(chosen_bin),
             hf=False,
             system="pst",
+            batch_size=args.batch_size,
             use_within_block_sep=True,
             verbose=True,
             disallow_pad_inside_block=args.disallow_pad_inside_block,
@@ -386,35 +454,93 @@ def main():
 
     hisco_out = None
     pst_out = None
-    if mod_hisco is not None:
-        print("Running HISCO predictions…")
-        pred_hisco = mod_hisco(
-            df.occ1_clean.tolist(),
-            k_pred=HOW_MANY_PREDS,
-            debug=args.debug,
-            max_num_codes=args.max_num_codes,
-        )
-        pred_hisco["id"] = df["id"].tolist()
-        pred_hisco["occ1"] = df["occ1_original"].tolist()
-        pred_hisco["occ1_clean"] = df["occ1_clean"].tolist()
-        hisco_out = predicted_dir / f"{file_base}_predictions_hisco_{ts}.csv"
-        pred_hisco.to_csv(hisco_out, index=False, encoding=out_enc)
-        print(f"→ Saved HISCO to {hisco_out.name}")
+    occ1_clean_values = df["occ1_clean"].tolist()
+    id_values = df["id"].tolist()
+    occ1_original_values = df["occ1_original"].tolist()
 
-    if mod_pst is not None:
-        print("Running PST predictions…")
-        pred_pst = mod_pst(
-            df.occ1_clean.tolist(),
-            k_pred=HOW_MANY_PREDS,
-            debug=args.debug,
-            max_num_codes=args.max_num_codes,
-        )
-        pred_pst["id"] = df["id"].tolist()
-        pred_pst["occ1"] = df["occ1_original"].tolist()
-        pred_pst["occ1_clean"] = df["occ1_clean"].tolist()
-        pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}_{pst_model_slug}.csv"
-        pred_pst.to_csv(pst_out, index=False, encoding=out_enc)
-        print(f"→ Saved PST   to {pst_out.name}")
+    if args.parallel_systems and mod_hisco is not None and mod_pst is not None:
+        print("Running HISCO and PST predictions in parallel…")
+        max_workers = min(args.parallel_workers, MAX_PARALLEL_SYSTEMS)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_system = {
+                executor.submit(
+                    _run_system_predictions,
+                    "hisco",
+                    mod_hisco,
+                    occ1_clean_values,
+                    id_values,
+                    occ1_original_values,
+                    predicted_dir,
+                    file_base,
+                    ts,
+                    out_enc,
+                    HOW_MANY_PREDS,
+                    args.debug,
+                    args.max_num_codes,
+                ): "hisco",
+                executor.submit(
+                    _run_system_predictions,
+                    "pst",
+                    mod_pst,
+                    occ1_clean_values,
+                    id_values,
+                    occ1_original_values,
+                    predicted_dir,
+                    file_base,
+                    ts,
+                    out_enc,
+                    HOW_MANY_PREDS,
+                    args.debug,
+                    args.max_num_codes,
+                    pst_model_slug,
+                ): "pst",
+            }
+            for future in as_completed(future_to_system):
+                expected_system = future_to_system[future]
+                try:
+                    system_name, out_path = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Parallel inference failed for expected {expected_system.upper()} task "
+                        f"({type(exc).__name__}: {exc})"
+                    ) from exc
+                if system_name == "hisco":
+                    hisco_out = out_path
+                else:
+                    pst_out = out_path
+    else:
+        if mod_hisco is not None:
+            _, hisco_out = _run_system_predictions(
+                "hisco",
+                mod_hisco,
+                occ1_clean_values,
+                id_values,
+                occ1_original_values,
+                predicted_dir,
+                file_base,
+                ts,
+                out_enc,
+                HOW_MANY_PREDS,
+                args.debug,
+                args.max_num_codes,
+            )
+
+        if mod_pst is not None:
+            _, pst_out = _run_system_predictions(
+                "pst",
+                mod_pst,
+                occ1_clean_values,
+                id_values,
+                occ1_original_values,
+                predicted_dir,
+                file_base,
+                ts,
+                out_enc,
+                HOW_MANY_PREDS,
+                args.debug,
+                args.max_num_codes,
+                pst_model_slug,
+            )
 
     if args.predict_system == "both":
         lookup_path = Path(args.lookup)
