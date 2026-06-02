@@ -208,13 +208,13 @@ def main():
     parser.add_argument(
         "--parallel-systems",
         action="store_true",
-        help="Run HISCO and PST inference concurrently when --predict-system both is selected.",
+        help="Run HISCO and PST inference concurrently when --predict-system both is selected (GPU-bound workloads recommended).",
     )
     parser.add_argument(
         "--parallel-workers",
         type=positive_int,
         default=2,
-        help="Worker count for --parallel-systems (must be > 0).",
+        help="Worker count for --parallel-systems (must be > 0, capped at 2 for HISCO+PST).",
     )
     parser.add_argument(
         "--format-only",
