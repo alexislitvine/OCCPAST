@@ -17,7 +17,7 @@ def sanitize_filename_component(text: str) -> str:
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
-        raise argparse.ArgumentTypeError("Value must be a positive integer.")
+        raise argparse.ArgumentTypeError(f"Expected a positive integer, got: {value}")
     return parsed
 
 
@@ -203,12 +203,18 @@ def main():
         "--batch-size",
         type=positive_int,
         default=256,
-        help="Batch size used during model inference.",
+        help="Batch size used during model inference (must be > 0).",
     )
     parser.add_argument(
         "--parallel-systems",
         action="store_true",
         help="Run HISCO and PST inference concurrently when --predict-system both is selected.",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=positive_int,
+        default=2,
+        help="Worker count for --parallel-systems (must be > 0).",
     )
     parser.add_argument(
         "--format-only",
@@ -452,7 +458,7 @@ def main():
 
     if args.parallel_systems and mod_hisco is not None and mod_pst is not None:
         print("Running HISCO and PST predictions in parallel…")
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=args.parallel_workers) as executor:
             future_to_system = {
                 executor.submit(
                     _run_system_predictions,
@@ -492,7 +498,8 @@ def main():
                     system_name, out_path = future.result()
                 except Exception as exc:
                     raise RuntimeError(
-                        f"{expected_system.upper()} prediction failed during parallel inference."
+                        f"{expected_system.upper()} prediction failed during parallel inference "
+                        f"({type(exc).__name__}: {exc})"
                     ) from exc
                 if system_name == "hisco":
                     hisco_out = out_path
