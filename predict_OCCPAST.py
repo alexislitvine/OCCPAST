@@ -8,6 +8,10 @@ import unicodedata
 import re  # NEW
 import os
 
+def sanitize_filename_component(text: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
+    return s or "unknown_model"
+
 def detect_encoding(p: Path) -> str:
     """
     Minimal, dependency-free probe. Tries common encodings in order.
@@ -66,6 +70,15 @@ def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
         return None
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0]
+
+def _extract_prediction_metadata(path: Path, system: str) -> tuple[str | None, str | None]:
+    m = re.match(
+        rf".*_predictions_{re.escape(system)}_(\d{{4}}-\d{{2}}-\d{{2}}_\d{{6}})(?:_(.+))?$",
+        path.stem,
+    )
+    if not m:
+        return None, None
+    return m.group(1), m.group(2)
 
 
 def main():
@@ -200,7 +213,12 @@ def main():
         predicted_dir = Path(args.output_dir) if args.output_dir else pst_out.parent
         predicted_dir.mkdir(parents=True, exist_ok=True)
 
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
+        if ts_from_csv is None:
+            ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
+            model_from_csv = model_from_csv or hisco_model_from_csv
+        ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        model_suffix = sanitize_filename_component(model_from_csv or "unknown_model")
         file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", pst_out.stem)
 
         print("Formatting/merging predictions…")
@@ -218,7 +236,7 @@ def main():
         else:
             print("No duplicate entries found.")
 
-        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}.json"
+        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
         write_json(combined_json, serialize_formatted_entries(entries))
         print(f"→ Wrote combined formatted JSON: {combined_json.name}")
         print(
@@ -308,6 +326,7 @@ def main():
 
     # Discover PST models with last.bin under model_root and select
     mod_pst = None
+    pst_model_slug = None
     if args.predict_system in {"both", "pst"}:
         if args.model_bin:
             chosen_bin = Path(args.model_bin)
@@ -354,6 +373,7 @@ def main():
             chosen_name, chosen_bin, chosen_mtime = candidates[idx - 1]
 
         print(f"Using PST model: {chosen_name} ({chosen_bin})")
+        pst_model_slug = sanitize_filename_component(chosen_name)
         mod_pst = OccCANINE(
             str(chosen_bin),
             hf=False,
@@ -392,7 +412,7 @@ def main():
         pred_pst["id"] = df["id"].tolist()
         pred_pst["occ1"] = df["occ1_original"].tolist()
         pred_pst["occ1_clean"] = df["occ1_clean"].tolist()
-        pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}.csv"
+        pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}_{pst_model_slug}.csv"
         pred_pst.to_csv(pst_out, index=False, encoding=out_enc)
         print(f"→ Saved PST   to {pst_out.name}")
 
@@ -420,7 +440,8 @@ def main():
         else:
             print("No duplicate entries found.")
 
-        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}.json"
+        model_suffix = pst_model_slug or "unknown_model"
+        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
         write_json(combined_json, serialize_formatted_entries(entries))
         print(f"→ Wrote combined formatted JSON: {combined_json.name}")
         print(
