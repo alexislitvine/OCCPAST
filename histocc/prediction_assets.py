@@ -10,6 +10,7 @@ import os
 import time
 import warnings
 
+from functools import lru_cache
 from typing import Dict, Tuple, Literal
 
 import torch
@@ -100,6 +101,7 @@ def load_keys() -> pd.DataFrame:
 
 
 # Get_adapted_tokenizer
+@lru_cache(maxsize=None)
 def get_adapated_tokenizer(name: str):
     """
     This function loads the adapted tokenizers used in training
@@ -228,13 +230,8 @@ class OccCANINE:
             if hf:
                 raise ValueError("Hugging Face loading is only supported for the 'HISCO' system. Please set 'hf' to False and provide a local model name.")
 
-            # TODO: Move into key loading method
-            # loaded_state = torch.load(name, weights_only=True)
-            try: # TODO: Delete this try except again
-                loaded_state = torch.load(name, weights_only=True)
-            # Load with weight_only=False if error
-            except Exception as e:
-                loaded_state = torch.load(name, weights_only=False)
+            loaded_state = self._load_local_state(name)
+            self._loaded_state = loaded_state
                             # tmp load keys from csv TODO: Remove this again
             if 'key' not in loaded_state.keys():
                  # Load from dir of 'name' + 'key.csv'
@@ -460,10 +457,11 @@ class OccCANINE:
 
         # Load state
         model_path = f'{self.name}'
-        try: # TODO: Delete this try except again
-            loaded_state = torch.load(model_path, weights_only = True, map_location=self.device)
-        except Exception as e:
-            loaded_state = torch.load(model_path, weights_only = False, map_location=self.device)
+        loaded_state = getattr(self, "_loaded_state", None)
+        if loaded_state is None:
+            loaded_state = self._load_local_state(model_path)
+        else:
+            self._loaded_state = None
 
         # Determine model type
         model_type = self._derive_model_type(loaded_state)
@@ -472,6 +470,12 @@ class OccCANINE:
         model = self._initialize_model(model_type=model_type, state_dict=loaded_state, baseline=baseline)
 
         return model, model_type
+
+    def _load_local_state(self, model_path: str):
+        try:
+            return torch.load(model_path, weights_only=True, map_location=self.device)
+        except Exception:
+            return torch.load(model_path, weights_only=False, map_location=self.device)
 
     def _derive_model_type(self, loaded_state):
         """
@@ -1290,10 +1294,6 @@ class OccCANINE:
 
         print("Estimated hours saved compared to human labeller (assuming 10 seconds per label):")
         print(f" ---> {h:.0f} hours, {m:.0f} minutes and {s:.0f} seconds")
-
-        print("")
-        print("If the time saved is valuable for you, please cite our paper:")
-        self.citation()
 
     def citation(self, BibTex = False):
         if BibTex:
