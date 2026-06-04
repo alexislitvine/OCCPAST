@@ -398,14 +398,16 @@ def _predict_csv_file(
                 pst_model_slug,
             )
 
-    if args.predict_system == "both":
-        lookup_path = Path(args.lookup)
-        if not lookup_path.exists():
-            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
-        if hisco_out is None or pst_out is None:
+    if hisco_out is not None or pst_out is not None:
+        lookup_path = None
+        if pst_out is not None:
+            lookup_path = Path(args.lookup)
+            if not lookup_path.exists():
+                raise FileNotFoundError(f"Lookup not found: {lookup_path}")
+        if args.predict_system == "both" and (hisco_out is None or pst_out is None):
             raise RuntimeError("Both prediction outputs are required to format combined results.")
 
-        print("Formatting/merging predictions…")
+        print("Formatting predictions…")
         entries, stats = format_predictions(
             hisco_csv_path=hisco_out,
             pst2_csv_path=pst_out,
@@ -420,10 +422,10 @@ def _predict_csv_file(
         else:
             print("No duplicate entries found.")
 
-        model_suffix = pst_model_slug or "unknown_model"
+        model_suffix = pst_model_slug or args.predict_system or "unknown_model"
         combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
         write_json(combined_json, serialize_formatted_entries(entries))
-        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
+        print(f"→ Wrote formatted JSON: {combined_json.name}")
         print(
             f"Total predictions processed: {stats.total_predictions_processed} | "
             f"Failures: {stats.failures}"
@@ -541,53 +543,58 @@ def main():
 
     # Format-only flow: merge existing prediction CSVs into final JSON without inference.
     if args.format_only:
-        if args.predict_system != "both":
-            raise ValueError("--format-only currently requires --predict-system both.")
-
         auto_search_dir = Path(args.output_dir) if args.output_dir else (Path(args.input_dir).parent / "predicted")
 
-        hisco_out = Path(args.hisco_csv) if args.hisco_csv else None
-        pst_out = Path(args.pst_csv) if args.pst_csv else None
+        hisco_out = Path(args.hisco_csv) if args.hisco_csv and args.predict_system in {"both", "hisco"} else None
+        pst_out = Path(args.pst_csv) if args.pst_csv and args.predict_system in {"both", "pst"} else None
 
-        if hisco_out is None:
+        if hisco_out is None and args.predict_system in {"both", "hisco"}:
             hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
             if hisco_out is not None:
                 print(f"Auto-selected latest HISCO CSV: {hisco_out}")
-        if pst_out is None:
+        if pst_out is None and args.predict_system in {"both", "pst"}:
             pst_out = _latest_prediction_csv(auto_search_dir, "pst")
             if pst_out is not None:
                 print(f"Auto-selected latest PST CSV: {pst_out}")
 
-        if hisco_out is None:
+        if hisco_out is None and args.predict_system in {"both", "hisco"}:
             raise FileNotFoundError(
                 f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
             )
-        if pst_out is None:
+        if pst_out is None and args.predict_system in {"both", "pst"}:
             raise FileNotFoundError(
                 f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
             )
 
-        if not hisco_out.exists():
+        if hisco_out is not None and not hisco_out.exists():
             raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
-        if not pst_out.exists():
+        if pst_out is not None and not pst_out.exists():
             raise FileNotFoundError(f"PST CSV not found: {pst_out}")
 
-        lookup_path = Path(args.lookup)
-        if not lookup_path.exists():
-            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
+        lookup_path = None
+        if pst_out is not None:
+            lookup_path = Path(args.lookup)
+            if not lookup_path.exists():
+                raise FileNotFoundError(f"Lookup not found: {lookup_path}")
 
-        predicted_dir = Path(args.output_dir) if args.output_dir else pst_out.parent
+        source_out = pst_out or hisco_out
+        if source_out is None:
+            raise RuntimeError("No prediction CSV selected for formatting.")
+
+        predicted_dir = Path(args.output_dir) if args.output_dir else source_out.parent
         predicted_dir.mkdir(parents=True, exist_ok=True)
 
-        ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
-        if ts_from_csv is None:
+        ts_from_csv, model_from_csv = (None, None)
+        if pst_out is not None:
+            ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
+        if ts_from_csv is None and hisco_out is not None:
             ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
             model_from_csv = model_from_csv or hisco_model_from_csv
         ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        model_suffix = sanitize_filename_component(model_from_csv or "unknown_model")
-        file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", pst_out.stem)
+        model_suffix = sanitize_filename_component(model_from_csv or args.predict_system or "unknown_model")
+        file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", source_out.stem)
 
-        print("Formatting/merging predictions…")
+        print("Formatting predictions…")
         entries, stats = format_predictions(
             hisco_csv_path=hisco_out,
             pst2_csv_path=pst_out,
@@ -604,7 +611,7 @@ def main():
 
         combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
         write_json(combined_json, serialize_formatted_entries(entries))
-        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
+        print(f"→ Wrote formatted JSON: {combined_json.name}")
         print(
             f"Total predictions processed: {stats.total_predictions_processed} | "
             f"Failures: {stats.failures}"
