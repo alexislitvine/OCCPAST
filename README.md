@@ -143,6 +143,8 @@ Recent behavior updates:
 
 - The PST lookup JSON prompt was removed in normal both-mode flow.
 - If --lookup is not passed, the built-in default path is used.
+- If an input CSV is missing `occ1_original`, the script prompts for the column to use for prediction.
+- Interactive CSV selection accepts multiple files separated by commas, ranges, or `all`.
 - New format-only mode can skip inference and build final JSON from existing CSV outputs.
 - In format-only mode, if --hisco-csv / --pst-csv are omitted, the script auto-selects the most recent matching files.
 
@@ -156,6 +158,18 @@ Example (full inference, non-interactive input):
 
 ```bash
 python3 predict_OCCPAST.py --input predictions/to_predict/cedric_french_strings.csv --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
+Example (multiple non-interactive inputs):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/file1.csv,predictions/to_predict/file2.csv --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
+Example (explicit prediction column):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/jobs.csv --prediction-column job_title --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
 ```
 
 Example (parallel HISCO+PST inference on one node/GPU):

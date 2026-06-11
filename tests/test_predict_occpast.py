@@ -1,0 +1,124 @@
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pandas as pd
+from tqdm import tqdm
+
+from predict_OCCPAST import (
+    _parse_csv_selection,
+    _preprocess_dataset,
+    _resolve_format_only_prediction_csvs,
+)
+
+
+class TestPredictOCCPASTSelection(unittest.TestCase):
+    def test_parse_csv_selection_accepts_comma_separated_indexes(self):
+        self.assertEqual(_parse_csv_selection("1,3,5", 5), [1, 3, 5])
+
+    def test_parse_csv_selection_accepts_comma_separated_indexes_with_spaces(self):
+        self.assertEqual(_parse_csv_selection("1, 3, 5", 5), [1, 3, 5])
+
+    def test_parse_csv_selection_accepts_ranges_and_deduplicates(self):
+        self.assertEqual(_parse_csv_selection("1,3-5,4", 6), [1, 3, 4, 5])
+
+
+class TestPredictOCCPASTFormatOnly(unittest.TestCase):
+    def test_default_both_allows_only_pst_prediction_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pst_csv = tmp_path / "jobs_predictions_pst_2026-06-08_120000_model.csv"
+            pst_csv.write_text("id,occ1,pst_1\n1,Baker,1,2,3\n", encoding="utf-8")
+            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="both")
+
+            hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, tmp_path)
+
+            self.assertIsNone(hisco_out)
+            self.assertEqual(pst_out, pst_csv)
+
+    def test_default_both_allows_only_hisco_prediction_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            hisco_csv = tmp_path / "jobs_predictions_hisco_2026-06-08_120000.csv"
+            hisco_csv.write_text("id,occ1,hisco_1\n1,Baker,12345\n", encoding="utf-8")
+            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="both")
+
+            hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, tmp_path)
+
+            self.assertEqual(hisco_out, hisco_csv)
+            self.assertIsNone(pst_out)
+
+    def test_explicit_hisco_still_requires_hisco_prediction_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "jobs_predictions_pst_2026-06-08_120000_model.csv").write_text(
+                "id,occ1,pst_1\n1,Baker,1,2,3\n",
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="hisco")
+
+            with self.assertRaises(FileNotFoundError):
+                _resolve_format_only_prediction_csvs(args, tmp_path)
+
+
+class TestPredictOCCPASTPreprocess(unittest.TestCase):
+    def setUp(self):
+        tqdm.pandas(desc="Cleaning strings")
+
+    def test_prompts_for_prediction_column_when_occ1_original_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            csv_path = tmp_path / "jobs.csv"
+            predicted_dir = tmp_path / "predicted"
+            predicted_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "job_title": ["Baker", "Smith, metal", ""],
+                    "note": ["a", "b", "c"],
+                }
+            ).to_csv(csv_path, index=False)
+
+            with patch("builtins.input", return_value="job_title"):
+                df = _preprocess_dataset(
+                    csv_path,
+                    predicted_dir,
+                    "jobs",
+                    "2026-06-08_120000",
+                    "utf-8",
+                    chunksize=2,
+                )
+
+            self.assertEqual(df["occ1_original"].tolist(), ["Baker", "Smith, metal"])
+            self.assertEqual(df["occ1_clean"].tolist(), ["Baker", "Smith metal"])
+
+    def test_uses_requested_prediction_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            csv_path = tmp_path / "jobs.csv"
+            predicted_dir = tmp_path / "predicted"
+            predicted_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "id": [1, 2],
+                    "job_title": ["Tailor", "Miner"],
+                }
+            ).to_csv(csv_path, index=False)
+
+            df = _preprocess_dataset(
+                csv_path,
+                predicted_dir,
+                "jobs",
+                "2026-06-08_120000",
+                "utf-8",
+                chunksize=2,
+                prediction_column="job_title",
+            )
+
+            self.assertEqual(df["occ1_original"].tolist(), ["Tailor", "Miner"])
+
+
+if __name__ == "__main__":
+    unittest.main()

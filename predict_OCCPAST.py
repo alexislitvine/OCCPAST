@@ -10,6 +10,7 @@ import re  # NEW
 import os
 
 MAX_PARALLEL_SYSTEMS = 2
+DEFAULT_PREDICTION_COLUMN = "occ1_original"
 
 def sanitize_filename_component(text: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
@@ -105,7 +106,7 @@ def select_csv_files(directory: Path) -> list[Path]:
     for idx, file in enumerate(csv_files, start=1):
         print(f"{idx}. {file.name}")
     while True:
-        choice = input("Enter file number(s) to predict, e.g. 1,3-5 or all: ").strip()
+        choice = input("Enter file number(s) to predict, separated by commas, e.g. 1,3-5 or all: ").strip()
         try:
             selected = _parse_csv_selection(choice, len(csv_files))
             return [csv_files[idx - 1] for idx in selected]
@@ -127,6 +128,60 @@ def prediction_output_dir(csv_file: Path, output_dir: str | None) -> Path:
     return Path(output_dir) if output_dir else (csv_file.parent.parent / "predicted")
 
 
+def _csv_columns(csv_file: Path, encoding: str) -> list[str]:
+    header = pd.read_csv(csv_file, nrows=0, encoding=encoding)
+    return list(header.columns)
+
+
+def _format_available_columns(columns: list[str]) -> str:
+    return "\n".join(f"{idx}. {column}" for idx, column in enumerate(columns, start=1))
+
+
+def _prompt_for_prediction_column(csv_file: Path, columns: list[str]) -> str:
+    print(f"{csv_file.name} does not contain '{DEFAULT_PREDICTION_COLUMN}'.")
+    print("Available columns:")
+    print(_format_available_columns(columns))
+
+    while True:
+        choice = input("Enter the column number or name to use for predicting: ").strip()
+        if not choice:
+            print("Please enter a column number or name.")
+            continue
+
+        if choice in columns:
+            return choice
+
+        try:
+            idx = int(choice)
+        except ValueError:
+            idx = None
+
+        if idx is not None and 1 <= idx <= len(columns):
+            return columns[idx - 1]
+
+        print(f"Column not found. Choose a number between 1 and {len(columns)}, or an exact column name.")
+
+
+def _resolve_prediction_column(
+    csv_file: Path,
+    columns: list[str],
+    requested_column: str | None = None,
+) -> str:
+    if requested_column:
+        if requested_column not in columns:
+            available = ", ".join(columns)
+            raise ValueError(
+                f"{csv_file} does not contain requested prediction column "
+                f"'{requested_column}'. Available columns: {available}"
+            )
+        return requested_column
+
+    if DEFAULT_PREDICTION_COLUMN in columns:
+        return DEFAULT_PREDICTION_COLUMN
+
+    return _prompt_for_prediction_column(csv_file, columns)
+
+
 def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
     pattern = f"*_predictions_{system}_*.csv"
     matches = list(search_dir.glob(pattern))
@@ -134,6 +189,36 @@ def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
         return None
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0]
+
+
+def _resolve_format_only_prediction_csvs(args, auto_search_dir: Path) -> tuple[Path | None, Path | None]:
+    hisco_out = Path(args.hisco_csv) if args.hisco_csv and args.predict_system in {"both", "hisco"} else None
+    pst_out = Path(args.pst_csv) if args.pst_csv and args.predict_system in {"both", "pst"} else None
+
+    if hisco_out is None and args.predict_system in {"both", "hisco"}:
+        hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
+        if hisco_out is not None:
+            print(f"Auto-selected latest HISCO CSV: {hisco_out}")
+    if pst_out is None and args.predict_system in {"both", "pst"}:
+        pst_out = _latest_prediction_csv(auto_search_dir, "pst")
+        if pst_out is not None:
+            print(f"Auto-selected latest PST CSV: {pst_out}")
+
+    if args.predict_system == "hisco" and hisco_out is None:
+        raise FileNotFoundError(
+            f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
+        )
+    if args.predict_system == "pst" and pst_out is None:
+        raise FileNotFoundError(
+            f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
+        )
+    if args.predict_system == "both" and hisco_out is None and pst_out is None:
+        raise FileNotFoundError(
+            f"No HISCO or PST prediction CSV found in {auto_search_dir}. "
+            "Provide --hisco-csv or --pst-csv explicitly."
+        )
+
+    return hisco_out, pst_out
 
 def _extract_prediction_metadata(path: Path, system: str) -> tuple[str | None, str | None]:
     m = re.match(
@@ -200,41 +285,51 @@ def _preprocess_dataset(
     ts: str,
     out_enc: str,
     chunksize: int,
+    prediction_column: str | None = None,
 ) -> pd.DataFrame:
     print(f"Preprocessing data from {csv_file.name}…")
 
     source_enc = detect_encoding(csv_file)
     print(f"Detected input encoding: {source_enc}")
+    source_column = _resolve_prediction_column(
+        csv_file,
+        _csv_columns(csv_file, source_enc),
+        prediction_column,
+    )
+    if source_column != DEFAULT_PREDICTION_COLUMN:
+        print(f"Using '{source_column}' for prediction input.")
 
     reader = pd.read_csv(csv_file, chunksize=chunksize, encoding=source_enc)
     clean_chunks = []
 
     for chunk in tqdm(reader, desc="Preprocessing chunks", unit="chunk"):
-        required_cols = {"id", "occ1_original"}
+        required_cols = {"id", source_column}
         missing_cols = required_cols - set(chunk.columns)
         if missing_cols:
             missing = ", ".join(sorted(missing_cols))
             raise ValueError(f"{csv_file} is missing required column(s): {missing}")
 
         mask = (
-            chunk["occ1_original"].notna()
-            & chunk["occ1_original"].astype(str).str.strip().astype(bool)
+            chunk[source_column].notna()
+            & chunk[source_column].astype(str).str.strip().astype(bool)
         )
         chunk = chunk.loc[mask].copy()
         if not chunk.empty:
+            if source_column != DEFAULT_PREDICTION_COLUMN:
+                chunk[DEFAULT_PREDICTION_COLUMN] = chunk[source_column]
             clean_chunks.append(chunk)
 
     if not clean_chunks:
-        raise ValueError(f"No non-empty occ1_original values found in {csv_file}")
+        raise ValueError(f"No non-empty {source_column} values found in {csv_file}")
 
     df = pd.concat(clean_chunks, ignore_index=True)
     df = df.drop_duplicates(subset=["id"])
 
     # Normalize accents first
-    df["occ1_original"] = normalize_series_nfc(df["occ1_original"])
+    df[DEFAULT_PREDICTION_COLUMN] = normalize_series_nfc(df[DEFAULT_PREDICTION_COLUMN])
 
     # Clean strings
-    df["occ1_clean"] = df["occ1_original"].progress_map(clean_string)
+    df["occ1_clean"] = df[DEFAULT_PREDICTION_COLUMN].progress_map(clean_string)
     df = df[df["occ1_clean"].astype(str).str.strip().astype(bool)]
 
     # Deduplicate by cleaned string BEFORE saving and predicting
@@ -306,7 +401,15 @@ def _predict_csv_file(
     predicted_dir = prediction_output_dir(csv_file, args.output_dir)
     predicted_dir.mkdir(parents=True, exist_ok=True)
 
-    df = _preprocess_dataset(csv_file, predicted_dir, file_base, ts, out_enc, chunksize)
+    df = _preprocess_dataset(
+        csv_file,
+        predicted_dir,
+        file_base,
+        ts,
+        out_enc,
+        chunksize,
+        args.prediction_column,
+    )
 
     hisco_out = None
     pst_out = None
@@ -455,6 +558,15 @@ def main():
         help="Directory containing CSV files to choose from when --input is not provided."
     )
     parser.add_argument(
+        "--prediction-column",
+        type=str,
+        default=None,
+        help=(
+            "Column containing occupation strings to predict. Defaults to "
+            f"'{DEFAULT_PREDICTION_COLUMN}'; if that column is missing, you will be prompted."
+        ),
+    )
+    parser.add_argument(
         "--lookup",
         type=str,
         default="/rds/user/adl38/hpc-work/OCCPAST2/Data/predictions/occpast/PST2CodeDict.json",
@@ -544,27 +656,7 @@ def main():
     # Format-only flow: merge existing prediction CSVs into final JSON without inference.
     if args.format_only:
         auto_search_dir = Path(args.output_dir) if args.output_dir else (Path(args.input_dir).parent / "predicted")
-
-        hisco_out = Path(args.hisco_csv) if args.hisco_csv and args.predict_system in {"both", "hisco"} else None
-        pst_out = Path(args.pst_csv) if args.pst_csv and args.predict_system in {"both", "pst"} else None
-
-        if hisco_out is None and args.predict_system in {"both", "hisco"}:
-            hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
-            if hisco_out is not None:
-                print(f"Auto-selected latest HISCO CSV: {hisco_out}")
-        if pst_out is None and args.predict_system in {"both", "pst"}:
-            pst_out = _latest_prediction_csv(auto_search_dir, "pst")
-            if pst_out is not None:
-                print(f"Auto-selected latest PST CSV: {pst_out}")
-
-        if hisco_out is None and args.predict_system in {"both", "hisco"}:
-            raise FileNotFoundError(
-                f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
-            )
-        if pst_out is None and args.predict_system in {"both", "pst"}:
-            raise FileNotFoundError(
-                f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
-            )
+        hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, auto_search_dir)
 
         if hisco_out is not None and not hisco_out.exists():
             raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
@@ -591,7 +683,16 @@ def main():
             ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
             model_from_csv = model_from_csv or hisco_model_from_csv
         ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        model_suffix = sanitize_filename_component(model_from_csv or args.predict_system or "unknown_model")
+        selected_system_suffix = (
+            "both"
+            if hisco_out is not None and pst_out is not None
+            else "hisco"
+            if hisco_out is not None
+            else "pst"
+            if pst_out is not None
+            else "unknown_model"
+        )
+        model_suffix = sanitize_filename_component(model_from_csv or selected_system_suffix)
         file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", source_out.stem)
 
         print("Formatting predictions…")
