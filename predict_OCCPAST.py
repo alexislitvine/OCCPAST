@@ -4,6 +4,7 @@ import argparse
 import pandas as pd
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from tqdm import tqdm
 import unicodedata
 import re  # NEW
@@ -11,6 +12,13 @@ import os
 
 MAX_PARALLEL_SYSTEMS = 2
 DEFAULT_PREDICTION_COLUMN = "occ1_original"
+
+
+@dataclass
+class FormatOnlyDataset:
+    base: str
+    hisco_csv: Path | None = None
+    pst_csv: Path | None = None
 
 def sanitize_filename_component(text: str) -> str:
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
@@ -191,43 +199,93 @@ def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
     return matches[0]
 
 
-def _resolve_format_only_prediction_csvs(args, auto_search_dir: Path) -> tuple[Path | None, Path | None]:
+def _prediction_csv_parts(path: Path) -> tuple[str, str] | None:
+    m = re.match(r"^(.+)_predictions_(hisco|pst)_.+$", path.stem)
+    if not m:
+        return None
+    base, system = m.groups()
+    return base, system
+
+
+def _preferred_prediction_csv(current: Path | None, candidate: Path) -> Path:
+    if current is None:
+        return candidate
+    try:
+        return candidate if candidate.stat().st_mtime > current.stat().st_mtime else current
+    except OSError:
+        return current
+
+
+def _discover_format_only_datasets(search_dir: Path, predict_system: str) -> list[FormatOnlyDataset]:
+    wanted_systems = {"hisco", "pst"} if predict_system == "both" else {predict_system}
+    datasets: dict[str, FormatOnlyDataset] = {}
+
+    for csv_path in sorted(search_dir.glob("*_predictions_*_*.csv")):
+        parts = _prediction_csv_parts(csv_path)
+        if parts is None:
+            continue
+        base, system = parts
+        if system not in wanted_systems:
+            continue
+
+        dataset = datasets.setdefault(base, FormatOnlyDataset(base=base))
+        if system == "hisco":
+            dataset.hisco_csv = _preferred_prediction_csv(dataset.hisco_csv, csv_path)
+        else:
+            dataset.pst_csv = _preferred_prediction_csv(dataset.pst_csv, csv_path)
+
+    return sorted(datasets.values(), key=lambda item: item.base)
+
+
+def _format_dataset_label(dataset: FormatOnlyDataset) -> str:
+    systems = []
+    if dataset.hisco_csv is not None:
+        systems.append(f"HISCO: {dataset.hisco_csv.name}")
+    if dataset.pst_csv is not None:
+        systems.append(f"PST: {dataset.pst_csv.name}")
+    return f"{dataset.base} [{' | '.join(systems)}]"
+
+
+def _select_format_only_datasets(datasets: list[FormatOnlyDataset]) -> list[FormatOnlyDataset]:
+    if not datasets:
+        raise ValueError("No prediction datasets available to format.")
+
+    print("Available prediction datasets:")
+    for idx, dataset in enumerate(datasets, start=1):
+        print(f"{idx}. {_format_dataset_label(dataset)}")
+
+    while True:
+        choice = input("Enter dataset number(s) to format, separated by commas, e.g. 1,3-5 or all: ").strip()
+        try:
+            selected = _parse_csv_selection(choice, len(datasets))
+            return [datasets[idx - 1] for idx in selected]
+        except ValueError as exc:
+            print(exc)
+
+
+def _explicit_format_only_dataset(args) -> FormatOnlyDataset | None:
     hisco_out = Path(args.hisco_csv) if args.hisco_csv and args.predict_system in {"both", "hisco"} else None
     pst_out = Path(args.pst_csv) if args.pst_csv and args.predict_system in {"both", "pst"} else None
+    if hisco_out is None and pst_out is None:
+        return None
 
-    if hisco_out is None and args.predict_system in {"both", "hisco"}:
-        hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
-        if hisco_out is not None:
-            print(f"Auto-selected latest HISCO CSV: {hisco_out}")
-    if pst_out is None and args.predict_system in {"both", "pst"}:
-        pst_out = _latest_prediction_csv(auto_search_dir, "pst")
-        if pst_out is not None:
-            print(f"Auto-selected latest PST CSV: {pst_out}")
-
-    if args.predict_system == "hisco" and hisco_out is None:
-        raise FileNotFoundError(
-            f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
-        )
-    if args.predict_system == "pst" and pst_out is None:
-        raise FileNotFoundError(
-            f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
-        )
-    if args.predict_system == "both" and hisco_out is None and pst_out is None:
-        raise FileNotFoundError(
-            f"No HISCO or PST prediction CSV found in {auto_search_dir}. "
-            "Provide --hisco-csv or --pst-csv explicitly."
-        )
-
-    return hisco_out, pst_out
+    source_out = pst_out or hisco_out
+    base = re.sub(r"_predictions_(hisco|pst)_.*$", "", source_out.stem)
+    return FormatOnlyDataset(base=base, hisco_csv=hisco_out, pst_csv=pst_out)
 
 def _extract_prediction_metadata(path: Path, system: str) -> tuple[str | None, str | None]:
-    m = re.match(
-        rf".*_predictions_{re.escape(system)}_(\d{{4}}-\d{{2}}-\d{{2}}_\d{{6}})(?:_(.+))?$",
-        path.stem,
-    )
+    m = re.match(rf".*_predictions_{re.escape(system)}_(.+)$", path.stem)
     if not m:
         return None, None
-    return m.group(1), m.group(2)
+
+    rest = m.group(1)
+    ts_match = re.match(
+        r"^(\d{4}-\d{2}-\d{2}(?:_\d{6}| \d{2}:\d{2}:\d{2}))(?:_(.+))?$",
+        rest,
+    )
+    if not ts_match:
+        return None, None
+    return ts_match.group(1), ts_match.group(2)
 
 
 def _select_pst_model(args) -> tuple[str | None, Path | None]:
@@ -535,6 +593,73 @@ def _predict_csv_file(
         )
 
 
+def _format_prediction_dataset(
+    dataset: FormatOnlyDataset,
+    args,
+    csv_encoding: str = "utf-8-sig",
+) -> Path:
+    hisco_out = dataset.hisco_csv
+    pst_out = dataset.pst_csv
+
+    if hisco_out is None and pst_out is None:
+        raise RuntimeError(f"No prediction CSV selected for formatting dataset '{dataset.base}'.")
+    if hisco_out is not None and not hisco_out.exists():
+        raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
+    if pst_out is not None and not pst_out.exists():
+        raise FileNotFoundError(f"PST CSV not found: {pst_out}")
+
+    lookup_path = None
+    if pst_out is not None:
+        lookup_path = Path(args.lookup)
+        if not lookup_path.exists():
+            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
+
+    source_out = pst_out or hisco_out
+    predicted_dir = Path(args.output_dir) if args.output_dir else source_out.parent
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_from_csv, model_from_csv = (None, None)
+    if pst_out is not None:
+        ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
+    if ts_from_csv is None and hisco_out is not None:
+        ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
+        model_from_csv = model_from_csv or hisco_model_from_csv
+    ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    selected_system_suffix = (
+        "both"
+        if hisco_out is not None and pst_out is not None
+        else "hisco"
+        if hisco_out is not None
+        else "pst"
+    )
+    model_suffix = sanitize_filename_component(model_from_csv or selected_system_suffix)
+    file_base = dataset.base
+
+    print(f"Formatting predictions for {file_base}...")
+    entries, stats = format_predictions(
+        hisco_csv_path=hisco_out,
+        pst2_csv_path=pst_out,
+        pst2_lookup_json_path=lookup_path,
+        csv_encoding=csv_encoding,
+    )
+
+    if stats.duplicate_strings:
+        print("Duplicate entries found for the following strings:")
+        for s, c in stats.duplicate_strings:
+            print(f'"{s}" occurs {c} times')
+    else:
+        print("No duplicate entries found.")
+
+    combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
+    write_json(combined_json, serialize_formatted_entries(entries))
+    print(f"→ Wrote formatted JSON: {combined_json.name}")
+    print(
+        f"Total predictions processed: {stats.total_predictions_processed} | "
+        f"Failures: {stats.failures}"
+    )
+    return combined_json
+
+
 def main():
     # CLI flags
     parser = argparse.ArgumentParser(
@@ -656,67 +781,19 @@ def main():
     # Format-only flow: merge existing prediction CSVs into final JSON without inference.
     if args.format_only:
         auto_search_dir = Path(args.output_dir) if args.output_dir else (Path(args.input_dir).parent / "predicted")
-        hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, auto_search_dir)
-
-        if hisco_out is not None and not hisco_out.exists():
-            raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
-        if pst_out is not None and not pst_out.exists():
-            raise FileNotFoundError(f"PST CSV not found: {pst_out}")
-
-        lookup_path = None
-        if pst_out is not None:
-            lookup_path = Path(args.lookup)
-            if not lookup_path.exists():
-                raise FileNotFoundError(f"Lookup not found: {lookup_path}")
-
-        source_out = pst_out or hisco_out
-        if source_out is None:
-            raise RuntimeError("No prediction CSV selected for formatting.")
-
-        predicted_dir = Path(args.output_dir) if args.output_dir else source_out.parent
-        predicted_dir.mkdir(parents=True, exist_ok=True)
-
-        ts_from_csv, model_from_csv = (None, None)
-        if pst_out is not None:
-            ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
-        if ts_from_csv is None and hisco_out is not None:
-            ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
-            model_from_csv = model_from_csv or hisco_model_from_csv
-        ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        selected_system_suffix = (
-            "both"
-            if hisco_out is not None and pst_out is not None
-            else "hisco"
-            if hisco_out is not None
-            else "pst"
-            if pst_out is not None
-            else "unknown_model"
-        )
-        model_suffix = sanitize_filename_component(model_from_csv or selected_system_suffix)
-        file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", source_out.stem)
-
-        print("Formatting predictions…")
-        entries, stats = format_predictions(
-            hisco_csv_path=hisco_out,
-            pst2_csv_path=pst_out,
-            pst2_lookup_json_path=lookup_path,
-            csv_encoding="utf-8-sig",
-        )
-
-        if stats.duplicate_strings:
-            print("Duplicate entries found for the following strings:")
-            for s, c in stats.duplicate_strings:
-                print(f'"{s}" occurs {c} times')
+        explicit_dataset = _explicit_format_only_dataset(args)
+        if explicit_dataset is not None:
+            datasets_to_format = [explicit_dataset]
         else:
-            print("No duplicate entries found.")
+            available_datasets = _discover_format_only_datasets(auto_search_dir, args.predict_system)
+            if not available_datasets:
+                wanted = "HISCO or PST" if args.predict_system == "both" else args.predict_system.upper()
+                raise FileNotFoundError(f"No {wanted} prediction CSV found in {auto_search_dir}.")
+            datasets_to_format = _select_format_only_datasets(available_datasets)
 
-        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
-        write_json(combined_json, serialize_formatted_entries(entries))
-        print(f"→ Wrote formatted JSON: {combined_json.name}")
-        print(
-            f"Total predictions processed: {stats.total_predictions_processed} | "
-            f"Failures: {stats.failures}"
-        )
+        for idx, dataset in enumerate(datasets_to_format, start=1):
+            print(f"\n=== Formatting dataset {idx}/{len(datasets_to_format)}: {dataset.base} ===")
+            _format_prediction_dataset(dataset, args)
         print("All done ✅")
         return
 

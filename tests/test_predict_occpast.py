@@ -8,9 +8,11 @@ import pandas as pd
 from tqdm import tqdm
 
 from predict_OCCPAST import (
+    _discover_format_only_datasets,
+    _explicit_format_only_dataset,
     _parse_csv_selection,
     _preprocess_dataset,
-    _resolve_format_only_prediction_csvs,
+    _select_format_only_datasets,
 )
 
 
@@ -26,41 +28,57 @@ class TestPredictOCCPASTSelection(unittest.TestCase):
 
 
 class TestPredictOCCPASTFormatOnly(unittest.TestCase):
-    def test_default_both_allows_only_pst_prediction_csv(self):
+    def test_discovers_dataset_with_only_pst_prediction_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             pst_csv = tmp_path / "jobs_predictions_pst_2026-06-08_120000_model.csv"
-            pst_csv.write_text("id,occ1,pst_1\n1,Baker,1,2,3\n", encoding="utf-8")
-            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="both")
+            pst_csv.write_text("id,occ1,pst_1\n1,Baker,\"1,2,3\"\n", encoding="utf-8")
 
-            hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, tmp_path)
+            datasets = _discover_format_only_datasets(tmp_path, "both")
 
-            self.assertIsNone(hisco_out)
-            self.assertEqual(pst_out, pst_csv)
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(datasets[0].base, "jobs")
+            self.assertIsNone(datasets[0].hisco_csv)
+            self.assertEqual(datasets[0].pst_csv, pst_csv)
 
-    def test_default_both_allows_only_hisco_prediction_csv(self):
+    def test_discovers_dataset_with_only_hisco_prediction_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             hisco_csv = tmp_path / "jobs_predictions_hisco_2026-06-08_120000.csv"
             hisco_csv.write_text("id,occ1,hisco_1\n1,Baker,12345\n", encoding="utf-8")
-            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="both")
 
-            hisco_out, pst_out = _resolve_format_only_prediction_csvs(args, tmp_path)
+            datasets = _discover_format_only_datasets(tmp_path, "both")
 
-            self.assertEqual(hisco_out, hisco_csv)
-            self.assertIsNone(pst_out)
+            self.assertEqual(len(datasets), 1)
+            self.assertEqual(datasets[0].hisco_csv, hisco_csv)
+            self.assertIsNone(datasets[0].pst_csv)
 
-    def test_explicit_hisco_still_requires_hisco_prediction_csv(self):
+    def test_discovers_multiple_datasets_and_selects_requested_ones(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            (tmp_path / "jobs_predictions_pst_2026-06-08_120000_model.csv").write_text(
-                "id,occ1,pst_1\n1,Baker,1,2,3\n",
-                encoding="utf-8",
-            )
-            args = SimpleNamespace(hisco_csv=None, pst_csv=None, predict_system="hisco")
+            (tmp_path / "jobs_predictions_pst_2026-06-08_120000_model.csv").write_text("", encoding="utf-8")
+            (tmp_path / "miners_predictions_hisco_2026-06-08_120000.csv").write_text("", encoding="utf-8")
+            (tmp_path / "tailors_predictions_pst_2026-06-08_120000_model.csv").write_text("", encoding="utf-8")
 
-            with self.assertRaises(FileNotFoundError):
-                _resolve_format_only_prediction_csvs(args, tmp_path)
+            datasets = _discover_format_only_datasets(tmp_path, "both")
+
+            with patch("builtins.input", return_value="1,3"):
+                selected = _select_format_only_datasets(datasets)
+
+            self.assertEqual([dataset.base for dataset in selected], ["jobs", "tailors"])
+
+    def test_explicit_csv_paths_skip_dataset_discovery(self):
+        args = SimpleNamespace(
+            hisco_csv="/tmp/jobs_predictions_hisco_2026-06-08_120000.csv",
+            pst_csv=None,
+            predict_system="both",
+        )
+
+        dataset = _explicit_format_only_dataset(args)
+
+        self.assertEqual(dataset.base, "jobs")
+        self.assertEqual(dataset.hisco_csv, Path(args.hisco_csv))
+        self.assertIsNone(dataset.pst_csv)
 
 
 class TestPredictOCCPASTPreprocess(unittest.TestCase):
