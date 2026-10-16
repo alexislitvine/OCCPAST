@@ -13,6 +13,7 @@ from predict_OCCPAST import (
     _parse_csv_selection,
     _preprocess_dataset,
     _select_format_only_datasets,
+    _validate_language_mode_args,
 )
 
 
@@ -107,6 +108,7 @@ class TestPredictOCCPASTPreprocess(unittest.TestCase):
                     "2026-06-08_120000",
                     "utf-8",
                     chunksize=2,
+                    language="en",
                 )
 
             self.assertEqual(df["occ1_original"].tolist(), ["Baker", "Smith, metal"])
@@ -133,9 +135,109 @@ class TestPredictOCCPASTPreprocess(unittest.TestCase):
                 "utf-8",
                 chunksize=2,
                 prediction_column="job_title",
+                language="en",
             )
 
             self.assertEqual(df["occ1_original"].tolist(), ["Tailor", "Miner"])
+
+    def test_multilingual_mode_uses_language_column_and_unk_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            csv_path = tmp_path / "jobs.csv"
+            predicted_dir = tmp_path / "predicted"
+            predicted_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "id": [1, 2, 3, 4],
+                    "occ1_original": ["Tailor", "Miner", "Baker", "Teacher"],
+                    "lang_col": ["en", "", None, "fr"],
+                }
+            ).to_csv(csv_path, index=False)
+
+            df = _preprocess_dataset(
+                csv_path,
+                predicted_dir,
+                "jobs",
+                "2026-06-08_120000",
+                "utf-8",
+                chunksize=2,
+                language_column="lang_col",
+                unk_lang="unk",
+            )
+
+            self.assertEqual(df["lang"].tolist(), ["en", "unk", "unk", "fr"])
+
+    def test_deduplicates_by_occ_and_language_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            csv_path = tmp_path / "jobs.csv"
+            predicted_dir = tmp_path / "predicted"
+            predicted_dir.mkdir()
+            pd.DataFrame(
+                {
+                    "id": [1, 2, 3],
+                    "occ1_original": ["Baker", "Baker", "Baker"],
+                    "lang_col": ["en", "fr", "en"],
+                }
+            ).to_csv(csv_path, index=False)
+
+            df = _preprocess_dataset(
+                csv_path,
+                predicted_dir,
+                "jobs",
+                "2026-06-08_120000",
+                "utf-8",
+                chunksize=3,
+                language_column="lang_col",
+                unk_lang="unk",
+            )
+
+            self.assertEqual(len(df), 2)
+            self.assertEqual(sorted(df["lang"].tolist()), ["en", "fr"])
+
+
+class TestPredictOCCPASTLanguageArgs(unittest.TestCase):
+    def test_requires_exactly_one_language_mode(self):
+        args = SimpleNamespace(
+            format_only=False,
+            language=None,
+            language_column=None,
+            unk_lang="unk",
+        )
+        with self.assertRaises(ValueError):
+            _validate_language_mode_args(args)
+
+    def test_rejects_both_language_modes(self):
+        args = SimpleNamespace(
+            format_only=False,
+            language="en",
+            language_column="lang",
+            unk_lang="unk",
+        )
+        with self.assertRaises(ValueError):
+            _validate_language_mode_args(args)
+
+    def test_accepts_single_language_mode(self):
+        args = SimpleNamespace(
+            format_only=False,
+            language="EN",
+            language_column=None,
+            unk_lang="UNK",
+        )
+        _validate_language_mode_args(args)
+        self.assertEqual(args.language, "en")
+        self.assertEqual(args.unk_lang, "unk")
+
+    def test_accepts_multilingual_mode(self):
+        args = SimpleNamespace(
+            format_only=False,
+            language=None,
+            language_column=" lang ",
+            unk_lang="UNK",
+        )
+        _validate_language_mode_args(args)
+        self.assertEqual(args.language_column, "lang")
+        self.assertEqual(args.unk_lang, "unk")
 
 
 if __name__ == "__main__":

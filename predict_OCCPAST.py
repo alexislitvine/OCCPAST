@@ -63,6 +63,52 @@ def clean_string(text: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
+def _normalize_fallback_language(value: str) -> str:
+    lang = str(value).strip().lower()
+    if not lang:
+        raise ValueError("--unk-lang must be a non-empty string.")
+    return lang
+
+
+def _normalize_required_language(value: str, *, arg_name: str) -> str:
+    lang = str(value).strip().lower()
+    if not lang:
+        raise ValueError(f"{arg_name} must be a non-empty string.")
+    return lang
+
+
+def _normalize_optional_language(value, fallback: str) -> str:
+    if value is None:
+        return fallback
+    lang = str(value).strip().lower()
+    if lang in {"", "nan", "none", "null", "<na>", "na"}:
+        return fallback
+    return lang
+
+
+def _validate_language_mode_args(args) -> None:
+    if args.format_only:
+        return
+
+    has_single_language = args.language is not None
+    has_multilingual = args.language_column is not None
+
+    if has_single_language == has_multilingual:
+        raise ValueError(
+            "Specify exactly one language mode: --language (single-language dataset) "
+            "or --language-column (multilingual dataset with fallback)."
+        )
+
+    args.unk_lang = _normalize_fallback_language(args.unk_lang)
+
+    if has_single_language:
+        args.language = _normalize_required_language(args.language, arg_name="--language")
+    else:
+        args.language_column = str(args.language_column).strip()
+        if not args.language_column:
+            raise ValueError("--language-column must be a non-empty column name.")
+
 # import the formatting module:
 from format_preds import (
     format_predictions,
@@ -344,6 +390,9 @@ def _preprocess_dataset(
     out_enc: str,
     chunksize: int,
     prediction_column: str | None = None,
+    language: str | None = None,
+    language_column: str | None = None,
+    unk_lang: str = "unk",
 ) -> pd.DataFrame:
     print(f"Preprocessing data from {csv_file.name}…")
 
@@ -362,6 +411,8 @@ def _preprocess_dataset(
 
     for chunk in tqdm(reader, desc="Preprocessing chunks", unit="chunk"):
         required_cols = {"id", source_column}
+        if language_column is not None:
+            required_cols.add(language_column)
         missing_cols = required_cols - set(chunk.columns)
         if missing_cols:
             missing = ", ".join(sorted(missing_cols))
@@ -383,6 +434,19 @@ def _preprocess_dataset(
     df = pd.concat(clean_chunks, ignore_index=True)
     df = df.drop_duplicates(subset=["id"])
 
+    if language_column is None:
+        if language is None:
+            raise ValueError("Single-language mode requires --language.")
+        df["lang"] = language
+    else:
+        normalized_lang = df[language_column].map(lambda x: _normalize_optional_language(x, unk_lang))
+        fallback_count = int((normalized_lang == unk_lang).sum())
+        if fallback_count:
+            print(
+                f"Applied '{unk_lang}' fallback for {fallback_count} row(s) with missing/invalid language."
+            )
+        df["lang"] = normalized_lang
+
     # Normalize accents first
     df[DEFAULT_PREDICTION_COLUMN] = normalize_series_nfc(df[DEFAULT_PREDICTION_COLUMN])
 
@@ -390,11 +454,11 @@ def _preprocess_dataset(
     df["occ1_clean"] = df[DEFAULT_PREDICTION_COLUMN].progress_map(clean_string)
     df = df[df["occ1_clean"].astype(str).str.strip().astype(bool)]
 
-    # Deduplicate by cleaned string BEFORE saving and predicting
+    # Deduplicate by cleaned (string, language) pair BEFORE saving and predicting
     before = len(df)
-    df = df.drop_duplicates(subset=["occ1_clean"], keep="first")
+    df = df.drop_duplicates(subset=["occ1_clean", "lang"], keep="first")
     after = len(df)
-    print(f"Removed {before - after} duplicate string(s) based on 'occ1_clean'.")
+    print(f"Removed {before - after} duplicate row(s) based on ('occ1_clean', 'lang').")
 
     cleaned_csv_out = predicted_dir / f"{file_base}_cleaned_{ts}.csv"
     df.to_csv(cleaned_csv_out, index=False, encoding=out_enc)
@@ -410,6 +474,7 @@ def _run_system_predictions(
     system: str,
     model,
     occ1_clean: list[str],
+    langs: list[str],
     ids: list,
     occ1_original: list[str],
     out_dir: Path,
@@ -424,6 +489,7 @@ def _run_system_predictions(
     print(f"Running {system.upper()} predictions…")
     preds = model(
         occ1_clean,
+        lang=langs,
         k_pred=k_pred,
         debug=debug,
         max_num_codes=max_num_codes,
@@ -431,6 +497,7 @@ def _run_system_predictions(
     preds["id"] = ids
     preds["occ1"] = occ1_original
     preds["occ1_clean"] = occ1_clean
+    preds["lang"] = langs
 
     if system == "hisco":
         out_path = out_dir / f"{file_base}_predictions_hisco_{ts}.csv"
@@ -467,11 +534,15 @@ def _predict_csv_file(
         out_enc,
         chunksize,
         args.prediction_column,
+        args.language,
+        args.language_column,
+        args.unk_lang,
     )
 
     hisco_out = None
     pst_out = None
     occ1_clean_values = df["occ1_clean"].tolist()
+    lang_values = df["lang"].tolist()
     id_values = df["id"].tolist()
     occ1_original_values = df["occ1_original"].tolist()
 
@@ -485,6 +556,7 @@ def _predict_csv_file(
                     "hisco",
                     mod_hisco,
                     occ1_clean_values,
+                    lang_values,
                     id_values,
                     occ1_original_values,
                     predicted_dir,
@@ -500,6 +572,7 @@ def _predict_csv_file(
                     "pst",
                     mod_pst,
                     occ1_clean_values,
+                    lang_values,
                     id_values,
                     occ1_original_values,
                     predicted_dir,
@@ -531,6 +604,7 @@ def _predict_csv_file(
                 "hisco",
                 mod_hisco,
                 occ1_clean_values,
+                lang_values,
                 id_values,
                 occ1_original_values,
                 predicted_dir,
@@ -547,6 +621,7 @@ def _predict_csv_file(
                 "pst",
                 mod_pst,
                 occ1_clean_values,
+                lang_values,
                 id_values,
                 occ1_original_values,
                 predicted_dir,
@@ -692,6 +767,30 @@ def main():
         ),
     )
     parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help=(
+            "Single-language dataset mode: apply this language to all rows "
+            "(e.g., en, fr, unk). Mutually exclusive with --language-column."
+        ),
+    )
+    parser.add_argument(
+        "--language-column",
+        type=str,
+        default=None,
+        help=(
+            "Multilingual dataset mode: column with row-level language values. "
+            "Missing/invalid values fall back to --unk-lang."
+        ),
+    )
+    parser.add_argument(
+        "--unk-lang",
+        type=str,
+        default="unk",
+        help="Fallback language code used in multilingual mode when language values are missing/invalid.",
+    )
+    parser.add_argument(
         "--lookup",
         type=str,
         default="/rds/user/adl38/hpc-work/OCCPAST2/Data/predictions/occpast/PST2CodeDict.json",
@@ -775,6 +874,7 @@ def main():
         help="Path to an existing PST predictions CSV (used with --format-only).",
     )
     args = parser.parse_args()
+    _validate_language_mode_args(args)
 
     tqdm.pandas(desc="Cleaning strings")
 
