@@ -71,7 +71,8 @@ python3 train_mixer.py --train-data Data/TOYDATA.csv --val-data Data/TOYDATA.csv
 
 ### finetune.py
 
-Purpose: Finetune a model on a custom dataset.
+Purpose: Finetune a model on a custom dataset. Training is step-centric:
+`global_step` means optimizer update step, while `global_micro_step` means one dataloader batch per rank.
 
 Help:
 
@@ -82,14 +83,41 @@ python3 finetune.py --help
 Example:
 
 ```bash
-python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --num-epochs 1 --batch-size 64 --save-path ./Finetuned
+python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 1000 --per-gpu-batch-size 64 --grad-accum-steps 1 --save-path ./Finetuned
 ```
 
-Late-phase example (one-liner):
+Batch-size semantics:
+
+- `per_gpu_batch_size`: samples per GPU/process per dataloader forward/backward pass.
+- `world_size`: number of distributed processes/GPUs.
+- `grad_accum_steps`: micro-batches accumulated before `optimizer.step()`.
+- `global_micro_batch_size = per_gpu_batch_size * world_size`.
+- `effective_batch_size = per_gpu_batch_size * world_size * grad_accum_steps`.
+
+`--batch-size` is still accepted as a deprecated alias for `--per-gpu-batch-size`.
+
+Print the resolved schedule without training:
 
 ```bash
-python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --late-grad-accum 4 --late-lr-mult 0.5 --late-warmup-steps 100 --num-epochs 1 --batch-size 64 --save-path ./Finetuned
+python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 1000 --per-gpu-batch-size 64 --grad-accum-steps 1 --save-path ./Finetuned --print-training-schedule-only
 ```
+
+Late-phase accumulation example:
+
+```bash
+python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 100000 --per-gpu-batch-size 512 --grad-accum-steps 1 --late-phase-start-step 50000 --late-phase-steps 75000 --late-phase-grad-accum-steps 2 4 --late-phase-lr-mults 0.7 0.7 --save-path ./Finetuned
+```
+
+All scheduling arguments (`--max-steps`, `--eval-interval`, `--save-interval`, `--late-phase-start-step`, `--late-phase-steps`, LR schedule steps, W&B step logging) use optimizer update steps. Epochs are only a backward-compatible way to derive `--max-steps` when `--max-steps` is omitted.
+
+The script writes `training_schedule.csv` in `--save-path` and logs the same table to W&B when `--log-wandb` is enabled.
+
+Restart behavior:
+
+- Checkpoints are written to `<save-path>/last.bin` and `<save-path>/<global_step>.bin`.
+- Restart with the same `--save-path`; model, optimizer, scheduler, `global_step`, and `global_micro_step` are restored.
+- In Slurm, send `SIGUSR1` before the time limit so the trainer saves at the next optimizer-step boundary and exits cleanly.
+- The included `slurm_finetune_pst2.sbatch` uses `#SBATCH --signal=USR1@600` for this purpose.
 
 ### finetune-2.py
 
@@ -104,7 +132,7 @@ python3 finetune-2.py --help
 Example:
 
 ```bash
-python3 finetune-2.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --num-epochs 1 --batch-size 64 --save-path ./Finetuned
+python3 finetune-2.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 1000 --per-gpu-batch-size 64 --grad-accum-steps 1 --save-path ./Finetuned
 ```
 
 ### predict_OCCPAST.py
@@ -115,6 +143,8 @@ Recent behavior updates:
 
 - The PST lookup JSON prompt was removed in normal both-mode flow.
 - If --lookup is not passed, the built-in default path is used.
+- If an input CSV is missing `occ1_original`, the script prompts for the column to use for prediction.
+- Interactive CSV selection accepts multiple files separated by commas, ranges, or `all`.
 - New format-only mode can skip inference and build final JSON from existing CSV outputs.
 - In format-only mode, if --hisco-csv / --pst-csv are omitted, the script auto-selects the most recent matching files.
 - Output filenames are timestamp-aligned, and final merged JSON appends the PST model suffix: `_processedPredictions_<timestamp>_<model_name>.json`.
@@ -129,6 +159,24 @@ Example (full inference, non-interactive input):
 
 ```bash
 python3 predict_OCCPAST.py --input predictions/to_predict/cedric_french_strings.csv --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
+Example (multiple non-interactive inputs):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/file1.csv,predictions/to_predict/file2.csv --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
+Example (explicit prediction column):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/jobs.csv --prediction-column job_title --predict-system both --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+```
+
+Example (parallel HISCO+PST inference on one node/GPU):
+
+```bash
+python3 predict_OCCPAST.py --input predictions/to_predict/cedric_french_strings.csv --predict-system both --parallel-systems --batch-size 512 --parallel-workers 2 --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
 ```
 
 Example (format-only using latest files automatically):
@@ -162,19 +210,27 @@ python3 format_preds.py --hisco predictions/predicted/cedric_french_strings_pred
 Distributed Notes
 -----------------
 
-When using Slurm, use one launcher strategy consistently:
+When using Slurm, use one launcher strategy consistently. For multi-GPU finetuning in this repo, the recommended pattern is one `srun` task per node and `torchrun` spawning one rank per GPU on that node.
 
-- torchrun without srun
-- srun without torchrun
-
-Examples:
+Example single-node local launch:
 
 ```bash
-torchrun --nproc_per_node=4 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep
+torchrun --nproc_per_node=4 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 1000 --per-gpu-batch-size 64 --grad-accum-steps 1
 ```
 
+Example Slurm script:
+
 ```bash
-srun --mpi=pmix_v3 --ntasks=4 --gpus-per-task=1 python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --distributed
+export WANDB_API_KEY=...
+sbatch slurm_finetune_pst2.sbatch
+```
+
+For 4 GPUs with `--per-gpu-batch-size 512` and `--grad-accum-steps 1`, the initial `global_micro_batch_size` and `effective_batch_size` are both `2048`. A late schedule of `--late-phase-grad-accum-steps 2 4 8` changes effective batch to `4096`, `8192`, and `16384` without changing per-GPU memory use.
+
+Legacy direct Slurm launch without torchrun is still possible when using one task per GPU:
+
+```bash
+srun --mpi=pmix_v3 --ntasks=4 --gpus-per-task=1 python3 finetune.py --dataset Data/Training_data_other/pst2.csv --input-col occ1 --target-cols pst2_1 pst2_2 --use-within-block-sep --max-steps 1000 --per-gpu-batch-size 64 --grad-accum-steps 1 --distributed
 ```
 
 Notes

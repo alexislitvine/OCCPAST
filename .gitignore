@@ -186,6 +186,7 @@ histocc/Data/Tmp_finetune/
 
 # Helper scripts not for sharing
 /helper_scripts/
+slurm_finetune_pst2.sbatch
 
 # .vs
 .vs/

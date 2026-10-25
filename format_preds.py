@@ -208,23 +208,29 @@ def _find_duplicates(entries: List[FormattedEntry]) -> List[Tuple[str, int]]:
 
 
 def format_predictions(
-    hisco_csv_path: Path,
-    pst2_csv_path: Path,
-    pst2_lookup_json_path: Path,
+    hisco_csv_path: Path | None = None,
+    pst2_csv_path: Path | None = None,
+    pst2_lookup_json_path: Path | None = None,
     csv_encoding: str = "utf-8",
 ) -> Tuple[List[FormattedEntry], FormatStats]:
-    raw_hisco = read_csv_dicts(hisco_csv_path, encoding=csv_encoding)
-    raw_pst2 = read_csv_dicts(pst2_csv_path, encoding=csv_encoding)
-    pst2_lookup = load_pst2_code_lookup(pst2_lookup_json_path)
+    if hisco_csv_path is None and pst2_csv_path is None:
+        raise ValueError("At least one prediction CSV path is required.")
 
     formatted: List[FormattedEntry] = []
     counters = {"count": 0, "failure_count": 0}
 
-    for row in tqdm(raw_pst2, desc="Processing PST2 predictions", unit="row"):
-        _process_entry(row, "pst", pst2_lookup, formatted, counters)
+    if pst2_csv_path is not None:
+        if pst2_lookup_json_path is None:
+            raise ValueError("pst2_lookup_json_path is required when formatting PST predictions.")
+        raw_pst2 = read_csv_dicts(pst2_csv_path, encoding=csv_encoding)
+        pst2_lookup = load_pst2_code_lookup(pst2_lookup_json_path)
+        for row in tqdm(raw_pst2, desc="Processing PST2 predictions", unit="row"):
+            _process_entry(row, "pst", pst2_lookup, formatted, counters)
 
-    for row in tqdm(raw_hisco, desc="Processing HISCO predictions", unit="row"):
-        _process_entry(row, "hisco", pst2_lookup=None, formatted_entries=formatted, counters=counters)
+    if hisco_csv_path is not None:
+        raw_hisco = read_csv_dicts(hisco_csv_path, encoding=csv_encoding)
+        for row in tqdm(raw_hisco, desc="Processing HISCO predictions", unit="row"):
+            _process_entry(row, "hisco", pst2_lookup=None, formatted_entries=formatted, counters=counters)
 
     duplicates = _find_duplicates(formatted)
 
@@ -356,9 +362,9 @@ def deserialize_formatted_entries(data: List[dict]) -> List[FormattedEntry]:
 # -----------------------
 
 def main_cli(
-    hisco_csv: str,
-    pst2_csv: str,
-    pst2_lookup_json: str,
+    hisco_csv: str | None,
+    pst2_csv: str | None,
+    pst2_lookup_json: str | None,
     output_formatted_json: str,
     chunk_out_dir: str | None = None,
     chunk_base_name: str = "census_below_preds",
@@ -376,9 +382,9 @@ def main_cli(
         --out ./2025_12_9_census_over_processedPredictions.json \
         --chunks ./chunks --base census_below_preds --n 300
     """
-    hisco_csv_path = Path(hisco_csv)
-    pst2_csv_path = Path(pst2_csv)
-    pst2_lookup_path = Path(pst2_lookup_json)
+    hisco_csv_path = Path(hisco_csv) if hisco_csv else None
+    pst2_csv_path = Path(pst2_csv) if pst2_csv else None
+    pst2_lookup_path = Path(pst2_lookup_json) if pst2_lookup_json else None
     out_json_path = Path(output_formatted_json)
 
     entries, stats = format_predictions(hisco_csv_path, pst2_csv_path, pst2_lookup_path)
@@ -413,9 +419,9 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="Format predictions and create quarter samples + CSVs")
-    p.add_argument("--hisco", required=True, help="Path to predictions_hisco.csv")
-    p.add_argument("--pst2", required=True, help="Path to predictions_pst2.csv")
-    p.add_argument("--lookup", required=True, help="Path to updatedPST2CodeDict.json")
+    p.add_argument("--hisco", default=None, help="Path to predictions_hisco.csv")
+    p.add_argument("--pst2", default=None, help="Path to predictions_pst2.csv")
+    p.add_argument("--lookup", default=None, help="Path to updatedPST2CodeDict.json")
     p.add_argument("--out", required=True, help="Output JSON for formatted predictions")
     p.add_argument("--chunks", default=None, help="Directory to write quarter chunk files (optional)")
     p.add_argument("--base", default="census_below_preds", help="Base name for chunk files")
