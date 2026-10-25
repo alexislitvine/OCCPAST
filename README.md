@@ -147,6 +147,7 @@ Recent behavior updates:
 - Interactive CSV selection accepts multiple files separated by commas, ranges, or `all`.
 - New format-only mode can skip inference and build final JSON from existing CSV outputs.
 - In format-only mode, if --hisco-csv / --pst-csv are omitted, the script auto-selects the most recent matching files.
+- Output filenames are timestamp-aligned, and final merged JSON appends the PST model suffix: `_processedPredictions_<timestamp>_<model_name>.json`.
 
 Help:
 
@@ -187,7 +188,7 @@ python3 predict_OCCPAST.py --format-only --predict-system both --lookup predicti
 Example (format-only with explicit CSV paths):
 
 ```bash
-python3 predict_OCCPAST.py --format-only --predict-system both --hisco-csv predictions/predicted/cedric_french_strings_predictions_hisco_2025-11-29_163101.csv --pst-csv predictions/predicted/cedric_french_strings_predictions_pst_2025-09-17_214339.csv --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
+python3 predict_OCCPAST.py --format-only --predict-system both --hisco-csv predictions/predicted/cedric_french_strings_predictions_hisco_2025-11-29_163101.csv --pst-csv predictions/predicted/cedric_french_strings_predictions_pst_2025-09-17_214339_mixer-pst2-v3.csv --lookup predictions/occpast/updatedPST2CodeDict.json --output-dir predictions/predicted
 ```
 
 ### format_preds.py
