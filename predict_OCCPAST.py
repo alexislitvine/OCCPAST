@@ -33,7 +33,6 @@ def positive_int(value: str) -> int:
 
 
 def detect_encoding(p: Path, sample_size: int = 1024 * 1024) -> str:
-def detect_encoding(p: Path) -> str:
     """
     Minimal, dependency-free probe. Tries common encodings in order.
     Returns the first that cleanly decodes.
@@ -244,15 +243,6 @@ def _latest_prediction_csv(search_dir: Path, system: str) -> Path | None:
         return None
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0]
-
-def _extract_prediction_metadata(path: Path, system: str) -> tuple[str | None, str | None]:
-    m = re.match(
-        rf".*_predictions_{re.escape(system)}_(\d{{4}}-\d{{2}}-\d{{2}}_\d{{6}})(?:_(.+))?$",
-        path.stem,
-    )
-    if not m:
-        return None, None
-    return m.group(1), m.group(2)
 
 
 def _prediction_csv_parts(path: Path) -> tuple[str, str] | None:
@@ -904,70 +894,6 @@ def main():
         for idx, dataset in enumerate(datasets_to_format, start=1):
             print(f"\n=== Formatting dataset {idx}/{len(datasets_to_format)}: {dataset.base} ===")
             _format_prediction_dataset(dataset, args)
-
-        hisco_out = Path(args.hisco_csv) if args.hisco_csv else None
-        pst_out = Path(args.pst_csv) if args.pst_csv else None
-
-        if hisco_out is None:
-            hisco_out = _latest_prediction_csv(auto_search_dir, "hisco")
-            if hisco_out is not None:
-                print(f"Auto-selected latest HISCO CSV: {hisco_out}")
-        if pst_out is None:
-            pst_out = _latest_prediction_csv(auto_search_dir, "pst")
-            if pst_out is not None:
-                print(f"Auto-selected latest PST CSV: {pst_out}")
-
-        if hisco_out is None:
-            raise FileNotFoundError(
-                f"No HISCO prediction CSV found in {auto_search_dir}. Provide --hisco-csv explicitly."
-            )
-        if pst_out is None:
-            raise FileNotFoundError(
-                f"No PST prediction CSV found in {auto_search_dir}. Provide --pst-csv explicitly."
-            )
-
-        if not hisco_out.exists():
-            raise FileNotFoundError(f"HISCO CSV not found: {hisco_out}")
-        if not pst_out.exists():
-            raise FileNotFoundError(f"PST CSV not found: {pst_out}")
-
-        lookup_path = Path(args.lookup)
-        if not lookup_path.exists():
-            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
-
-        predicted_dir = Path(args.output_dir) if args.output_dir else pst_out.parent
-        predicted_dir.mkdir(parents=True, exist_ok=True)
-
-        ts_from_csv, model_from_csv = _extract_prediction_metadata(pst_out, "pst")
-        if ts_from_csv is None:
-            ts_from_csv, hisco_model_from_csv = _extract_prediction_metadata(hisco_out, "hisco")
-            model_from_csv = model_from_csv or hisco_model_from_csv
-        ts = ts_from_csv or datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        model_suffix = sanitize_filename_component(model_from_csv or "unknown_model")
-        file_base = re.sub(r"_predictions_(hisco|pst)_.*$", "", pst_out.stem)
-
-        print("Formatting/merging predictions…")
-        entries, stats = format_predictions(
-            hisco_csv_path=hisco_out,
-            pst2_csv_path=pst_out,
-            pst2_lookup_json_path=lookup_path,
-            csv_encoding="utf-8-sig",
-        )
-
-        if stats.duplicate_strings:
-            print("Duplicate entries found for the following strings:")
-            for s, c in stats.duplicate_strings:
-                print(f'"{s}" occurs {c} times')
-        else:
-            print("No duplicate entries found.")
-
-        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
-        write_json(combined_json, serialize_formatted_entries(entries))
-        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
-        print(
-            f"Total predictions processed: {stats.total_predictions_processed} | "
-            f"Failures: {stats.failures}"
-        )
         print("All done ✅")
         return
 
@@ -1003,51 +929,6 @@ def main():
     mod_pst = None
     pst_model_slug = None
     if chosen_bin is not None:
-    if args.predict_system in {"both", "pst"}:
-        if args.model_bin:
-            chosen_bin = Path(args.model_bin)
-            if not chosen_bin.exists():
-                raise FileNotFoundError(f"PST model not found: {chosen_bin}")
-            chosen_name = chosen_bin.parent.name
-        else:
-            model_root = Path(args.model_root)
-            if not model_root.exists():
-                raise FileNotFoundError(f"Model root not found: {model_root}")
-
-            candidates: list[tuple[str, Path, float]] = []  # (name, bin_path, mtime)
-            for entry in model_root.iterdir():
-                if entry.is_dir():
-                    bin_path = entry / "last.bin"
-                    if bin_path.exists():
-                        try:
-                            mtime = bin_path.stat().st_mtime
-                        except Exception:
-                            mtime = 0.0
-                        candidates.append((entry.name, bin_path, mtime))
-
-            if not candidates:
-                raise SystemExit(f"No models with last.bin found under {model_root}")
-
-            print("Available PST models (with last.bin):")
-            # Sort candidates by mtime desc
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            for i, (name, bin_path, mtime) in enumerate(candidates, start=1):
-                ts = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-                print(f"{i}. {name}  [last.bin saved: {ts}] -> {bin_path}")
-
-            while True:
-                try:
-                    sel = input("Select PST model number (default 1): ").strip()
-                    idx = 1 if sel == "" else int(sel)
-                    if 1 <= idx <= len(candidates):
-                        break
-                    else:
-                        print(f"Please enter a number between 1 and {len(candidates)}.")
-                except ValueError:
-                    print("Please enter a valid number.")
-
-            chosen_name, chosen_bin, chosen_mtime = candidates[idx - 1]
-
         print(f"Using PST model: {chosen_name} ({chosen_bin})")
         pst_model_slug = sanitize_filename_component(chosen_name)
         mod_pst = OccCANINE(
@@ -1073,62 +954,6 @@ def main():
             out_enc=out_enc,
             chunksize=chunksize,
             k_pred=HOW_MANY_PREDS,
-            debug=args.debug,
-            max_num_codes=args.max_num_codes,
-        )
-        pred_hisco["id"] = df["id"].tolist()
-        pred_hisco["occ1"] = df["occ1_original"].tolist()
-        pred_hisco["occ1_clean"] = df["occ1_clean"].tolist()
-        hisco_out = predicted_dir / f"{file_base}_predictions_hisco_{ts}.csv"
-        pred_hisco.to_csv(hisco_out, index=False, encoding=out_enc)
-        print(f"→ Saved HISCO to {hisco_out.name}")
-
-    if mod_pst is not None:
-        print("Running PST predictions…")
-        pred_pst = mod_pst(
-            df.occ1_clean.tolist(),
-            k_pred=HOW_MANY_PREDS,
-            debug=args.debug,
-            max_num_codes=args.max_num_codes,
-        )
-        pred_pst["id"] = df["id"].tolist()
-        pred_pst["occ1"] = df["occ1_original"].tolist()
-        pred_pst["occ1_clean"] = df["occ1_clean"].tolist()
-        pst_out = predicted_dir / f"{file_base}_predictions_pst_{ts}_{pst_model_slug}.csv"
-        pred_pst.to_csv(pst_out, index=False, encoding=out_enc)
-        print(f"→ Saved PST   to {pst_out.name}")
-
-    if args.predict_system == "both":
-        lookup_path = Path(args.lookup)
-        if not lookup_path.exists():
-            raise FileNotFoundError(f"Lookup not found: {lookup_path}")
-        if hisco_out is None or pst_out is None:
-            raise RuntimeError("Both prediction outputs are required to format combined results.")
-
-        # 5) Format & merge predictions -> combined JSON (with progress bars)
-        print("Formatting/merging predictions…")
-        entries, stats = format_predictions(
-            hisco_csv_path=hisco_out,
-            pst2_csv_path=pst_out,
-            pst2_lookup_json_path=lookup_path,
-            csv_encoding=out_enc,
-        )
-
-        # Log duplicates like the Node script
-        if stats.duplicate_strings:
-            print("Duplicate entries found for the following strings:")
-            for s, c in stats.duplicate_strings:
-                print(f'"{s}" occurs {c} times')
-        else:
-            print("No duplicate entries found.")
-
-        model_suffix = pst_model_slug or "unknown_model"
-        combined_json = predicted_dir / f"{file_base}_processedPredictions_{ts}_{model_suffix}.json"
-        write_json(combined_json, serialize_formatted_entries(entries))
-        print(f"→ Wrote combined formatted JSON: {combined_json.name}")
-        print(
-            f"Total predictions processed: {stats.total_predictions_processed} | "
-            f"Failures: {stats.failures}"
         )
 
     # # 6) Create 4 sampled chunks as JSON + CSV (titles) beside the combined JSON
