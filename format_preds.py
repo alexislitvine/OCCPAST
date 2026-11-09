@@ -62,15 +62,20 @@ def _normalize_occ1(occ1: str) -> str:
     occ1 = occ1.replace("/", " ").strip()
     return unicodedata.normalize("NFC", occ1)
 
-def _normalize_pst_code(code: str) -> str:
+def _normalize_pst_code(code: str, width: int = 8) -> str:
     """
-    Ensure the PST code has 8 comma-separated components by right-padding with ',0',
-    exactly like the JS logic.
+    Ensure the PST code has the lookup's comma-separated width by right-padding
+    with ',0', exactly like the JS logic.
     """
     parts = code.split(",")
-    while len(parts) < 8:
+    while len(parts) < width:
         parts.append("0")
     return ",".join(parts)
+
+
+def _pst_lookup_width(pst2_lookup: Dict[str, str]) -> int:
+    """Return the maximum hierarchy width represented by a PST2 lookup."""
+    return max((len(code.split(",")) for code in pst2_lookup), default=8)
 
 
 def _is_valid_val(val: str | None, scheme: str) -> bool:
@@ -167,12 +172,13 @@ def _process_entry(
         if pst2_lookup is None:
             raise ValueError("pst2_lookup is required for PST processing")
 
+        lookup_width = _pst_lookup_width(pst2_lookup)
         for i in range(5):
             code_prop = f"pst_{i+1}"
             if code_prop in entry and _is_valid_val(entry.get(code_prop), "pst"):
                 counters["count"] += 1
                 code = str(entry[code_prop])
-                code = _normalize_pst_code(code)
+                code = _normalize_pst_code(code, lookup_width)
                 pst2_code = pst2_lookup.get(code)
                 if pst2_code:
                     pred.uris.append("pst2:" + pst2_code)

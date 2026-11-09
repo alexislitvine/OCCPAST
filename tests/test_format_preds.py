@@ -40,6 +40,30 @@ class TestFormatPredictions(unittest.TestCase):
                 ],
             )
 
+    def test_formats_nine_level_pst_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pst_csv = tmp_path / "predictions_pst.csv"
+            lookup_json = tmp_path / "PST2CodeDict.json"
+
+            pst_csv.write_text(
+                "occ1,pst_1\n"
+                "worker,\"1,2,3,4,5,6,7,8\"\n",
+                encoding="utf-8",
+            )
+            lookup_json.write_text(
+                json.dumps({"99": {"code": "1,2,3,4,5,6,7,8,0"}}),
+                encoding="utf-8",
+            )
+
+            entries, stats = format_predictions(
+                pst2_csv_path=pst_csv,
+                pst2_lookup_json_path=lookup_json,
+            )
+
+            self.assertEqual(stats.failures, 0)
+            self.assertEqual(entries[0].predictions[0].uris, ["pst2:99"])
+
     def test_requires_at_least_one_prediction_csv(self):
         with self.assertRaisesRegex(ValueError, "At least one prediction CSV"):
             format_predictions()
